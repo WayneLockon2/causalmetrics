@@ -1,0 +1,4 @@
+name: Lecture note
+description: >
+   A reusable R Markdown lecture-note template for math, data science, and econometrics.
+create_dir: TRUE

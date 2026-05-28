@@ -1,0 +1,189 @@
+---
+title: "Title of the Empirical Working Paper"
+shorttitle: "Short Title"
+nber_number: ""
+author:
+  - name: "First Author"
+    affiliation: "Department of Economics, University Name"
+    email: "first.author@example.edu"
+  - name: "Second Author"
+    affiliation: "Business School, University Name"
+    email: "second.author@example.edu"
+date: "`r format(Sys.Date(), '%B %Y')`"
+thanks_title: "We thank seminar participants and colleagues for helpful comments. All errors are our own."
+acknowledgements: "Replace this text with grant acknowledgements, data-use acknowledgements, and replication-package notes."
+disclaimer: "The views expressed herein are those of the authors and do not necessarily reflect the views of any affiliated institution."
+output:
+  pdf_document:
+    template: template.tex
+    latex_engine: pdflatex
+    keep_tex: true
+    number_sections: true
+    highlight: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 6.5,
+  fig.height = 3.7,
+  dpi = 300,
+  out.width = "0.85\\linewidth"
+)
+
+# Daily empirical workflow packages. These are loaded only if installed.
+load_if_available <- function(pkg) {
+  if (requireNamespace(pkg, quietly = TRUE)) {
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+    TRUE
+  } else {
+    message("Package not installed: ", pkg)
+    FALSE
+  }
+}
+
+pkgs <- c(
+  "data.table", "ggplot2", "fixest", "modelsummary", "kableExtra",
+  "broom", "sandwich", "lmtest", "causalmetrics"
+)
+invisible(vapply(pkgs, load_if_available, logical(1)))
+
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  ggplot2::theme_set(ggplot2::theme_minimal(base_size = 11))
+}
+```
+
+\begin{abstract}
+This template is designed for empirical economics and marketing-science working papers. The abstract should state the research question, research design, data, main quantitative result, and contribution in one concise paragraph.
+
+\bigskip
+\noindent \textbf{JEL:} C21, C93, I12
+
+\noindent \textbf{Keywords:} causal inference, randomized trials, empirical economics
+\end{abstract}
+
+\clearpage
+\setcounter{page}{1}
+
+# Introduction
+
+State the research question, empirical setting, source of identifying variation, and main result. A useful first paragraph answers four questions: What is the economic question? Why does it matter? What variation identifies the effect? What is the headline estimate?
+
+This template uses `natbib`, so citations can be written directly in LaTeX as `\citet{lin2013agnostic}` or `\citep{angrist1996identification}`. Bibliography commands are also written directly in LaTeX at the end of this file rather than placed in the YAML header.
+
+# Data and Institutional Background
+
+Describe the raw data, sample construction, unit of observation, outcomes, treatment variables, timing, and important institutional details.
+
+```{r demo-data}
+if (requireNamespace("data.table", quietly = TRUE)) {
+  set.seed(123)
+  dt <- data.table::data.table(
+    unit_id = 1:500,
+    cluster = sample(1:50, 500, replace = TRUE),
+    treat = rbinom(500, 1, 0.5),
+    x1 = rnorm(500),
+    x2 = rbinom(500, 1, 0.4)
+  )
+  dt[, y := 1.5 * treat + 0.6 * x1 - 0.3 * x2 + rnorm(.N)]
+  head(dt)
+}
+```
+
+# Research Design
+
+Define the estimand and identifying assumption. For a randomized trial, define assignment $Z_i$, treatment receipt $D_i$, outcome $Y_i$, covariates $X_i$, and the assignment or clustering level.
+
+\begin{assumption}[Random assignment]
+Conditional on pre-treatment covariates $X_i$, assignment is independent of potential outcomes:
+\[
+Z_i \indep \{Y_i(1), Y_i(0)\} \mid X_i.
+\]
+\end{assumption}
+
+The baseline estimating equation is
+\[
+Y_i = \alpha + \tau Z_i + X_i'\beta + \varepsilon_i.
+\]
+
+# Empirical Workflow Algorithm
+
+Use the algorithm environment for procedures that readers may want to replicate.
+
+\begin{algorithm}[H]
+\caption{Baseline empirical workflow}
+\label{alg:workflow}
+\begin{algorithmic}[1]
+\Require Raw data $D$, outcome $Y$, assignment $Z$, covariates $X$, cluster variable $G$
+\State Construct the analysis sample and document all exclusions.
+\State Report summary statistics and baseline balance.
+\State Estimate the intention-to-treat effect of $Z$ on $Y$.
+\State If compliance is imperfect, report the first stage of $Z$ on treatment receipt $D$.
+\State Choose robust or clustered standard errors based on the assignment mechanism.
+\State Report robustness checks and threats to validity.
+\Ensure Tables, figures, and a replication-ready data pipeline.
+\end{algorithmic}
+\end{algorithm}
+
+# Main Results
+
+Use direct estimator calls here. The template should not hide regressions behind wrappers.
+
+```{r demo-regression, results='asis'}
+if (requireNamespace("fixest", quietly = TRUE) && exists("dt")) {
+  fit <- fixest::feols(y ~ treat + x1 + x2, data = dt, cluster = ~cluster)
+
+  if (requireNamespace("modelsummary", quietly = TRUE)) {
+    modelsummary::modelsummary(
+      list("Outcome" = fit),
+      output = "latex",
+      stars = TRUE,
+      gof_omit = "IC|Log|Adj|Within"
+    )
+  } else {
+    print(summary(fit))
+  }
+}
+```
+
+# Figures
+
+Figures should have informative captions and notes.
+
+```{r demo-figure, fig.cap='Simulated treatment and control outcome distributions'}
+if (requireNamespace("ggplot2", quietly = TRUE) && exists("dt")) {
+  ggplot2::ggplot(dt, ggplot2::aes(x = y, fill = factor(treat))) +
+    ggplot2::geom_density(alpha = 0.35) +
+    ggplot2::labs(
+      x = "Outcome",
+      y = "Density",
+      fill = "Treatment",
+      caption = "Notes: Replace this demo figure with a project-specific plot."
+    )
+}
+```
+
+# Robustness and Validity
+
+Discuss balance, attrition, compliance, clustering, functional form, alternative outcomes, multiple testing, and external validity.
+
+# Conclusion
+
+Summarize the main estimate, interpretation, mechanism, limitations, and contribution.
+
+\clearpage
+\appendix
+\counterwithin{figure}{section}
+\counterwithin{table}{section}
+
+# Appendix: Additional Tables and Figures
+
+Put long tables, additional figures, alternative specifications, and derivations here.
+
+\clearpage
+\singlespacing
+\bibliographystyle{ecta}
+\bibliography{references}

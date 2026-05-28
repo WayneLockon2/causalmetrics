@@ -1,0 +1,4 @@
+name: Presentation / group discussion
+description: >
+   A single-file Beamer R Markdown template for math, computer science, data science, and empirical econometrics presentations.
+create_dir: FALSE

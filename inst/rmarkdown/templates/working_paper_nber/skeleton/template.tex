@@ -1,0 +1,208 @@
+% Simple NBER-style empirical working-paper template for R Markdown.
+% This is not an official NBER template.
+% Robust version: manual title page; no \maketitle.
+
+\documentclass[12pt]{article}
+
+% Page layout -----------------------------------------------------------------
+\usepackage[letterpaper,left=1.15in,right=1.15in,top=1.20in,bottom=1.20in]{geometry}
+\usepackage{setspace}
+\onehalfspacing
+\frenchspacing
+\usepackage{microtype}
+
+% Encoding and fonts -----------------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+
+% Math -------------------------------------------------------------------------
+\usepackage{amsmath,amssymb,amsfonts,amsthm,bm,mathtools}
+\usepackage{bbm}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathbb{V}\mathrm{ar}}
+\newcommand{\Cov}{\mathbb{C}\mathrm{ov}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\ind}{\mathbbm{1}}
+\newcommand{\1}[1]{\mathbbm{1}\{#1\}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\indep}{\mathrel{\perp\!\!\!\perp}}
+
+% Tables and figures -----------------------------------------------------------
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{makecell}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{threeparttable}
+\usepackage{siunitx}
+\sisetup{detect-all=true,group-separator={,},group-minimum-digits=4}
+\usepackage{adjustbox}
+\usepackage{pdflscape}
+\usepackage[labelfont=bf,labelsep=period]{caption}
+\usepackage{subcaption}
+\usepackage[section]{placeins}
+\usepackage{chngcntr}
+
+% Lists, theorem environments, and algorithms ---------------------------------
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\floatname{algorithm}{Algorithm}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem{assumption}{Assumption}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{example}{Example}
+
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% Section formatting -----------------------------------------------------------
+\usepackage{titlesec}
+\titleformat{\section}{\normalsize\bfseries}{\thesection.}{0.75em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.75em}{}
+\titleformat{\subsubsection}{\normalsize\itshape}{\thesubsubsection.}{0.75em}{}
+\titlespacing*{\section}{0pt}{0.22in}{0.06in}
+\titlespacing*{\subsection}{0pt}{0.14in}{0.04in}
+\titlespacing*{\subsubsection}{0pt}{0.10in}{0.03in}
+
+% Citations and links ----------------------------------------------------------
+\usepackage[authoryear,round]{natbib}
+\usepackage{xcolor}
+\usepackage{xurl}
+\definecolor{linkblue}{RGB}{0,54,115}
+\usepackage[colorlinks=true,linkcolor=linkblue,citecolor=linkblue,urlcolor=linkblue]{hyperref}
+\usepackage[capitalize,nameinlink,noabbrev]{cleveref}
+
+% Pandoc/R Markdown compatibility --------------------------------------------
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\providecommand{\pandocbounded}[1]{#1}
+
+% Title-page note helpers.  These avoid \thanks / \maketitle, which can be
+% fragile under Pandoc + hyperref, while still printing a star after the title
+% and a title-page footnote at the bottom of the first page.
+\newcommand{\cmTitleNoteMark}{\textsuperscript{*}}
+\newcommand{\cmTitleNoteText}[1]{%
+  \begingroup
+  \renewcommand{\thefootnote}{\fnsymbol{footnote}}%
+  \footnotetext[1]{#1}%
+  \endgroup
+}
+
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\maxheight{\ifdim\Gin@nat@height>0.85\textheight 0.85\textheight\else\Gin@nat@height\fi}
+\makeatother
+\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+
+$if(highlighting-macros)$
+$highlighting-macros$
+$endif$
+
+$if(header-includes)$
+$for(header-includes)$
+$header-includes$
+$endfor$
+$endif$
+
+\hypersetup{
+$if(title)$
+  pdftitle={$title$},
+$endif$
+$if(author)$
+  pdfauthor={$for(author)$$if(author.name)$$author.name$$else$$author$$endif$$sep$; $endfor$},
+$endif$
+  bookmarksnumbered=true
+}
+
+\begin{document}
+
+% Manual title page. This avoids fragile \maketitle/\thanks recursion.
+\begin{center}
+$if(title)$
+{\Large\bfseries $title$$if(thanks_title)$\cmTitleNoteMark$else$$if(acknowledgements)$\cmTitleNoteMark$else$$if(disclaimer)$\cmTitleNoteMark$endif$$endif$$endif$\par}
+$endif$
+$if(shorttitle)$
+\vspace{0.05in}
+{\normalsize\itshape $shorttitle$\par}
+$endif$
+\vspace{0.18in}
+$if(author)$
+\begingroup
+\setlength{\parindent}{0pt}%
+\setlength{\parskip}{0.12in}%
+\centering
+$for(author)$
+$if(author.name)$
+\begin{minipage}[t]{0.46\linewidth}
+\centering
+$author.name$$if(author.affiliation)$\\[-0.01in]
+{\small $author.affiliation$}$endif$$if(author.email)$\\[-0.01in]
+{\small $author.email$}$endif$
+\end{minipage}\hspace{0.04\linewidth}
+$else$
+\begin{minipage}[t]{0.46\linewidth}
+\centering
+$author$
+\end{minipage}\hspace{0.04\linewidth}
+$endif$
+$endfor$
+\par
+\endgroup
+$endif$
+\vspace{0.15in}
+
+$if(date)$
+{\normalsize $date$\par}
+$else$
+{\normalsize \today\par}
+$endif$
+
+$if(nber_number)$
+\vspace{0.10in}
+{\normalsize NBER Working Paper No. $nber_number$\par}
+$endif$
+\end{center}
+\thispagestyle{empty}
+\vspace{0.05in}
+
+$if(thanks_title)$
+\cmTitleNoteText{\textit{$thanks_title$}%
+$if(acknowledgements)$
+\par\medskip\noindent\textbf{Acknowledgements:} $acknowledgements$
+$endif$
+$if(disclaimer)$
+\par\medskip\noindent\textbf{Disclaimer:} $disclaimer$
+$endif$
+}
+$else$
+$if(acknowledgements)$
+\cmTitleNoteText{\textbf{Acknowledgements:} $acknowledgements$%
+$if(disclaimer)$
+\par\medskip\noindent\textbf{Disclaimer:} $disclaimer$
+$endif$
+}
+$else$
+$if(disclaimer)$
+\cmTitleNoteText{\textbf{Disclaimer:} $disclaimer$}
+$endif$
+$endif$
+$endif$
+
+$body$
+
+\end{document}

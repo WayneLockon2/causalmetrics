@@ -1,0 +1,4 @@
+name: Homework
+description: >
+   A reusable R Markdown homework template for math, computer science, data science, and empirical econometrics.
+create_dir: TRUE

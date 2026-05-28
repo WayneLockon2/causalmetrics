@@ -1,0 +1,892 @@
+---
+title: "Title of the Presentation"
+subtitle: "Beamer Slides via R Markdown"
+author: "Author Name"
+institute: "Department · University"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  beamer_presentation:
+    slide_level: 2
+    keep_tex: true
+    latex_engine: xelatex
+    highlight: null
+fontsize: 10pt
+classoption: "aspectratio=169"
+header-includes:
+  - |
+    ```{=latex}
+    \RequirePackage{tikz, natbib, setspace}
+    \RequirePackage{xcolor}
+    \RequirePackage{amsmath, amssymb, amsfonts, amsthm}
+    \RequirePackage{mathtools}            % extends amsmath
+    \RequirePackage{bm}                   % bold math symbols
+    \RequirePackage{verbatim}
+    \RequirePackage{hyperref}
+    \RequirePackage{listings}
+    \RequirePackage{booktabs}             % professional tables
+    \RequirePackage{algorithm2e}          % pseudocode
+
+    % ── TikZ libraries ────────────────────────────────────────────────
+    \usetikzlibrary{arrows.meta, calc, positioning, shapes.geometric,
+                    fit, backgrounds, decorations.pathreplacing,
+                    matrix, chains, shadows}
+
+    % ── Colour palette ────────────────────────────────────────────────
+    % Primary / structural colours  (rename freely)
+    \definecolor{primary}{HTML}{A02337}       % deep crimson
+    \definecolor{primarylight}{HTML}{A63547}   % lighter crimson
+    \definecolor{accentgrey}{HTML}{58595B}     % neutral grey
+
+    % Functional colours for boxes & emphasis
+    \definecolor{infocolor}{HTML}{1A6E8E}     % teal-blue   → info / remark
+    \definecolor{successcolor}{HTML}{2E7D32}  % forest green → example / proof
+    \definecolor{warncolor}{HTML}{E65100}     % burnt orange → caution / alert
+    \definecolor{mathpurple}{HTML}{6A1B9A}    % deep purple  → definition / theorem
+    \definecolor{csblue}{HTML}{1565C0}        % royal blue   → algorithm / code
+    \definecolor{skyblue}{HTML}{6BA4B8}       % sky blue     → miscellaneous
+    \definecolor{lightgrey}{HTML}{F5F5F5}     % near-white   → code backgrounds
+    \definecolor{codepurple}{HTML}{7B1FA2}    % listings string colour
+
+    % ── Beamer colour assignments ─────────────────────────────────────
+    \setbeamercolor{title}{fg=white}
+    \setbeamercolor{subtitle}{fg=white}
+    \setbeamercolor{author}{fg=white}
+    \setbeamercolor{date}{fg=white}
+    \setbeamercolor{institute}{fg=white}
+    \setbeamercolor{head}{bg=primarylight}
+
+    \setbeamercolor{alerted text}{fg=primary}
+    \setbeamercolor{normal text}{fg=darkgray, bg=white}
+    \setbeamercolor{structure}{fg=primary}
+
+    \setbeamercolor{jumbo}{bg=primarylight}
+    \setbeamercolor{progress bar}{fg=primary, bg=accentgrey}
+    \setbeamercolor{progress bar progress}{use=progress bar, bg=progress bar.fg}
+
+    % Default block  (primary)
+    \setbeamercolor{block title}{use=structure, fg=white, bg=primarylight}
+    \setbeamercolor{block body}{use=structure, fg=darkgray, bg=primarylight!8}
+
+    % Alert block    (warning orange)
+    \setbeamercolor{block title alerted}{fg=white, bg=warncolor}
+    \setbeamercolor{block body alerted}{fg=darkgray, bg=warncolor!8}
+
+    % Example block  (success green)
+    \setbeamercolor{block title example}{fg=white, bg=successcolor}
+    \setbeamercolor{block body example}{fg=darkgray, bg=successcolor!8}
+
+    % ── Hyperlinks ────────────────────────────────────────────────────
+    \hypersetup{
+        colorlinks,
+        linkcolor   = primary,
+        anchorcolor = primary,
+        citecolor   = infocolor,
+        urlcolor    = primarylight,
+    }
+
+    % ── Font settings ─────────────────────────────────────────────────
+    \setbeamerfont{title}{series=\bfseries, size=\Large}
+    \setbeamerfont{subtitle}{series=\mdseries, size=\normalsize}
+    \setbeamerfont{author}{size=\small}
+    \setbeamerfont{date}{size=\footnotesize}
+    \setbeamerfont{institute}{size=\footnotesize}
+    \setbeamerfont{alerted text}{series=\bfseries}
+    \setbeamerfont{frametitle}{series=\bfseries}
+    \setbeamerfont{framesubtitle}{series=\mdseries}
+    \setbeamerfont{footline}{size=\scriptsize}
+    \setbeamerfont{block title}{size=\normalsize, series=\bfseries}
+    \setbeamerfont{block body}{size=\normalsize}
+
+    \usefonttheme{serif}
+
+    % ── Template chrome ────────────────────────────────────────────────
+    \setbeamertemplate{navigation symbols}{}
+    \setbeamertemplate{blocks}[rounded]
+    \setbeamertemplate{itemize item}{\textbullet}
+    \setbeamertemplate{itemize subitem}{\textemdash}
+    \setbeamertemplate{itemize subsubitem}{\ensuremath{\circ}}
+    \setlength{\parskip}{5pt}
+
+    % ── Listings (code) style ──────────────────────────────────────────
+    \lstdefinestyle{mystyle}{
+        commentstyle   = \color{successcolor!70},
+        keywordstyle   = \color{csblue},
+        numberstyle    = \tiny\color{accentgrey},
+        stringstyle    = \color{codepurple},
+        basicstyle     = \ttfamily\scriptsize,
+        breakatwhitespace = false,
+        breaklines     = true,
+        captionpos     = b,
+        keepspaces     = true,
+        numbers        = left,
+        numbersep      = 5pt,
+        showspaces     = false,
+        showstringspaces = false,
+        showtabs       = false,
+        tabsize        = 4,
+        xleftmargin    = 10pt,
+        xrightmargin   = 10pt,
+        backgroundcolor = \color{lightgrey},
+        frame          = single,
+        rulecolor      = \color{accentgrey!30},
+    }
+    \lstset{style=mystyle}
+
+    % ── Progress-bar footline ──────────────────────────────────────────
+    % Use e-TeX dimexpr so Beamer receives a true dimension for the bar width.
+    \newdimen\progressbarwidth
+    \defbeamertemplate{footline}{progress bar}{%
+        \ifnum\value{framenumber}=1\relax
+        \else
+            \progressbarwidth=\dimexpr\paperwidth*\value{framenumber}/\inserttotalframenumber\relax
+            \leavevmode%
+            \begin{beamercolorbox}[wd=\paperwidth,ht=2pt,dp=1pt]{progress bar}%
+                \begin{beamercolorbox}[wd=\progressbarwidth,ht=2pt,dp=1pt]{progress bar progress}%
+                \end{beamercolorbox}%
+            \end{beamercolorbox}%
+        \fi
+    }
+    \setbeamertemplate{footline}[progress bar]
+
+    % ── Back-matter (blank closing slide) ──────────────────────────────
+    \newcommand{\backmatter}{
+        \begingroup
+        \setbeamertemplate{headline}{}
+        \setbeamertemplate{footline}{}
+        \begin{frame}[c]{}
+        \end{frame}
+        \endgroup
+    }
+
+    % ── Table of contents styling ──────────────────────────────────────
+    \setbeamertemplate{section in toc}{
+      $\blacktriangleright$~\textbf{\inserttocsection}
+    }
+    \setbeamertemplate{subsection in toc}{}
+    \setbeamertemplate{frametitle continuation}{}
+
+    \AtBeginSection[]{
+        \begingroup
+        \begin{frame}{Outline}{}
+            \tableofcontents[currentsection]
+        \end{frame}
+        \endgroup
+    }
+
+    % ── Headline & frame title ─────────────────────────────────────────
+    \makeatletter
+    \setbeamertemplate{headline}{
+      \ifnum\theframenumber=1
+      \else
+        \begin{beamercolorbox}[wd=\paperwidth,ht=40pt]{head}
+        \end{beamercolorbox}
+      \fi
+    }
+    \setbeamertemplate{frametitle}{
+        \begin{picture}(0,0)
+            \ifx\insertframesubtitle\@empty
+                \put(0,27){\usebeamerfont{frametitle}\usebeamercolor[fg]{title}\insertframetitle}
+        \else
+          \put(0,32){\usebeamerfont{frametitle}\usebeamercolor[fg]{title} \insertframetitle}
+          \put(0,20){\usebeamerfont{framesubtitle}\usebeamercolor[fg]{title} \insertframesubtitle }
+        \fi
+        \end{picture}
+    }
+
+    \makeatother
+
+    % ── Title page ─────────────────────────────────────────────────────
+    \setbeamertemplate{title page}{
+      \begin{picture}(0,0)
+            \put(-5,-77){
+                \begin{beamercolorbox}[wd=1.1\paperwidth,ht=140pt]{jumbo}
+                \end{beamercolorbox}
+            }
+        \put(0,25){
+          \begin{minipage}{300pt}
+            \usebeamerfont{title}\usebeamercolor[fg]{title}\inserttitle\par
+            \vspace{10pt}
+            \usebeamerfont{subtitle}\usebeamercolor[fg]{subtitle}\insertsubtitle
+          \end{minipage}
+        }
+        \put(0,-45){
+          \usebeamerfont{author}\usebeamercolor[fg]{author}\insertauthor
+        }
+            \put(0,-58){
+          \usebeamerfont{institute}\usebeamercolor[fg]{institute}\insertinstitute
+        }
+        \put(0,-70){
+          \usebeamerfont{date}\usebeamercolor[fg]{date}\insertdate
+        }
+      \end{picture}
+    }
+
+    % ══════════════════════════════════════════════════════════════════
+    %  CUSTOM COLOURED BOXES  (for emphasis during presentations)
+    % ══════════════════════════════════════════════════════════════════
+
+    % ── Info / Remark box (teal-blue) ──────────────────────────────────
+    \newenvironment{infobox}[1][Remark]{%
+      \setbeamercolor{block title}{fg=white, bg=infocolor}%
+      \setbeamercolor{block body}{fg=darkgray, bg=infocolor!8}%
+      \begin{block}{#1}}{\end{block}}
+
+    % ── Caution / Warning box (orange) ─────────────────────────────────
+    \newenvironment{cautionbox}[1][Caution]{%
+      \setbeamercolor{block title}{fg=white, bg=warncolor}%
+      \setbeamercolor{block body}{fg=darkgray, bg=warncolor!8}%
+      \begin{block}{#1}}{\end{block}}
+
+    % ── Definition box (purple) ────────────────────────────────────────
+    \newenvironment{defbox}[1][Definition]{%
+      \setbeamercolor{block title}{fg=white, bg=mathpurple}%
+      \setbeamercolor{block body}{fg=darkgray, bg=mathpurple!8}%
+      \begin{block}{#1}}{\end{block}}
+
+    % ── Theorem box (deep blue) ────────────────────────────────────────
+    \newenvironment{thmbox}[1][Theorem]{%
+      \setbeamercolor{block title}{fg=white, bg=csblue}%
+      \setbeamercolor{block body}{fg=darkgray, bg=csblue!8}%
+      \begin{block}{#1}}{\end{block}}
+
+    % ── Proof sketch box (green, no title bar) ─────────────────────────
+    \newenvironment{proofbox}[1][Proof]{%
+      \setbeamercolor{block title}{fg=white, bg=successcolor!80}%
+      \setbeamercolor{block body}{fg=darkgray, bg=successcolor!6}%
+      \begin{block}{#1}}{\end{block}}
+
+    % ── Algorithm / Code box (royal blue) ──────────────────────────────
+    \newenvironment{algobox}[1][Algorithm]{%
+      \setbeamercolor{block title}{fg=white, bg=csblue!90}%
+      \setbeamercolor{block body}{fg=darkgray, bg=csblue!6}%
+      \begin{block}{#1}}{\end{block}}
+
+    % ── Highlight / Key-takeaway box (primary crimson) ─────────────────
+    \newenvironment{keybox}[1][Key Takeaway]{%
+      \setbeamercolor{block title}{fg=white, bg=primary}%
+      \setbeamercolor{block body}{fg=darkgray, bg=primary!8}%
+      \begin{block}{#1}}{\end{block}}
+
+    % ══════════════════════════════════════════════════════════════════
+    %  MATH SHORTCUTS  (optional — delete any you don't need)
+    % ══════════════════════════════════════════════════════════════════
+    \newcommand{\E}{\mathbb{E}}
+    \newcommand{\Var}{\operatorname{Var}}
+    \newcommand{\Cov}{\operatorname{Cov}}
+    \newcommand{\Prob}{\mathbb{P}}
+    \newcommand{\R}{\mathbb{R}}
+    \newcommand{\N}{\mathbb{N}}
+    \newcommand{\Z}{\mathbb{Z}}
+    \newcommand{\indep}{\perp\!\!\!\perp}
+    \DeclareMathOperator*{\argmin}{arg\,min}
+    \DeclareMathOperator*{\argmax}{arg\,max}
+    \DeclareMathOperator{\plim}{plim}
+    \newcommand{\iid}{\overset{\text{iid}}{\sim}}
+    \newcommand{\convp}{\xrightarrow{p}}
+    \newcommand{\convd}{\xrightarrow{d}}
+    \newcommand{\aseq}{\overset{\text{a.s.}}{=}}
+    \newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+    \newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+    ```
+---
+
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(
+  echo        = FALSE,
+  message     = FALSE,
+  warning     = FALSE,
+  fig.width   = 6,
+  fig.height  = 3,
+  out.width   = "70%",
+  fig.align   = "center",
+  size        = "footnotesize"
+)
+
+# Packages (add / remove as needed)
+# library(tidyverse)
+# library(modelsummary)
+# library(fixest)
+# library(kableExtra)
+
+# Custom ggplot theme
+# Colour-hex values match the beamer palette for visual consistency
+primary_col     <- "#A02337"
+infocolor_col   <- "#1A6E8E"
+success_col     <- "#2E7D32"
+csblue_col      <- "#1565C0"
+accentgrey_col  <- "#58595B"
+
+palette_main <- c(primary_col, csblue_col, infocolor_col,
+                  success_col, "#E65100", "#6A1B9A")
+
+theme_slides <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) %+replace%
+    theme(
+      legend.position  = "bottom",
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold", size = rel(1.1)),
+      axis.title       = element_text(size = rel(0.9))
+    )
+}
+
+# modelsummary formatting (for regression tables)
+gof <- tibble::tribble(
+  ~raw,           ~clean,          ~fmt,
+  "nobs",         "N",             0,
+  "r.squared",    "$R^2$",         2,
+  "adj.r.squared","Adj.~$R^2$",    2,
+  "rmse",         "RMSE",          3
+)
+
+# Dynamic font-size hook
+def.chunk.hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize",
+         paste0("\n \\", options$size, "\n\n", x, "\n\n \\normalsize"),
+         x)
+})
+```
+
+
+<!-- ================================================================
+     SECTION 1 — COLOUR PALETTE & BOX SHOWCASE
+     ================================================================ -->
+
+# Template Showcase
+
+## Built-in Beamer Blocks
+
+Beamer ships with three block types.
+
+::: {.block}
+### Default Block
+Use for neutral information, references, or summaries.
+:::
+
+::: {.alertblock}
+### Alert Block
+Draw attention to caveats, assumptions, or pitfalls.
+:::
+
+::: {.exampleblock}
+### Example Block
+Worked examples, data excerpts, or code output.
+:::
+
+
+## Custom Emphasis Boxes
+
+\begin{infobox}[Remark]
+  Use \texttt{infobox} for supplementary notes, data-source caveats,
+  or interpretation guidance.
+\end{infobox}
+
+\begin{cautionbox}[Caution]
+  Use \texttt{cautionbox} when an assumption is critical:
+  e.g.\ ``strict exogeneity may fail under simultaneity.''
+\end{cautionbox}
+
+\begin{defbox}[Definition — Conditional Expectation]
+  $\E[Y \mid X] = \int y \, f_{Y|X}(y \mid x) \, dy$
+\end{defbox}
+
+
+## Custom Emphasis Boxes (cont.)
+
+\begin{thmbox}[Gauss--Markov Theorem]
+  Under assumptions A1--A5, the OLS estimator $\hat{\beta}$
+  is \textbf{BLUE}: Best Linear Unbiased Estimator.
+\end{thmbox}
+
+\begin{proofbox}[Proof Sketch]
+  Show $\Var(\tilde\beta) - \Var(\hat\beta)$ is positive
+  semi-definite for any alternative linear unbiased $\tilde\beta$.
+\end{proofbox}
+
+\begin{keybox}[Key Takeaway]
+  Unbiasedness alone is not enough — we also need minimum variance
+  among the class of linear unbiased estimators.
+\end{keybox}
+
+
+## Colour Reference Card
+
+\begin{center}
+\begin{tikzpicture}[
+    swatch/.style={
+      minimum width=1.3cm, minimum height=0.65cm,
+      rounded corners=2pt, font=\scriptsize\sffamily, text=white
+    }
+  ]
+  \node[swatch, fill=primary]      at (0,0)   {primary};
+  \node[swatch, fill=primarylight] at (1.8,0) {primarylight};
+  \node[swatch, fill=accentgrey]   at (3.6,0) {accentgrey};
+  \node[swatch, fill=infocolor]    at (5.4,0) {infocolor};
+  \node[swatch, fill=successcolor] at (7.2,0) {successcolor};
+  \node[swatch, fill=warncolor]    at (9.0,0) {warncolor};
+  \node[swatch, fill=mathpurple]   at (10.8,0){mathpurple};
+  \node[swatch, fill=csblue]       at (12.6,0){csblue};
+\end{tikzpicture}
+\end{center}
+
+All colours are defined once in the YAML header — change a single
+`\definecolor` line and the entire deck updates.
+
+
+<!-- ================================================================
+     SECTION 2 — MATHEMATICS
+     ================================================================ -->
+
+# Mathematics
+
+## Optimisation Problem
+
+\begin{defbox}[Empirical Risk Minimisation]
+\vspace{-4pt}
+\[
+  \hat\theta = \argmin_{\theta \in \Theta}\;
+  \frac{1}{n} \sum_{i=1}^{n} \ell\!\bigl(y_i,\; f(x_i;\theta)\bigr)
+  + \lambda\, \Omega(\theta)
+\]
+where $\ell$ is a loss function and $\Omega(\theta)$ is a regulariser
+(e.g.\ $\norm{\theta}_2^2$ for ridge, $\norm{\theta}_1$ for lasso).
+\end{defbox}
+
+\begin{infobox}[Remark]
+  When $\ell$ is the negative log-likelihood and $\lambda=0$,
+  ERM reduces to maximum likelihood estimation (MLE).
+\end{infobox}
+
+
+## Probability \& Convergence
+
+\begin{thmbox}[Central Limit Theorem]
+  Let $X_1, X_2, \ldots \iid (\mu, \sigma^2)$ with
+  $\sigma^2 < \infty$.  Then
+  \[
+    \sqrt{n}\,(\bar X_n - \mu) \;\convd\; \mathcal{N}(0,\,\sigma^2).
+  \]
+\end{thmbox}
+
+\begin{proofbox}[Proof Idea]
+  Use the characteristic-function approach:
+  $\varphi_{\bar X_n}(t) \to e^{-\sigma^2 t^2/2}$
+  by Taylor expansion of $\log\varphi_X$.
+\end{proofbox}
+
+
+## Aligned Equations
+
+Multi-line derivations render cleanly with `align*`:
+
+\begin{align*}
+  \hat\beta_{\text{OLS}}
+    &= (X'X)^{-1} X'y \\
+    &= \beta + (X'X)^{-1} X'\varepsilon \\
+  \E[\hat\beta \mid X]
+    &= \beta + (X'X)^{-1} X' \underbrace{\E[\varepsilon \mid X]}_{=\,0}
+     = \beta.
+\end{align*}
+
+\begin{infobox}[Remark]
+  Unbiasedness requires $\E[\varepsilon \mid X] = 0$
+  (strict exogeneity), which is stronger than
+  $\E[\varepsilon_i x_i] = 0$ (mean independence).
+\end{infobox}
+
+
+<!-- ================================================================
+     SECTION 3 — ECONOMETRICS
+     ================================================================ -->
+
+# Econometrics
+
+## Instrumental Variables
+
+\begin{defbox}[IV Estimator]
+Given instrument matrix $Z$ satisfying \textbf{relevance}
+($\text{rank}\, \E[Z'X] = k$) and \textbf{exogeneity}
+($\E[Z'\varepsilon] = 0$):
+\[
+  \hat\beta_{\text{IV}} = (Z'X)^{-1} Z'y.
+\]
+The two-stage least-squares (2SLS) generalisation for
+over-identification is
+$\hat\beta_{2\text{SLS}} = (X'P_Z X)^{-1} X'P_Z y$,
+where $P_Z = Z(Z'Z)^{-1}Z'$.
+\end{defbox}
+
+\begin{cautionbox}[Weak Instruments]
+  If the first-stage $F$-statistic is below $\approx 10$,
+  2SLS is severely biased toward OLS; consider LIML or
+  Anderson--Rubin confidence sets.
+\end{cautionbox}
+
+
+## Regression Table (modelsummary)
+
+```{r reg-table, echo=FALSE, eval=FALSE, results='asis'}
+# Uncomment when fixest / modelsummary are available
+# library(fixest) ; library(modelsummary)
+# m1 <- feols(y ~ x1,              data = df)
+# m2 <- feols(y ~ x1 + x2,         data = df)
+# m3 <- feols(y ~ x1 + x2 | fe_id, data = df)
+# modelsummary(
+#   list("(1)" = m1, "(2)" = m2, "(3)" = m3),
+#   output   = "latex_tabular",
+#   stars    = c("*" = .1, "**" = .05, "***" = .01),
+#   gof_map  = gof,
+#   coef_rename = c("x1" = "Treatment", "x2" = "Control Var")
+# )
+```
+
+\begin{center}\scriptsize
+\begin{tabular}{lccc}
+\toprule
+ & (1) & (2) & (3) \\
+\midrule
+Treatment       & 0.52$^{***}$ & 0.48$^{***}$ & 0.45$^{**}$  \\
+                & (0.12)       & (0.11)       & (0.18)       \\
+Control Var     &              & 0.33$^{**}$  & 0.30$^{*}$   \\
+                &              & (0.15)       & (0.16)       \\
+\midrule
+Fixed Effects   & No  & No  & Yes \\
+$N$             & 500 & 500 & 500 \\
+$R^2$           & 0.08 & 0.12 & 0.35 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+<!-- ================================================================
+     SECTION 4 — COMPUTER SCIENCE & ALGORITHMS
+     ================================================================ -->
+
+# Computer Science
+
+## Pseudocode with \texttt{algorithm2e}
+
+\begin{algobox}[Gradient Descent]
+\vspace{-2pt}
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetAlgoNoLine
+\KwIn{Learning rate $\eta$, initial $\theta^{(0)}$, tolerance $\epsilon$}
+\KwOut{$\hat\theta$}
+$t \gets 0$\;
+\Repeat{$\norm{\nabla L(\theta^{(t)})} < \epsilon$}{
+  $g \gets \nabla_\theta L(\theta^{(t)})$\;
+  $\theta^{(t+1)} \gets \theta^{(t)} - \eta\, g$\;
+  $t \gets t + 1$\;
+}
+\Return{$\theta^{(t)}$}\;
+\end{algorithm}
+\vspace{-4pt}
+\end{algobox}
+
+
+## Code Listing (Python) {.fragile}
+
+\begin{lstlisting}[language=Python, caption={Ridge regression via closed form}]
+import numpy as np
+
+def ridge(X, y, lam=1.0):
+    """Closed-form ridge regression."""
+    n, p = X.shape
+    I = np.eye(p)
+    beta = np.linalg.solve(X.T @ X + lam * I, X.T @ y)
+    return beta
+\end{lstlisting}
+
+
+## Code Listing (R) {.fragile}
+
+\begin{lstlisting}[language=R, caption={Fixed-effects panel regression}]
+library(fixest)
+
+# Estimate with two-way fixed effects
+m <- feols(
+  log(wage) ~ experience + education | firm + year,
+  data   = panel_df,
+  cluster = ~firm
+)
+summary(m)
+\end{lstlisting}
+
+
+<!-- ================================================================
+     SECTION 5 — TikZ DIAGRAMS
+     ================================================================ -->
+
+# Diagrams with TikZ
+
+## Machine-Learning Pipeline
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.6cm and 0.8cm,
+    stage/.style={
+      rectangle, rounded corners=4pt,
+      minimum width=2.2cm, minimum height=0.9cm,
+      font=\small\sffamily, text=white, align=center,
+      drop shadow={shadow xshift=0.5pt, shadow yshift=-0.5pt,
+                   fill=black!25}
+    },
+    arr/.style={-{Stealth[length=5pt]}, thick, accentgrey},
+  ]
+  % nodes
+  \node[stage, fill=accentgrey]   (raw)   {Raw Data};
+  \node[stage, fill=infocolor, right=of raw]   (clean) {Clean \&\\Wrangle};
+  \node[stage, fill=csblue,    right=of clean] (feat)  {Feature\\Engineering};
+  \node[stage, fill=mathpurple,right=of feat]  (model) {Model\\Training};
+  \node[stage, fill=successcolor,right=of model](eval)  {Evaluate};
+  \node[stage, fill=primary,   right=of eval]  (deploy){Deploy};
+  % arrows
+  \draw[arr] (raw)   -- (clean);
+  \draw[arr] (clean) -- (feat);
+  \draw[arr] (feat)  -- (model);
+  \draw[arr] (model) -- (eval);
+  \draw[arr] (eval)  -- (deploy);
+  % feedback loop
+  \draw[arr, warncolor, dashed]
+    (eval.south) -- ++(0,-0.55) -| node[below, pos=0.25,
+    font=\scriptsize\sffamily, text=warncolor]{retrain} (model.south);
+\end{tikzpicture}
+\end{center}
+
+
+## Econometric Identification Strategy (DAG)
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.5cm and 2.4cm,
+    var/.style={
+      circle, draw, thick, minimum size=1cm,
+      font=\small\sffamily, inner sep=2pt
+    },
+    arr/.style={-{Stealth[length=5pt]}, thick},
+  ]
+  % nodes
+  \node[var]                      (X)  {$X$};
+  \node[var, right=of X]          (Y)  {$Y$};
+  \node[var, above right=0.9cm and 1.2cm of X,
+        fill=warncolor!15, draw=warncolor] (U)  {$U$};
+  \node[var, left=of X,
+        fill=csblue!15, draw=csblue]       (Z)  {$Z$};
+
+  % edges
+  \draw[arr]                (X) -- node[below, font=\scriptsize]{causal?} (Y);
+  \draw[arr, warncolor]     (U) -- (X);
+  \draw[arr, warncolor]     (U) -- (Y);
+  \draw[arr, csblue]        (Z) -- node[below, font=\scriptsize]{1st stage} (X);
+
+  % annotations
+  \node[font=\scriptsize\sffamily, text=warncolor, above=0.05cm of U]
+    {Unobserved confounder};
+  \node[font=\scriptsize\sffamily, text=csblue, below=0.05cm of Z]
+    {Instrument};
+\end{tikzpicture}
+\end{center}
+
+\begin{infobox}[Reading the DAG]
+  $Z$ affects $Y$ \emph{only} through $X$ (exclusion restriction).
+  The confounder $U$ is the reason OLS is inconsistent.
+\end{infobox}
+
+
+## Neural-Network Architecture
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.2cm and 1.6cm,
+    neuron/.style={circle, draw, thick, minimum size=0.55cm,
+                   inner sep=0pt, font=\tiny},
+    arr/.style={-{Stealth[length=3pt]}, thin, accentgrey!70},
+    layer/.style={font=\scriptsize\sffamily, text=accentgrey},
+  ]
+  % Input layer
+  \foreach \i in {1,2,3,4}{
+    \node[neuron, fill=csblue!20, draw=csblue]
+      (I\i) at (0, -\i*0.7+1.75) {};
+  }
+  \node[layer, above=0.15cm of I1] {Input};
+
+  % Hidden layer 1
+  \foreach \i in {1,2,3,4,5}{
+    \node[neuron, fill=mathpurple!20, draw=mathpurple]
+      (H1\i) at (2, -\i*0.7+2.1) {};
+  }
+  \node[layer, above=0.15cm of H11] {Hidden 1};
+
+  % Hidden layer 2
+  \foreach \i in {1,2,3,4,5}{
+    \node[neuron, fill=mathpurple!20, draw=mathpurple]
+      (H2\i) at (4, -\i*0.7+2.1) {};
+  }
+  \node[layer, above=0.15cm of H21] {Hidden 2};
+
+  % Output layer
+  \foreach \i in {1,2}{
+    \node[neuron, fill=primary!20, draw=primary]
+      (O\i) at (6, -\i*0.7+0.7) {};
+  }
+  \node[layer, above=0.15cm of O1] {Output};
+
+  % Connections
+  \foreach \i in {1,...,4}
+    \foreach \j in {1,...,5}
+      \draw[arr] (I\i) -- (H1\j);
+  \foreach \i in {1,...,5}
+    \foreach \j in {1,...,5}
+      \draw[arr] (H1\i) -- (H2\j);
+  \foreach \i in {1,...,5}
+    \foreach \j in {1,...,2}
+      \draw[arr] (H2\i) -- (O\j);
+\end{tikzpicture}
+\end{center}
+
+
+## Software Architecture (Layered)
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={
+      rectangle, rounded corners=3pt,
+      minimum width=10cm, minimum height=0.85cm,
+      font=\small\sffamily, text=white, align=center
+    },
+  ]
+  \node[box, fill=csblue]       at (0, 0)    {Presentation Layer \quad (API / UI)};
+  \node[box, fill=infocolor]    at (0,-1.15) {Application Layer \quad (Business Logic)};
+  \node[box, fill=mathpurple]   at (0,-2.3)  {Domain Layer \quad (Models / Entities)};
+  \node[box, fill=accentgrey]   at (0,-3.45) {Infrastructure Layer \quad (DB / Cache / MQ)};
+\end{tikzpicture}
+\end{center}
+
+
+## Decision Flowchart
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.6cm and 1.3cm,
+    process/.style={rectangle, rounded corners=3pt, draw=csblue,
+                    fill=csblue!8, minimum width=2.5cm,
+                    minimum height=0.7cm, font=\small\sffamily,
+                    align=center},
+    decision/.style={diamond, draw=warncolor, fill=warncolor!8,
+                     minimum width=1.6cm, minimum height=0.8cm,
+                     font=\small\sffamily, align=center,
+                     aspect=2.2, inner sep=1pt},
+    arr/.style={-{Stealth[length=5pt]}, thick, accentgrey},
+  ]
+  \node[process]                     (start)  {Collect Data};
+  \node[decision, below=of start]    (eda)    {$n > p$\,?};
+  \node[process,  left=of eda]       (reg)    {Regularised\\Regression};
+  \node[process,  right=of eda]      (ols)    {OLS / MLE};
+  \node[decision, below=of eda]      (cv)     {CV error\\acceptable?};
+  \node[process,  below=of cv]       (report) {Report Results};
+  \node[process,  right=of cv]       (tune)   {Tune $\lambda$ /\\Add Features};
+
+  \draw[arr] (start) -- (eda);
+  \draw[arr] (eda)   -- node[above,font=\scriptsize]{No}  (reg);
+  \draw[arr] (eda)   -- node[above,font=\scriptsize]{Yes} (ols);
+  \draw[arr] (reg)   |- (cv);
+  \draw[arr] (ols)   |- (cv);
+  \draw[arr] (cv)    -- node[left,font=\scriptsize]{Yes} (report);
+  \draw[arr] (cv)    -- node[above,font=\scriptsize]{No}  (tune);
+  \draw[arr, dashed] (tune) |- (eda);
+\end{tikzpicture}
+\end{center}
+
+
+<!-- ================================================================
+     SECTION 6 — DATA SCIENCE / R PLOTS
+     ================================================================ -->
+
+# Data Visualisation
+
+## Slide with R Output {.fragile}
+
+```{r cars-summary, echo=TRUE}
+summary(cars)
+```
+
+## Slide with Plot
+
+```{r pressure-plot, fig.cap="Vapor pressure of mercury."}
+plot(pressure, pch = 19, col = "#A02337")
+```
+
+
+## ggplot2 Example {.fragile}
+
+```{r ggplot-demo, echo=TRUE, eval=TRUE, fig.height=2.6}
+library(ggplot2)
+ggplot(mpg, aes(displ, hwy, colour = factor(cyl))) +
+  geom_point(alpha = .7, size = 2) +
+  labs(x = "Displacement (L)", y = "Highway MPG",
+       colour = "Cylinders") +
+  scale_colour_manual(values = c("#1565C0","#2E7D32",
+                                 "#E65100","#A02337")) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+
+<!-- ================================================================
+     SECTION 7 — TABLES WITH kableExtra
+     ================================================================ -->
+
+# Tables
+
+## Formatted Table (kableExtra)
+
+```{r kable-demo, eval=TRUE}
+library(kableExtra)
+head(mtcars[, 1:6], 6) |>
+  kbl(booktabs = TRUE, caption = "Motor Trend Cars (excerpt)",
+      linesep = "") |>
+  kable_styling(font_size = 8,
+                latex_options = c("hold_position")) |>
+  row_spec(0, bold = TRUE, color = "white", background = "#A63547")
+```
+
+
+<!-- ================================================================
+     CLOSING
+     ================================================================ -->
+
+# Summary
+
+## Recap
+
+\begin{keybox}[What This Template Provides]
+\begin{itemize}
+  \item \textbf{8 custom colour boxes} — definition, theorem, proof,
+        info, caution, algorithm, key takeaway, plus 3 built-in Beamer blocks.
+  \item \textbf{TikZ diagrams} — pipelines, DAGs, neural nets,
+        flowcharts, layered architectures; all using palette colours.
+  \item \textbf{Math shortcuts} — $\E$, $\Var$, $\Cov$, $\Prob$,
+        $\argmin$, $\plim$, $\convp$, $\convd$, $\norm{\cdot}$, etc.
+  \item \textbf{Listings \& algorithm2e} — syntax-highlighted code +
+        pseudocode out of the box.
+  \item \textbf{Consistent palette} — change one
+        \texttt{\textbackslash definecolor} line and the whole deck follows.
+\end{itemize}
+\end{keybox}
+
+
+## Thank You {.plain}
+
+\begin{center}
+  {\Large\bfseries Questions?}
+
+  \vspace{10pt}
+  \textcolor{accentgrey}{
+    Author Name \quad $\cdot$ \quad \texttt{author@university.edu}
+  }
+\end{center}
+

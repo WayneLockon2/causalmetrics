@@ -1,0 +1,281 @@
+---
+title: "Replication: [Paper Title]"
+subtitle: "[Identification Strategy] - illustration using [Author Year]"
+author: "Replicated by [Your Name]"
+date: "`r Sys.Date()`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    keep_tex: false
+    latex_engine: xelatex
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+vignette: >
+  %\VignetteIndexEntry{causalmetrics Replication Vignette}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteEngine{knitr::rmarkdown}
+bibliography: references.bib
+link-citations: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi       = 150,
+  message   = FALSE,
+  warning   = FALSE
+)
+
+# This template is designed to knit before you replace placeholders.
+# Paper-specific code chunks are marked eval = FALSE until edited.
+optional_packages <- c(
+  "data.table", "ggplot2", "fixest", "modelsummary", "kableExtra"
+)
+missing_packages <- optional_packages[
+  !vapply(optional_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  message(
+    "Optional packages not installed: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running the empirical chunks."
+  )
+}
+```
+
+# Pedagogical goal {.unnumbered}
+
+> **One sentence: what should a reader learn from this vignette?**
+>
+> Example: *How to move from a randomized encouragement design to an IV
+> analysis when take-up is endogenous, while auditing sample construction,
+> attrition, balance, and first-stage strength.*
+
+This vignette uses **[Author Year]** as an illustration of **[identification strategy]**. The paper studies [one-sentence research question]. The point of the vignette is not to reproduce every result in the paper, but to teach the workflow for this design.
+
+**What is NOT in this vignette:**
+
+- [Robustness check] - [reason for exclusion]
+- [Supplementary specification] - [reason]
+- [Paper-specific calculation] - [reason]
+
+---
+
+# Design and data
+
+## Identification strategy
+
+[2-4 paragraphs.]
+
+- Causal estimand and parameter of interest.
+- Identification assumptions, stated formally and in plain English.
+- Threats to identification and how the paper addresses them.
+- Estimator used (be specific: e.g., "TWFE is inappropriate due to staggered timing; the paper uses Sun-Abraham via `fixest::sunab()`").
+
+## Data
+
+```{r load-data, eval = FALSE}
+# The demonstration dataset is built by data-raw/prep_replication_*.R.
+# Replace dataset_name with the dataset object exported by your package.
+data("dataset_name", package = "causalmetrics")
+dt <- data.table::as.data.table(dataset_name)
+
+dim(dt)
+```
+
+Variable definitions for this analysis:
+
+| Role | Variable | Description |
+|------|----------|-------------|
+| Unit | `unit_var` | [description] |
+| Time | `time_var` | [description] |
+| Treatment | `treat_var` | [description] |
+| Outcome | `outcome_var` | [description] |
+| Controls | `control_vars` | [description] |
+| Fixed effects | `fixed_effect_vars` | [description] |
+| Cluster | `cluster_var` | [description] |
+
+# Section 2: [Data construction and sample audit]
+
+> **What this section teaches:** [one idea]
+
+Auditing the sample construction is the first defense against silently changing the estimand. We use `diag_filter_flow()` to record observation counts at each filtering step, and `diag_special_codes()` to catch sentinel codes that would otherwise be treated as numeric outcomes.
+
+```{r sample-flow, eval = FALSE}
+flow <- causalmetrics::diag_filter_flow(dt, list(
+  "Initial observations" = function(d) rep(TRUE, nrow(d)),
+  "First filter"         = function(d) d[["your_indicator"]] == 1,
+  "Second filter"        = function(d) !is.na(d[["your_variable"]])
+  # Add filters as needed.
+))
+
+knitr::kable(
+  flow,
+  caption = "Sample construction.",
+  booktabs = TRUE
+)
+```
+
+```{r special-codes, eval = FALSE}
+# Example: detect sentinel codes.
+causalmetrics::diag_special_codes(
+  dt,
+  vars = c("var1", "var2"),
+  codes = c(-1, 88, 99)
+)
+```
+
+# Section 3: [Descriptive statistics]
+
+> **What this section teaches:** [one idea]
+
+```{r summary, eval = FALSE}
+sum_tab <- causalmetrics::desc_summary(
+  dt,
+  vars = c("var1", "var2", "var3"),
+  by   = "treat_var"
+)
+
+causalmetrics::to_latex(
+  sum_tab,
+  caption = "Summary statistics by treatment.",
+  label = "tab:summary"
+)
+```
+
+# Section 4: [Design-specific diagnostics]
+
+> **What this section teaches:** what to check before estimation for this identification strategy.
+
+Different identification strategies need different diagnostics. Edit this section based on the design.
+
+**For RCT / randomized encouragement:**
+
+```{r balance, eval = FALSE}
+causalmetrics::desc_balance(
+  dt,
+  vars = c("cov1", "cov2"),
+  treat = "treat"
+) |>
+  causalmetrics::to_latex(
+    caption = "Baseline balance.",
+    label = "tab:balance"
+  )
+```
+
+**For DiD:**
+
+```{r did-diag, eval = FALSE}
+# Plot treatment timing across cohorts.
+causalmetrics::plot_treatment_timing(
+  dt,
+  unit = "unit",
+  time = "time",
+  treat = "treat"
+)
+```
+
+**For IV:**
+
+```{r iv-diag, eval = FALSE}
+# First-stage regression. Call fixest directly.
+first_stage <- fixest::feols(
+  endog_var ~ instrument_var + control_var | fixed_effect_var,
+  data = dt,
+  cluster = ~ cluster_var
+)
+fixest::fitstat(first_stage, "ivf1")
+```
+
+**For RD:**
+
+```{r rd-diag, eval = FALSE}
+# McCrary density test, bandwidth sensitivity, and covariate balance at cutoff.
+# rdrobust::rddensity(...)
+```
+
+# Section 5: Estimation
+
+> **What this section teaches:** the main estimator for this design.
+
+External estimators are called directly. causalmetrics does not wrap them.
+
+```{r estimate, eval = FALSE}
+# Edit this chunk for the relevant identification strategy.
+
+# Example - staggered DiD via Sun-Abraham:
+fit <- fixest::feols(
+  outcome_var ~ fixest::sunab(cohort_var, time_var) | unit_fe + time_fe,
+  data = dt,
+  cluster = ~ cluster_var
+)
+
+summary(fit, agg = "att")
+```
+
+## Regression table
+
+```{r regtable, eval = FALSE}
+modelsummary::modelsummary(
+  list("Main" = fit),
+  output    = "latex",
+  estimate  = "{estimate}{stars}",
+  statistic = "({std.error})",
+  stars     = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
+  gof_map   = c("nobs", "r.squared"),
+  notes     = "Clustered standard errors at [level]."
+)
+```
+
+## Event study figure
+
+```{r event-study, eval = FALSE, fig.cap = "Event study coefficients."}
+# plot_event_study() reads fixest output directly.
+causalmetrics::plot_event_study(fit) +
+  ggplot2::labs(x = "Event time", y = "ATT")
+```
+
+# Section 6: Interpretation
+
+[2-4 paragraphs.]
+
+- What the point estimate means substantively.
+- What the LATE / ATT / ATE represents in this context.
+- Magnitude relative to the outcome's baseline level.
+- Comparison to the paper's headline number.
+- Limitations the paper acknowledges.
+
+# Decision summary
+
+This block is the formal record that the SKILL.md references. It captures the workflow decisions made in this vignette.
+
+```yaml
+design: "staggered DiD with heterogeneous treatment timing"
+estimator: "native call, e.g. fixest::sunab"
+diagnostics_run:
+  - diag_filter_flow: "N units, N observations final sample"
+  - diag_special_codes: "codes checked"
+  - design_specific_diagnostic: "result"
+clustering: "level"
+fixed_effects: "list"
+controls: "list"
+output: "tables and figures produced"
+key_judgment: >
+  Why this estimator was chosen over alternatives. What the threats to
+  identification are. What is being estimated and on what population.
+limitations:
+  - "limitation 1"
+  - "limitation 2"
+```
+
+# References {.unnumbered}
+
+Add citation entries to `references.bib` and cite with `[@example2024]`.

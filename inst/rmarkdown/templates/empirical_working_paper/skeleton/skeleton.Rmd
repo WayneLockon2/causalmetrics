@@ -1,0 +1,103 @@
+---
+title: "TITLE"
+thankstitle: "thanks title"
+author: "Your Name"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+thanks: "Last Name: University of Wisconsin Madison"
+output:
+  pdf_document:
+    template: template.tex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 6,
+  fig.height = 3,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "0.8\\linewidth",
+  size = "footnotesize",
+  comment = NA
+)
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+```
+
+\begin{abstract}
+ABSTRACT .......................
+
+\bigskip
+\noindent KEYWORDS: \textbf{KEYWORDS}
+\end{abstract}
+
+\thispagestyle{empty} 
+
+\clearpage
+\setcounter{page}{1}
+
+\section{Introduction}\label{introduction}
+\onehalfspacing
+
+\section{Theoretical Foundation} \label{sec:3}
+
+\subsection{Conventional Theory} \label{sec:3.1}
+
+\paragraph{The Background of U.S. Mortgage}
+
+In the United States, most mortgage have a fixed interest rate and no
+prepayment penalties. Thus, household could decide prepayment based on
+their potential savings. On the other hand, to share the risk of
+default, banks would sale mortgage backed securities (MBS).  MBS and mortgage loans constitute a major share of United States fixed income markets, comparable in size to that of Treasuries \citep{RN131}. And therefore, the fluctuations of MBS accounts for a considerable share in the aggregate risk of fixed income market. 
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\linewidth]{plot1.png}
+    \caption{NBER DATES AND ESTIMATED BUSINESS CYCLE PROXY}
+    \label{fig:1}
+    \caption*{\footnotesize  \textit{Notes}: The solid line is estimated business cycle using CFA. And the shadow area is recessions defined by NBER.}
+\end{figure}
+
+\begin{table}[H] 
+    \caption{potential structural breaking points }
+    \centering
+    \label{tab:a1}
+    \scalebox{0.8}{\begin{tabular}{lclc}
+        \toprule
+        Variable & Quarter & Variable & Quarter \\ \midrule
+        BC & 1992 Q3 & MP & 1973 Q1 \\ 
+        ~ & 1999 Q2 & ~ & 1975 Q1 \\
+        ~ & 2011 Q1 & ~ & 1977 Q3 \\
+        ~ & ~ & ~ & 1984 Q4 \\ 
+        ~ & ~ & ~ & 1995 Q2 \\ 
+        ~ & ~ & ~ & 1999 Q4 \\ 
+        ~ & ~ & ~ & 2005 Q4 \\ 
+        ~ & ~ & ~ & 2007 Q3 \\ \vspace{2\baselineskip}\\
+        FD & 1990 Q3 & GG & 1984 Q2 \\
+        ~ & 2000 Q2 & ~ & 2008 Q2 \\ 
+        ~ & 2013 Q1 & ~ & 2009 Q2 \\ \vspace{2\baselineskip}\\
+        RL & 1973 Q2 & ~ & ~ \\
+        ~ & 1989 Q1 & ~ & ~ \\ 
+        ~ & 2006 Q4 & ~ & ~ \\ 
+        ~ & 2007 Q3  & ~ &  ~ \\ \bottomrule
+    \end{tabular}}
+    \caption*{\footnotesize  \textit{Notes}: Here monetary policy with the most change points, as this variable is also affected by the change of the chair of Fed.}    
+\end{table}
+
+\newpage
+
+\singlespacing
+\bibliographystyle{ecta}
+\bibliography{references}
+
+\appendix
+\counterwithin{figure}{section}
+\counterwithin{table}{section}
+\onehalfspacing
+\titleformat{\section}{\normalsize\bfseries}{\appendixname~\thesection.}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{~\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{~\thesubsubsection}{1em}{}

@@ -1,0 +1,7 @@
+name: causalmetrics Replication Vignette
+description: >
+  Pedagogically organized replication vignette template. Teaches one
+  identification strategy using a published paper as illustration. Includes
+  sections for data, diagnostics, estimation, and a decision summary block
+  for the SKILL.md.
+create_dir: true

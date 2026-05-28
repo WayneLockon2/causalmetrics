@@ -1,0 +1,62 @@
+---
+title: "Lecture: "
+subtitle: "Econ 700"
+author: "Your Name"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document: 
+    template: template.tex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.width=6, fig.height=3, fig.align="center", size = "footnotesize")
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+```
+
+\begin{enumerate}
+\item \textcolor{Lblue}{Lecture Blue, Lblue}
+\item \textcolor{Lred}{Lecture Red, Lred}
+\item \textcolor{Lbg}{Lecture Blue Green, Lbg}
+\item \textcolor{Llg}{Lecture lightgreen, Llg}
+\item \textcolor{Ldg}{Lecture darkgreen, Ldg}
+\end{enumerate}
+
+This is some warmup discussion before the first section.
+
+\section{Here's a section header}
+
+\subsection{Here's a subsection}
+
+You might like to put use subsectioning these too.  An alternate way to put in a small subheading for a paragraph is to use the \begin{verbatim} \paragraph \end{verbatim} command.  For example:
+
+\paragraph{A remembrance by Dantzig.}  The early days were full of intense excitement. Scientists, free at last from war-time pressures, entered the post-war period hungry for new areas of research. The computer came on the scene at just the right time. Economists and mathematicians were intrigued with the possibility that the fundamental problem of optimal allocation of scarce resources could be numerically solved. Not too long after my first meeting with Tucker there was a meeting of the Econometric Society in Wisconsin attended by well-known statisticians and mathematicians like Hotelling and von Neumann, and economists like Koopmans. I was a young unknown and I remember how frightened I was at the idea of presenting for the first time to such a distinguished audience, the concept of linear programming.
+
+
+## Table
+
+\begin{table}[H]
+\centering
+\caption{"Caption"}
+\resizebox{0.8\textwidth}{0.4\textheight}{\input{"table.tex"}}
+\end{table}
+
+## Figure
+
+\begin{figure}
+\caption{"Caption"}
+\begin{center}\includegraphics[width=0.8\textwidth]{Figure1.pdf} \end{center}
+
+{\footnotesize  \textit{Notes}: Figure notes ........................}
+\end{figure}
+
+More equations:
+
+$\max \Big\{ \sum_{i \in Observations} \Big( y_i - \sum_{j \in Candidates} \beta_j x_{i,j} \Big) ^2 \Big\}$
+
+$\max\Bigg\{ \sum_{i \in Observations} \Big| y_i - \sum_{j \in Candidates} \beta_j x_{i,j} \Big| \Bigg\}$
+
+

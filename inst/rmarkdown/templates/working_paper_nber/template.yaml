@@ -1,0 +1,3 @@
+name: NBER-style working paper
+description: A simple NBER-style R Markdown template for empirical economics and marketing-science working papers.
+create_dir: true

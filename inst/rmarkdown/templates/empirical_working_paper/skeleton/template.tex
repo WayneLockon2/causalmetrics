@@ -1,0 +1,207 @@
+\PassOptionsToPackage{svgnames,dvipsnames,table}{xcolor}
+\documentclass[12pt]{article}
+
+% ------------------------------------------------------------
+% Core encoding, language, and typography
+% ------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{setspace}
+\usepackage{geometry}
+\geometry{left=1.15in,right=1.15in,top=1.25in,bottom=1.2in}
+\onehalfspacing
+\frenchspacing
+
+% ------------------------------------------------------------
+% Math, probability, statistics, and econometrics
+% ------------------------------------------------------------
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathrsfs,mathtools}
+\usepackage{bm}
+\usepackage{fixmath}
+\IfFileExists{bbm.sty}{\usepackage{bbm}}{}
+\IfFileExists{dsfont.sty}{\usepackage{dsfont}}{}
+\setcounter{MaxMatrixCols}{10}
+
+% Common notation for math, CS, data science, and econometrics
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\Corr}{\operatorname{Corr}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\plim}{\operatorname*{plim}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\indep}{\perp\!\!\!\perp}
+\newcommand{\convp}{\xrightarrow{p}}
+\newcommand{\convd}{\xrightarrow{d}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\1}[1]{\mathbf{1}\{#1\}}
+
+% ------------------------------------------------------------
+% Figures, tables, floats, and empirical-output helpers
+% ------------------------------------------------------------
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage[section]{placeins}
+\usepackage{booktabs}
+\usepackage{array,tabularx,longtable,multirow,makecell}
+\usepackage[flushleft]{threeparttable}
+\usepackage{adjustbox}
+\usepackage{siunitx}
+\sisetup{detect-all, group-separator={,}, group-minimum-digits=4}
+\usepackage{lscape}
+\usepackage{pdflscape}
+\usepackage{rotating}
+\usepackage{pdfpages}
+\usepackage[labelfont=bf,labelsep=period]{caption}
+\usepackage{subcaption}
+\usepackage{chngcntr}
+
+% Graphics defaults used by Pandoc/R Markdown
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\maxheight{\ifdim\Gin@nat@height>0.85\textheight 0.85\textheight\else\Gin@nat@height\fi}
+\makeatother
+\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+\providecommand{\pandocbounded}[1]{#1}
+
+% ------------------------------------------------------------
+% Code, algorithms, and diagrams
+% ------------------------------------------------------------
+\usepackage{fancyvrb}
+\usepackage{framed}
+\usepackage{upquote}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc,fit,decorations.pathreplacing}
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  frame=single,
+  rulecolor=\color{gray!40}
+}
+
+% ------------------------------------------------------------
+% Lists, appendix, titles, headers, and spacing
+% ------------------------------------------------------------
+\usepackage{enumitem}
+\setlist{nolistsep,leftmargin=*}
+\usepackage[title]{appendix}
+\renewcommand{\appendixname}{Appendix}
+\usepackage{sectsty}
+\usepackage{titlesec}
+\usepackage{titling}
+\usepackage{fancyhdr}
+\usepackage{afterpage}
+\usepackage[bottom,multiple,splitrule]{footmisc}
+\usepackage[normalem]{ulem}
+\usepackage{abstract}
+\renewcommand{\abstractname}{}
+
+\titlespacing*{\section}{0in}{.2in}{.03in}
+\titlespacing*{\subsection}{0in}{.1in}{0.03in}
+\titlespacing*{\paragraph}{0in}{.08in}{0.15in}
+\titleformat{\section}{\normalsize\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{1em}{}
+
+% ------------------------------------------------------------
+% Citations, links, URLs, and cross-references
+% ------------------------------------------------------------
+\usepackage[authoryear,round,longnamesfirst]{natbib}
+\usepackage{xurl}
+\urlstyle{same}
+\definecolor{maroon}{RGB}{100,0,0}
+\usepackage[colorlinks=true,
+            linkcolor=blue,
+            urlcolor=blue,
+            citecolor=blue,
+            anchorcolor=blue,
+            bookmarksnumbered=true]{hyperref}
+\usepackage[capitalize,nameinlink]{cleveref}
+\usepackage{xr}
+
+% ------------------------------------------------------------
+% Optional legacy packages. Loaded only if installed.
+% ------------------------------------------------------------
+\IfFileExists{sgame.sty}{\usepackage{sgame}}{}
+\IfFileExists{menukeys.sty}{\usepackage{menukeys}}{}
+\IfFileExists{subfiles.sty}{\usepackage{subfiles}}{}
+\IfFileExists{thmtools.sty}{\usepackage{thmtools}}{}
+
+% ------------------------------------------------------------
+% Pandoc/R Markdown compatibility
+% ------------------------------------------------------------
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\let\clipbox\relax
+
+$if(highlighting-macros)$
+$highlighting-macros$
+$endif$
+
+$for(header-includes)$
+$header-includes$
+$endfor$
+
+% ------------------------------------------------------------
+% Theorem environments
+% ------------------------------------------------------------
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem{claim}{Claim}
+\newtheorem{fact}{Fact}
+\newtheorem{result}{Result}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{assumption}{Assumption}
+\newtheorem{condition}{Condition}
+\newtheorem{example}{Example}
+\newtheorem{exercise}{Exercise}
+\newtheorem{problem}{Problem}
+\newtheorem{case}{Case}
+
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+\newtheorem{observation}{Observation}
+\newtheorem{notation}{Notation}
+\newtheorem{solution}{Solution}
+\newtheorem{summary}{Summary}
+\newtheorem{acknowledgement}{Acknowledgement}
+\newtheorem{conclusion}{Conclusion}
+\newtheorem{criterion}{Criterion}
+\newtheorem{conjecture}{Conjecture}
+\newtheorem{property}{Property}
+
+\crefname{observation}{Observation}{Observations}
+\crefname{eqnarray}{Eq.}{Eqs.}
+
+\begin{document}
+
+$if(title)$
+\title{$title$$if(thankstitle)$\thanks{$thankstitle$}$endif$}
+$endif$
+\author{$for(author)$$author$$sep$ \and $endfor$$if(thanks)$\thanks{$thanks$}$endif$}
+$if(date)$\date{$date$}$endif$
+\maketitle
+
+\vspace{-.3in}
+
+$body$
+
+\end{document}

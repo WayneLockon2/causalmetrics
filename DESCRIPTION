@@ -1,13 +1,40 @@
 Package: causalmetrics
-Title: What the Package Does (One Line, Title Case)
-Version: 0.0.0.9000
+Title: Causal Inference Toolkit for Applied Empirical Research
+Version: 0.0.1
 Authors@R: 
-    person("First", "Last", , "first.last@example.com", role = c("aut", "cre"))
-Description: What the package does (one paragraph).
+    person("Weiheng", "Zhang", email = "weiheng.zhang@utdallas.edu", role = c("aut", "cre"))
+Description: An opinionated workflow layer for causal inference and
+    reduced-form empirical analysis. Wraps fixest, grf, rdrobust, and other
+    backends with unified diagnostics, data preparation utilities, and
+    publication-ready output. Built on data.table for performance.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 8.0.0
-Suggests: 
-    testthat (>= 3.0.0)
+RoxygenNote: 7.3.0
+Depends:
+    R (>= 4.1.0)
+Imports:
+    data.table,
+    fixest,
+    checkmate,
+    rlang,
+    generics,
+    ggplot2
+Suggests:
+    testthat (>= 3.0.0),
+    broom,
+    modelsummary,
+    kableExtra,
+    grf,
+    rdrobust,
+    did,
+    MatchIt,
+    ranger,
+    xgboost,
+    glmnet,
+    estimatr,
+    DBI,
+    knitr,
+    rmarkdown
 Config/testthat/edition: 3
+VignetteBuilder: knitr
