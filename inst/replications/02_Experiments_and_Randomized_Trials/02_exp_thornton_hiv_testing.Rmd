@@ -1,0 +1,38 @@
+---
+title: "Replication: Demand for, and Impact of, Learning HIV Status"
+subtitle: "Randomized incentives, VCT distance, and encouragement-design logic in Thornton (2008)"
+author: "Weiheng Zhang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: 
+    template: template.tex
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi       = 150,
+  message   = FALSE,
+  warning   = FALSE
+)
+
+optional_packages <- c(
+  "dplyr", "ggplot2", "haven", "broom", "estimatr", "fixest", "modelsummary"
+)
+missing_packages <- optional_packages[
+  !vapply(optional_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  message(
+    "Optional packages not installed: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running the empirical chunks."
+  )
+}
+```
+
+

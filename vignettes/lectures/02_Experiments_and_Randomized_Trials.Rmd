@@ -1,0 +1,1106 @@
+---
+title: "causalmetrics lecture note, Section 2"
+subtitle: "Experiments and Randomized Trials"
+author: "Weiheng Zhang"
+date: "`r Sys.Date()`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    toc_depth: 4
+    keep_tex: false
+    latex_engine: xelatex
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+vignette: >
+  %\VignetteIndexEntry{causalmetrics: Experiments and Randomized Trials}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteEngine{knitr::rmarkdown}
+link-citations: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi       = 150,
+  message   = FALSE,
+  warning   = FALSE
+)
+
+optional_packages <- c(
+  "dplyr", "ggplot2", "broom", "estimatr", "fixest", "sandwich",
+  "clubSandwich", "randomizr", "ri2", "modelsummary", "marginaleffects"
+)
+missing_packages <- optional_packages[
+  !vapply(optional_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  message(
+    "Optional packages not installed: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running the empirical chunks."
+  )
+}
+```
+
+# The causal problem
+
+## Potential outcomes and the fundamental problem
+
+The core difficulty in causal inference is that for each unit \(i\), nature generates two latent potential outcomes:
+
+\[
+\left\{Y_i(1), \quad Y_i(0)\right\}.
+\]
+
+Only one of these outcomes is observed. If \(T_i\) denotes treatment receipt, the observed outcome is
+
+\[
+Y_i = T_iY_i(1) + (1-T_i)Y_i(0).
+\]
+
+This is the **fundamental problem of causal inference**: the counterfactual outcome is always missing. For a treated unit, we do not observe what would have happened without treatment. For a control unit, we do not observe what would have happened under treatment. Consequently, causality is not merely a prediction problem. It is a missing-data problem.
+
+## Selection bias
+
+A useful way to see the problem is through the standard decomposition:
+
+\[
+\mathbb{E}[Y_i \mid T_i=1] - \mathbb{E}[Y_i \mid T_i=0]
+=
+\underbrace{\mathbb{E}[Y_i(1)-Y_i(0)\mid T_i=1]}_{\text{ATT}}
++
+\underbrace{\left(\mathbb{E}[Y_i(0)\mid T_i=1]-\mathbb{E}[Y_i(0)\mid T_i=0]\right)}_{\text{selection bias}}.
+\]
+
+The first term is causal. The second term is selection bias. In observational comparisons, the second term is generally nonzero. People who choose a treatment are usually different from people who do not choose it.
+
+## How experiments solve the problem
+
+Randomized experiments solve this problem by moving treatment assignment outside the choice system of the units being studied. In an ideal randomized experiment, the treatment assignment mechanism is known and independent of the potential outcomes. The comparison between treated and control units is then causal because the design, not the regression model, creates the counterfactual comparison.
+
+This is the sense in which randomized trials are **design-based**. The identifying claim rests on the assignment mechanism. Regression, matching, tables, and plots help summarize and diagnose the design, but they do not create the causal variation.
+
+## Experimental notation
+
+A clean experimental notation separates four objects:
+
+| Symbol | Meaning | Example |
+|---|---|---|
+| \(Z_i\) | treatment assignment or offer | randomized solicitation, voucher, subsidy arm |
+| \(D_i\) | actual treatment take-up | posted a review, learned HIV status, used the voucher |
+| \(Y_i\) | outcome | spending, condom purchase, food consumption |
+| \(R_i\) | outcome observation indicator | followed up, outcome not missing |
+
+When assignment and treatment receipt coincide, \(Z_i=D_i\). Many experiments are not that simple. In Karaman's review-solicitation experiment, `solicit` is the randomized assignment \(Z_i\), while `review` is the realized treatment \(D_i\). In Thornton's HIV testing experiment, incentives and distance encourage people to learn their HIV results, but the endogenous object is whether the person actually learns the result.
+
+# Estimands
+
+## Average treatment effect
+
+The main population estimand in a simple randomized controlled trial is the **Average Treatment Effect**:
+
+\[
+\tau \equiv \mathbb{E}[Y_i(1)-Y_i(0)].
+\]
+
+Randomized experiments identify averages and marginal distributions of potential outcomes. They do not identify each individual treatment effect \(Y_i(1)-Y_i(0)\), because the joint distribution of \((Y_i(1),Y_i(0))\) is not observed.
+
+## Intention-to-treat effect
+
+When the experiment randomizes an offer or encouragement \(Z_i\), the cleanest estimand is usually the **intention-to-treat** effect:
+
+\[
+ITT_Y = \mathbb{E}[Y_i \mid Z_i=1]-\mathbb{E}[Y_i \mid Z_i=0].
+\]
+
+This is the causal effect of assignment or offer. It is often the most policy-relevant estimand because real programs are usually offers, recommendations, prices, subsidies, or access changes rather than deterministic treatment receipt.
+
+# Identification via randomization
+
+## Independence and the elimination of selection bias
+
+In a randomized experiment, assignment is independent of the potential outcomes:
+
+\[
+Z_i \perp \big(Y_i(1),Y_i(0)\big).
+\]
+
+If assignment equals treatment receipt, \(Z_i=T_i\), then
+
+\[
+\mathbb{E}[Y_i\mid Z_i=1]=\mathbb{E}[Y_i(1)],
+\qquad
+\mathbb{E}[Y_i\mid Z_i=0]=\mathbb{E}[Y_i(0)].
+\]
+
+Therefore,
+
+\[
+\mathbb{E}[Y_i\mid Z_i=1]-\mathbb{E}[Y_i\mid Z_i=0]
+=
+\mathbb{E}[Y_i(1)]-\mathbb{E}[Y_i(0)]
+=\tau.
+\]
+
+Randomization kills the selection-bias term:
+
+\[
+\mathbb{E}[Y_i(0)\mid Z_i=1]-\mathbb{E}[Y_i(0)\mid Z_i=0]=0.
+\]
+
+The same logic applies to the effect of assignment when assignment differs from take-up. If \(Z_i\) is randomized, then
+
+\[
+\mathbb{E}[Y_i\mid Z_i=1]-\mathbb{E}[Y_i\mid Z_i=0]
+\]
+
+identifies the causal effect of assignment, even if the effect of treatment receipt requires further assumptions.
+
+## Conditional and blocked randomization
+
+Sometimes assignment is randomized within blocks or strata. Let \(S_i\) be a stratum. Conditional randomization means
+
+\[
+Z_i \perp \big(Y_i(1),Y_i(0)\big) \mid S_i.
+\]
+
+Then the causal effect is identified by comparing treated and control units within strata and aggregating:
+
+\[
+\tau = \sum_s \Pr(S_i=s)
+\left[\mathbb{E}[Y_i\mid Z_i=1,S_i=s]-\mathbb{E}[Y_i\mid Z_i=0,S_i=s]\right].
+\]
+
+The design feature matters for estimation and inference. If treatment probabilities differ across strata, a single unweighted difference in means can target the wrong estimand.
+
+The block-specific estimator is
+
+\[
+\hat\tau_s = \bar Y_{1s}-\bar Y_{0s}.
+\]
+
+A natural aggregate is
+
+\[
+\hat\tau_{block} = \sum_s w_s\hat\tau_s,
+\]
+
+where \(w_s\) is typically the sample or population share of stratum \(s\). Blocking is especially valuable when strata are predictive of outcomes or when subgroup analysis is planned before the experiment.
+
+# Estimation
+
+## Difference in means
+
+Once treatment assignment is randomized, the most natural estimator of the ATE or ITT is the difference in sample means:
+
+\[
+\hat\tau = \bar Y_1 - \bar Y_0
+= \frac{1}{N_1}\sum_{i:Z_i=1}Y_i
+- \frac{1}{N_0}\sum_{i:Z_i=0}Y_i.
+\]
+
+Under randomization,
+
+\[
+\mathbb{E}[\hat\tau]
+=
+\mathbb{E}[\bar Y_1]-\mathbb{E}[\bar Y_0]
+=
+\mathbb{E}[Y_i(1)]-\mathbb{E}[Y_i(0)]
+=\tau.
+\]
+
+So the difference in means is not merely descriptive. In a randomized experiment, it is causal.
+
+```{r simulated-difference-in-means}
+set.seed(2026)
+N <- 1000
+x <- rnorm(N)
+Z <- rbinom(N, size = 1, prob = 0.5)
+tau <- 2
+Y0 <- 1 + x + rnorm(N)
+Y1 <- Y0 + tau
+Y <- ifelse(Z == 1, Y1, Y0)
+exp_df <- data.frame(unit_id = seq_len(N), Z = Z, x = x, Y = Y)
+
+with(exp_df, mean(Y[Z == 1]) - mean(Y[Z == 0]))
+```
+
+## OLS equivalence
+
+The simplest experimental regression is
+
+\[
+Y_i = \beta_0 + \beta_1 Z_i + \varepsilon_i.
+\]
+
+In a randomized experiment with binary assignment, the OLS coefficient \(\hat\beta_1\) is exactly the difference in means. OLS fits group means in this two-cell model:
+
+\[
+\hat\beta_0 = \bar Y_0,
+\qquad
+\hat\beta_0+\hat\beta_1 = \bar Y_1.
+\]
+
+Subtracting the two equations gives
+
+\[
+\hat\beta_1 = \bar Y_1-\bar Y_0 = \hat\tau.
+\]
+
+Regression does not change the estimator in the simplest experiment. It repackages the comparison in a form that generalizes easily to covariates, interactions, fixed effects, and non-binary treatments.
+
+```{r ols-equivalence}
+diff_means <- with(exp_df, mean(Y[Z == 1]) - mean(Y[Z == 0]))
+ols_fit <- lm(Y ~ Z, data = exp_df)
+
+c(
+  difference_in_means = diff_means,
+  ols_coefficient = unname(coef(ols_fit)["Z"])
+)
+```
+
+## Covariate adjustment and precision
+
+Because treatment is randomized, adding pre-treatment covariates is not needed for identification. The goal is precision. Covariates explain residual variation in \(Y_i\), which can shrink the standard error of the treatment effect.
+
+A simple adjusted specification is
+
+\[
+Y_i=\alpha+\tau Z_i+X_i'\beta+u_i.
+\]
+
+This specification is consistent for the ATE in a randomized experiment if \(X_i\) is pre-treatment and assignment is randomized, even if the true conditional mean is nonlinear. A stronger precision result is associated with the Lin-style interacted specification:
+
+\[
+Y_i
+=
+\alpha+\tau Z_i+(X_i-\bar X)'\beta+Z_i(X_i-\bar X)'\gamma+u_i.
+\]
+
+With demeaned pre-treatment covariates and treatment interactions, the coefficient on \(Z_i\) still targets the ATE and the estimator is asymptotically at least as precise as the unadjusted difference in means under broad conditions.
+
+```{r covariate-adjustment}
+fit_unadjusted <- estimatr::lm_robust(Y ~ Z, data = exp_df, se_type = "HC2")
+fit_adjusted <- estimatr::lm_robust(Y ~ Z + x, data = exp_df, se_type = "HC2")
+fit_interacted <- estimatr::lm_robust(
+  Y ~ Z * I(x - mean(x)),
+  data = exp_df,
+  se_type = "HC2"
+)
+
+modelsummary::modelsummary(
+  list(
+    "Unadjusted" = fit_unadjusted,
+    "Adjusted" = fit_adjusted,
+    "Interacted" = fit_interacted
+  ),
+  statistic = "std.error"
+)
+```
+
+## FWL intuition
+
+The Frisch--Waugh--Lovell theorem explains what adjustment does. Suppose we run
+
+\[
+Y_i = \alpha + \tau Z_i + X_i'\beta + u_i.
+\]
+
+Let \(M_X\) be the residual-maker matrix that projects variables off the span of the controls and intercept. Define
+
+\[
+\tilde Y = M_XY,
+\qquad
+\tilde Z = M_XZ.
+\]
+
+FWL says that the coefficient on \(Z\) in the full regression is exactly the coefficient from regressing residualized outcome on residualized treatment:
+
+\[
+\hat\tau = \frac{\tilde Z'\tilde Y}{\tilde Z'\tilde Z}.
+\]
+
+So adjustment compares the part of the outcome not predicted by pre-treatment covariates to the part of assignment not predicted by those covariates. In a randomized experiment, \(\tilde Z\) should not be strongly predictable from \(X\). The precision gain comes mostly from reducing residual variation in \(Y\). The full proof is in Appendix \@ref(app-fwl).
+
+# Inference
+
+## Large-sample inference and two-sample t-tests
+
+For large samples, inference often relies on the law of large numbers and the central limit theorem. Let
+
+\[
+\hat\sigma_d^2
+=
+\frac{1}{N_d-1}\sum_{i:Z_i=d}(Y_i-\bar Y_d)^2,
+\qquad d\in\{0,1\}.
+\]
+
+Then
+
+\[
+\frac{\hat\tau-\tau}{\sqrt{\hat\sigma_1^2/N_1+\hat\sigma_0^2/N_0}}
+\overset{d}{\longrightarrow} N(0,1).
+\]
+
+Under the weak null \(H_0:\tau=0\), the two-sample statistic is
+
+\[
+t
+=
+\frac{\hat\tau}{\sqrt{\hat\sigma_1^2/N_1+\hat\sigma_0^2/N_0}}.
+\]
+
+For a two-sided 5 percent test, the large-sample rule rejects when \(|t|>1.96\). In R, the simplest direct implementation is `t.test()` or an OLS regression with heteroskedasticity-robust standard errors.
+
+```{r t-test-and-robust-se}
+t.test(Y ~ Z, data = exp_df)
+
+estimatr::lm_robust(Y ~ Z, data = exp_df, se_type = "HC2")
+```
+
+## Why robust standard errors are natural in experiments
+
+Heterogeneous treatment effects mechanically generate heteroskedasticity. The full random-coefficient derivation is in Appendix \@ref(app-heteroskedasticity). The main result is that even with randomized assignment, the regression error variance can differ by treatment status:
+
+\[
+\mathrm{Var}(u_i\mid Z_i=0)\neq \mathrm{Var}(u_i\mid Z_i=1).
+\]
+
+That is why heteroskedasticity-robust standard errors are the default for regression analysis of experiments. In the scalar treatment-coefficient case with controls partialled out, the robust asymptotic variance can be written as
+
+\[
+V_\tau = \frac{\mathbb{E}[\epsilon_i^2\tilde Z_i^2]}{\mathbb{E}[\tilde Z_i^2]^2},
+\]
+
+where \(\tilde Z_i\) is assignment residualized on the included controls. With many controls or many fixed effects, conventional HC0/HC1 formulas can become unreliable; HC2 or HC3 corrections are often preferable in finite samples.
+
+```{r sandwich-robust-se}
+fit_lm <- lm(Y ~ Z + x, data = exp_df)
+V_hc2 <- sandwich::vcovHC(fit_lm, type = "HC2")
+sqrt(diag(V_hc2))
+```
+## Clustered inference
+
+Many experiments randomize or expose groups: villages, schools, households, stores, platforms, branches, or markets. Even when assignment occurs at the individual level, outcomes can be correlated within clusters because units share geography, staff, survey teams, networks, or repeated observations.
+
+If observations within cluster \(g\) are correlated, treating all individual observations as independent overstates precision. A common working approximation is the design effect
+
+\[
+DE = 1 + (m-1)\rho,
+\]
+
+where \(m\) is cluster size and \(\rho\) is the intra-class correlation. Standard errors are inflated by roughly
+
+\[
+\sqrt{DE}=\sqrt{1+(m-1)\rho}.
+\]
+
+In cluster-randomized trials, treatment is assigned to groups rather than individuals. If group \(g\) is assigned treatment \(Z_g\), then each individual \(i\) in the group has exposure \(Z_g\). The identifying variation is at the cluster level, so the number of independent assignment units is the number of clusters, not the number of people. Clustered assignment can sharply reduce power: the effective sample size is roughly \(N/DE\). Ignoring clustering can make a study look much more precise than it really is.
+
+Thornton clusters standard errors at the village level. Jensen and Miller use household clustering because the data contain repeated household observations. The correct clustering level is a design question, not a formatting choice.
+
+```{r clustered-se-example}
+set.seed(2026)
+G <- 100
+m <- 10
+cluster_id <- rep(seq_len(G), each = m)
+cluster_shock <- rnorm(G)[cluster_id]
+Z_cluster <- rbinom(G, 1, 0.5)[cluster_id]
+Y_cluster <- 1 + 1.5 * Z_cluster + cluster_shock + rnorm(G * m)
+cluster_df <- data.frame(Y = Y_cluster, Z = Z_cluster, cluster_id = cluster_id)
+
+estimatr::lm_robust(
+  Y ~ Z,
+  data = cluster_df,
+  clusters = cluster_id,
+  se_type = "stata"
+)
+
+fixest::feols(Y ~ Z, data = cluster_df, cluster = ~ cluster_id)
+```
+
+## Fisher randomization inference
+
+When samples are small, asymptotic approximations may be weak. Fisher's randomization test gives an exact design-based alternative. The key distinction is the null hypothesis. Fisher tests the **sharp null**:
+
+\[
+H_0: Y_i(1)=Y_i(0) \quad \text{for every } i.
+\]
+
+Under this null, treatment has no effect on any unit, so the observed data reveal the full schedule of potential outcomes. We can enumerate or simulate all treatment assignments consistent with the original assignment mechanism. For each assignment \(\omega\in\Omega\), compute
+
+\[
+\hat\tau(\omega)=\bar Y_1(\omega)-\bar Y_0(\omega).
+\]
+
+The randomization p-value is
+
+\[
+p
+=
+\frac{1}{|\Omega|}
+\sum_{\omega\in\Omega}
+\mathbf{1}\left\{|\hat\tau(\omega)|\ge |\hat\tau_{obs}|\right\}.
+\]
+
+This p-value is exact with respect to the randomization distribution. Fisher treats assignment as the only source of uncertainty.
+
+The classic Lady Tasting Tea design has 8 cups and 4 of each preparation method. If Dr. Bristol correctly classifies at least 3 of the 4 milk-first cups, the probability of doing at least as well by chance is
+
+\[
+\frac{\binom{4}{3}\binom{4}{1}+\binom{4}{4}\binom{4}{0}}{\binom{8}{4}}
+=
+\frac{17}{70}.
+\]
+
+The large-sample t-test is often used for the weak null \(H_0:\mathbb{E}[Y(1)-Y(0)]=0\). Fisher's test is about the sharp null of zero effect for every unit. Those are not the same hypothesis when effects are heterogeneous.
+
+```{r randomization-inference}
+# Direct use of randomizr and ri2.
+declaration <- randomizr::declare_ra(N = nrow(exp_df), m = sum(exp_df$Z))
+
+ri2::conduct_ri(
+  formula = Y ~ Z,
+  declaration = declaration,
+  assignment = "Z",
+  sharp_hypothesis = 0,
+  data = exp_df
+)
+```
+
+# Design: power, MDES, and sample allocation
+
+## Type I and Type II errors
+
+A **Type I error** occurs when we reject the null even though it is true. Its probability is the test size \(\alpha\), often 0.05. A **Type II error** occurs when we fail to reject even though the treatment truly has an effect. Its probability is \(\beta\). Statistical power is
+
+\[
+1-\beta.
+\]
+
+Power depends on four objects: effect size, sample size, outcome variance, and the chosen significance level.
+
+## Power and minimum detectable effects
+
+Let \(\delta=\mu_1-\mu_0\) denote the true treatment effect and suppose first that
+
+\[
+\sigma_1^2=\sigma_0^2=\sigma^2,
+\qquad
+p=\frac{N_1}{N}=\frac{1}{2}.
+\]
+
+Then
+
+\[
+\mathrm{Var}(\hat\tau)
+=
+\frac{\sigma^2}{N/2}+\frac{\sigma^2}{N/2}
+=
+\frac{4\sigma^2}{N},
+\]
+
+so the standard error is \(2\sigma/\sqrt{N}\). Under large-sample normality,
+
+\[
+t \sim N\left(\frac{\delta\sqrt N}{2\sigma},1\right).
+\]
+
+Rearranging the usual power condition gives the familiar sample-size formula
+
+\[
+N \gtrsim
+\frac{4\sigma^2\big(z_{1-\alpha/2}+z_{1-\beta}\big)^2}{\delta^2}.
+\]
+
+Equivalently, for fixed \(N\), the minimum detectable effect is approximately
+
+\[
+MDES \approx
+\big(z_{1-\alpha/2}+z_{1-\beta}\big)\frac{2\sigma}{\sqrt N}.
+\]
+
+A more general and convenient version is
+
+\[
+MDES \approx
+(z_{1-\kappa}+z_{\alpha/2})
+\sqrt{\frac{\sigma^2}{P(1-P)N}},
+\]
+
+where \(P\) is the treatment share and \(\kappa\) is power. The optimal allocation derivation is in Appendix \@ref(app-optimal-allocation).
+
+```{r mdes-calculation}
+alpha <- 0.05
+power <- 0.80
+sigma <- 1
+N <- 1000
+P <- 0.5
+
+(qnorm(1 - alpha / 2) + qnorm(power)) * sqrt(sigma^2 / (P * (1 - P) * N))
+```
+
+# Diagnostics before interpretation
+
+Experimental diagnostics answer a practical question: *what did the experiment actually deliver?* They should be checked before interpreting treatment effects.
+
+| Diagnostic | What it checks | Why it matters |
+|---|---|---|
+| Sample construction | Who enters each analysis sample | The estimand is sample-specific |
+| Assignment rate | Share assigned to each arm | Detects implementation or coding problems |
+| Randomization unit | Individual, household, village, store, school, market | Determines dependence and correct inference |
+| Blocking/stratification | Assignment rates within design cells | Analysis should respect the assignment mechanism |
+| Baseline balance | Pre-treatment comparability | Checks implementation and improves understanding of precision |
+| Missing outcomes | Whether \(R_i=1\) differs by assignment | Missingness can break comparability among observed outcomes |
+| Attrition | Follow-up loss by assignment | Differential attrition threatens internal validity |
+| Take-up/compliance | Whether \(D_i\) differs from \(Z_i\) | Determines whether the main estimand is ITT or LATE |
+| Outcome distributions | Full outcome shape by arm | Mean effects may hide distributional changes |
+| Multiple outcomes | Outcome family definition | Prevents selective emphasis on significant outcomes |
+| Heterogeneity | Subgroups and interactions | Tests mechanisms but risks overinterpretation |
+
+Balance checks are often misunderstood. Under valid randomization, balance is not what identifies the effect. Randomization identifies the effect. Balance checks verify implementation, reveal chance imbalances, and help readers understand precision.
+
+```{r diagnostics-examples}
+# Assignment rate by arm.
+exp_df |>
+  dplyr::count(Z) |>
+  dplyr::mutate(rate = n / sum(n))
+
+# Covariate balance as direct comparisons, not a new estimator.
+lm(x ~ Z, data = exp_df) |>
+  broom::tidy()
+
+# Missing outcome rate by assignment.
+exp_df_missing <- transform(exp_df, R = rbinom(nrow(exp_df), 1, 0.95))
+with(exp_df_missing, tapply(R, Z, mean))
+```
+
+# Complications: noncompliance, multiple arms, multiple outcomes, heterogeneity, and distributional effects
+
+## Noncompliance, encouragement designs, and LATE
+
+Noncompliance means assignment \(Z_i\) and treatment receipt \(D_i\) differ. The ITT remains clean:
+
+\[
+ITT_Y = \mathbb{E}[Y_i\mid Z_i=1]-\mathbb{E}[Y_i\mid Z_i=0].
+\]
+
+If assignment changes take-up, the first stage is
+
+\[
+ITT_D = \mathbb{E}[D_i\mid Z_i=1]-\mathbb{E}[D_i\mid Z_i=0].
+\]
+
+When \(Z_i\) affects \(Y_i\) only through \(D_i\), the assignment is as-good-as-random, and monotonicity holds, the Wald estimand is
+
+\[
+LATE = \frac{ITT_Y}{ITT_D}
+= \frac{\mathbb{E}[Y_i\mid Z_i=1]-\mathbb{E}[Y_i\mid Z_i=0]}
+{\mathbb{E}[D_i\mid Z_i=1]-\mathbb{E}[D_i\mid Z_i=0]}.
+\]
+
+This is a **local average treatment effect** for compliers: units whose treatment receipt changes when assignment changes. The LATE is not automatically the ATE. It depends on the compliance margin moved by the instrument. Thornton and Karaman are both encouragement designs: randomized incentives or solicitations shift endogenous behavior.
+
+```{r encouragement-example}
+set.seed(2026)
+N <- 2000
+Z <- rbinom(N, 1, 0.5)
+D <- rbinom(N, 1, ifelse(Z == 1, 0.55, 0.10))
+Y <- 10 - 3 * D + rnorm(N)
+iv_df <- data.frame(Y = Y, D = D, Z = Z)
+
+itt_y <- with(iv_df, mean(Y[Z == 1]) - mean(Y[Z == 0]))
+itt_d <- with(iv_df, mean(D[Z == 1]) - mean(D[Z == 0]))
+c(ITT = itt_y, first_stage = itt_d, Wald_LATE = itt_y / itt_d)
+
+estimatr::iv_robust(Y ~ D | Z, data = iv_df, se_type = "HC2")
+```
+
+## Multiple arms and dose treatments
+
+Many experiments have more than two arms. Jensen and Miller's subsidy experiment is an example: treatment is a randomized price subsidy dose rather than a single binary treatment.
+
+Let \(A_i\in\{0,1,2\}\), with arm 0 omitted. A saturated regression is
+
+\[
+Y_i = \alpha + \beta_1\mathbf{1}\{A_i=1\}
++ \beta_2\mathbf{1}\{A_i=2\} + u_i.
+\]
+
+The coefficient \(\beta_1\) compares arm 1 to arm 0; \(\beta_2\) compares arm 2 to arm 0. The contrast between arms 2 and 1 is
+
+\[
+\beta_2-\beta_1.
+\]
+
+Its variance is
+
+\[
+\widehat{\operatorname{Var}}(\hat\beta_2-\hat\beta_1)
+=
+\widehat{\operatorname{Var}}(\hat\beta_2)
++\widehat{\operatorname{Var}}(\hat\beta_1)
+-2\widehat{\operatorname{Cov}}(\hat\beta_2,\hat\beta_1).
+\]
+
+The covariance term matters. That is why post-estimation contrasts should use the full variance-covariance matrix. Additional Wald-test details are in Appendix \@ref(app-wald-tests).
+
+## Multiple outcomes and multiple testing
+
+Experiments often measure outcome families rather than one outcome. Karaman studies short-term and long-term future spending; Thornton studies condom purchase and related sexual-behavior outcomes. If researchers test many outcomes and subgroups, some estimates will appear significant by chance.
+
+A disciplined workflow defines the outcome family before looking at estimates, reports the full family, and distinguishes raw p-values from multiplicity-adjusted p-values when needed. The multiple-testing correction is not the source of identification; it is a reporting discipline for families of hypotheses.
+
+## Heterogeneous treatment effects and CATE
+
+Treatment effects can vary systematically across subgroups. The **Conditional Average Treatment Effect** is
+
+\[
+\tau(x) \equiv \mathbb{E}[Y_i(1)-Y_i(0)\mid X_i=x].
+\]
+
+A simple interaction regression is
+
+\[
+Y_i = \alpha + \tau Z_i + X_i'\beta + (Z_i\cdot X_i)'\gamma + u_i.
+\]
+
+Then the treatment effect conditional on \(X_i=x\) is approximated by
+
+\[
+\tau(x) \approx \tau + x'\gamma.
+\]
+
+Heterogeneity can be central to the theory. Karaman's main mechanism is asymmetric across satisfaction and loyalty cells. Jensen and Miller's Giffen prediction is strongest for households poor enough to face subsistence concerns but not so poor that they already consume only the staple.
+
+The danger is overinterpretation. Subgroups should be theory-driven, pre-specified where possible, and reported as a family of estimates rather than as isolated significant coefficients.
+
+## Quantile treatment effects
+
+Mean effects are often too coarse. Randomization identifies the full marginal distributions of \(Y(1)\) and \(Y(0)\), not just their means. For any \(y\),
+
+\[
+F_{Y(0)}(y)=\Pr(Y_i(0)\le y)=\Pr(Y_i\le y\mid Z_i=0),
+\]
+
+\[
+F_{Y(1)}(y)=\Pr(Y_i(1)\le y)=\Pr(Y_i\le y\mid Z_i=1).
+\]
+
+The \(\theta\)-quantile treatment effect is
+
+\[
+QTE_\theta = Q_\theta(Y_i(1))-Q_\theta(Y_i(0)).
+\]
+
+Common examples are
+
+\[
+QTE_{0.25}, \qquad QTE_{0.50}, \qquad QTE_{0.75}.
+\]
+
+The crucial conceptual distinction is
+
+\[
+Q_\theta(Y_i(1))-Q_\theta(Y_i(0))
+\neq
+Q_\theta\big(Y_i(1)-Y_i(0)\big).
+\]
+
+Randomized experiments identify the difference in the \(\theta\)-quantiles of the treated and control outcome distributions. They do **not** identify the \(\theta\)-quantile of individual treatment effects without stronger assumptions such as rank preservation.
+
+```{r qte-example}
+quantile(exp_df$Y[exp_df$Z == 1], probs = c(0.25, 0.50, 0.75)) -
+  quantile(exp_df$Y[exp_df$Z == 0], probs = c(0.25, 0.50, 0.75))
+```
+
+# Validity threats
+
+## Internal validity
+
+The common internal-validity threats in randomized experiments are failure of randomization, noncompliance, attrition, missing outcomes, measurement error, demand effects, and incorrect inference.
+
+Failure of randomization means the assignment mechanism was not implemented as intended. Large baseline imbalances are not proof of failure, but they are a warning sign.
+
+Noncompliance means \(Z_i\neq D_i\) for some units. The ITT remains a valid assignment effect, but treatment-on-treated comparisons are generally endogenous unless supported by an IV or compliance design.
+
+Attrition is a missing-data threat. Let \(R_i=1\) indicate that the outcome is observed. The target object might be \(\mathbb{E}[Y_i(t)]\), but the observed comparison conditions on \(R_i=1\):
+
+\[
+\mathbb{E}[Y_i\mid Z_i=z,R_i=1].
+\]
+
+If outcome observation depends on assignment and potential outcomes, the observed sample no longer preserves the original randomized comparison. This is why attrition and missing outcomes are design diagnostics, not administrative footnotes. Thornton's HIV follow-up survey is a useful replication example: the empirical interpretation requires knowing who remained in the follow-up sample.
+
+## SUTVA and spillovers
+
+The notation \((Y_i(1),Y_i(0))\) assumes the **Stable Unit Treatment Value Assumption**: unit \(i\)'s outcome depends only on its own treatment status. If spillovers exist, a more honest notation is
+
+\[
+Y_i = Y_i(Z_i,\mathbf{Z}_{-i}),
+\]
+
+where \(\mathbf{Z}_{-i}\) is the treatment assignment vector for other units. Then the two-potential-outcomes framework is too thin. There may be direct effects, spillover effects, and equilibrium effects.
+
+Spillovers are design problems. In vaccine trials, herd immunity means one person's treatment changes others' risk. In labor-market interventions, education or job-search treatments can affect wages and job-finding probabilities for untreated workers. In review-solicitation settings, posting a review may affect future spending on reviewed and nonreviewed brands.
+
+## External validity
+
+External validity asks whether the estimated effect transports to other populations, settings, treatment versions, or implementation scales. A treatment that works in a carefully supervised pilot can behave differently under broad implementation. Jensen and Miller are a useful reminder: Giffen behavior is predicted only under narrow conditions, so the question is not whether every staple good is Giffen, but whether the theory-predicted population exhibits the response.
+
+# Appendix
+
+## OLS as a best linear predictor {#app-blp}
+
+The linear-model interpretation used in experimental regressions does not require believing that the true conditional expectation is exactly linear. Even if the true conditional expectation is nonlinear, we can still write
+
+\[
+Y_i = \beta'X_i + \epsilon_i,
+\qquad
+\mathbb{E}[\epsilon_iX_i]=0,
+\]
+
+where \(\beta'X_i\) is the **best linear predictor**: the best linear approximation to \(\mathbb{E}[Y_i\mid X_i]\). In an experimental setting, this is useful because OLS need not be interpreted as a literal structural model. It is a projection tool that summarizes the treatment effect and the role of covariates in the best linear way.
+
+The population coefficient solves
+
+\[
+\beta = \arg\min_b \mathbb{E}\left[(Y_i-X_i'b)^2\right].
+\]
+
+The first-order condition is
+
+\[
+\mathbb{E}\left[X_i(Y_i-X_i'\beta)\right]=0,
+\]
+
+which gives
+
+\[
+\beta = \mathbb{E}[X_iX_i']^{-1}\mathbb{E}[X_iY_i]
+\]
+
+when \(\mathbb{E}[X_iX_i']\) is nonsingular.
+
+## Random coefficients and heteroskedasticity {#app-heteroskedasticity}
+
+Start from the potential-outcomes representation:
+
+\[
+Y_i = Y_i(0) + Z_i\big(Y_i(1)-Y_i(0)\big).
+\]
+
+Define
+
+\[
+\alpha = \mathbb{E}[Y_i(0)],
+\qquad
+\tau = \mathbb{E}[Y_i(1)-Y_i(0)],
+\]
+
+and the zero-mean deviations
+
+\[
+e_{0i}=Y_i(0)-\alpha,
+\qquad
+e_{1i}=\big(Y_i(1)-Y_i(0)\big)-\tau.
+\]
+
+Then
+
+\[
+Y_i = \alpha + \tau Z_i + \underbrace{e_{0i}+Z_ie_{1i}}_{u_i}.
+\]
+
+So the regression error is
+
+\[
+u_i=e_{0i}+Z_ie_{1i}.
+\]
+
+This implies
+
+\[
+\mathrm{Var}(u_i\mid Z_i=0)=\mathrm{Var}(e_{0i}),
+\qquad
+\mathrm{Var}(u_i\mid Z_i=1)=\mathrm{Var}(e_{0i}+e_{1i}).
+\]
+
+These variances are generally different whenever treatment effects vary across units. In other words, heterogeneous treatment effects mechanically generate heteroskedasticity. That is why robust standard errors are not just a defensive habit in experiments; they are the natural default.
+
+With controls, let \(\tilde Z_i\) be treatment residualized on the controls. In the scalar treatment-coefficient case, the robust asymptotic variance can be written as
+
+\[
+V_\tau = \frac{\mathbb{E}[\epsilon_i^2\tilde Z_i^2]}{\mathbb{E}[\tilde Z_i^2]^2}.
+\]
+
+A homoskedastic formula would replace the numerator with a structure that assumes the conditional error variance is constant. That assumption is generally not implied by randomization.
+
+## FWL theorem and partialling out {#app-fwl}
+
+Write the regression as
+
+\[
+Y_i=\tau Z_i+X_i'\beta+u_i,
+\]
+
+where \(Z_i\) is the variable of interest and \(X_i\) contains the controls, including a constant if desired.
+
+Now regress both \(Y_i\) and \(Z_i\) on \(X_i\):
+
+\[
+Y_i=X_i'\gamma_y+e_{yi},
+\qquad
+Z_i=X_i'\gamma_z+e_{zi},
+\]
+
+where \(e_{yi}\) and \(e_{zi}\) are the OLS residuals.
+
+Then run the residual-on-residual regression
+
+\[
+e_{yi}=\tau^* e_{zi}+u_i^*.
+\]
+
+**Frisch--Waugh--Lovell theorem.** The coefficient on \(e_{zi}\) in this regression equals the coefficient on \(Z_i\) in the full regression:
+
+\[
+\tau^*=\tau.
+\]
+
+Moreover, the residuals are the same:
+
+\[
+u_i^*=u_i.
+\]
+
+\begin{proof}
+Start from the full regression:
+
+\[
+Y_i=\tau Z_i+X_i'\beta+u_i.
+\]
+
+Since
+
+\[
+e_{yi}=Y_i-X_i'\gamma_y,
+\]
+
+substitute for \(Y_i\):
+
+\[
+e_{yi}=\tau Z_i+X_i'\beta+u_i-X_i'\gamma_y.
+\]
+
+Next use
+
+\[
+Z_i=X_i'\gamma_z+e_{zi},
+\]
+
+to get
+
+\[
+e_{yi}=\tau(X_i'\gamma_z+e_{zi})+X_i'\beta+u_i-X_i'\gamma_y.
+\]
+
+Rearranging,
+
+\[
+e_{yi}=\tau e_{zi}+X_i'(\beta+\tau\gamma_z-\gamma_y)+u_i.
+\]
+
+Now use the OLS orthogonality conditions from the auxiliary regressions:
+
+\[
+X_i'e_{yi}=0,
+\qquad
+X_i'e_{zi}=0.
+\]
+
+Thus both \(e_{yi}\) and \(e_{zi}\) are orthogonal to \(X_i\). Therefore the coefficient on \(X_i\) in the equation above must be zero, so
+
+\[
+\beta+\tau\gamma_z-\gamma_y=0.
+\]
+
+Hence the equation simplifies to
+
+\[
+e_{yi}=\tau e_{zi}+u_i.
+\]
+
+But this is exactly the residual-on-residual regression:
+
+\[
+e_{yi}=\tau^* e_{zi}+u_i^*.
+\]
+
+Therefore,
+
+\[
+\tau^*=\tau
+\qquad\text{and}\qquad
+u_i^*=u_i.
+\]
+
+So the coefficient on \(Z_i\) in the full regression can be obtained by first partialling out \(X_i\) from both \(Y_i\) and \(Z_i\), and then regressing the resulting residuals on each other.
+\end{proof}
+
+## Optimal sample allocation {#app-optimal-allocation}
+
+Suppose total sample size \(N\) is fixed and the treatment share is \(p=N_1/N\). Then
+
+\[
+\mathrm{Var}(\hat\tau)
+=
+\frac{\sigma_1^2}{pN}+\frac{\sigma_0^2}{(1-p)N}.
+\]
+
+To minimize this variance, differentiate with respect to \(p\):
+
+\[
+\frac{d}{dp}\mathrm{Var}(\hat\tau)
+=
+-\frac{\sigma_1^2}{p^2N}
++
+\frac{\sigma_0^2}{(1-p)^2N}=0.
+\]
+
+Solving gives
+
+\[
+\frac{1-p^*}{p^*}=\frac{\sigma_0}{\sigma_1},
+\qquad
+p^*=\frac{\sigma_1}{\sigma_1+\sigma_0}.
+\]
+
+If treated and control variances are approximately equal, the rule of thumb is
+
+\[
+p^*=\frac{1}{2}.
+\]
+
+When variances differ substantially, unequal assignment can be more efficient. In practice, logistics, ethics, political feasibility, and subgroup power may matter as much as the variance-minimizing allocation.
+
+## Wald tests for multiple-arm experiments {#app-wald-tests}
+
+Consider a product-label experiment with three arms:
+
+- Control 1: no label.
+- Treatment: focal label.
+- Control 2: placebo label.
+
+Let Control 1 be the omitted category. Define
+
+\[
+T_i=\mathbf{1}\{\text{unit } i \text{ receives focal label}\},
+\]
+
+\[
+C_{2i}=\mathbf{1}\{\text{unit } i \text{ receives placebo label}\}.
+\]
+
+With centered pre-treatment covariates \(X_i\), the regression model is
+
+\[
+Y_i=\alpha+\beta_TT_i+\beta_2C_{2i}+X_i'\gamma+u_i.
+\]
+
+Because the covariates are centered, the intercept and coefficients recover the arm means:
+
+\[
+\mathbb{E}[Y_i\mid \text{Control 1}]=\alpha,
+\]
+
+\[
+\mathbb{E}[Y_i\mid \text{Treatment}]=\alpha+\beta_T,
+\]
+
+\[
+\mathbb{E}[Y_i\mid \text{Control 2}]=\alpha+\beta_2.
+\]
+
+The focal label effect versus no label is \(\beta_T\). The placebo label effect versus no label is \(\beta_2\). The incremental effect of the focal label beyond the placebo label is
+
+\[
+H_0:\beta_T=\beta_2
+\quad\Longleftrightarrow\quad
+H_0:\beta_T-\beta_2=0.
+\]
+
+The variance of the estimated difference is
+
+\[
+\widehat{\operatorname{Var}}(\hat\beta_T-\hat\beta_2)
+=
+\widehat{\operatorname{Var}}(\hat\beta_T)
++\widehat{\operatorname{Var}}(\hat\beta_2)
+-2\widehat{\operatorname{Cov}}(\hat\beta_T,\hat\beta_2).
+\]
+
+For a single restriction, the test statistic is
+
+\[
+t=
+\frac{\hat\beta_T-\hat\beta_2}
+{\sqrt{\widehat{\operatorname{Var}}(\hat\beta_T-\hat\beta_2)}}.
+\]
+
+The corresponding \(F\)-statistic is \(F=t^2\). For multiple restrictions, write the joint null as
+
+\[
+H_0:R\theta=r.
+\]
+
+The Wald statistic is
+
+\[
+W=(R\hat\theta-r)'
+\left[R\widehat{\operatorname{Var}}(\hat\theta)R'\right]^{-1}
+(R\hat\theta-r).
+\]
+
+Use a heteroskedasticity-robust or cluster-robust variance-covariance matrix when the experimental design requires it.
+
+```{r wald-test-r}
+set.seed(2026)
+
+# Example data frame
+df <- data.frame(
+  y = rnorm(300),
+  arm = sample(
+    c("no_label", "placebo_label", "focal_label"),
+    size = 300,
+    replace = TRUE
+  ),
+  x1 = rnorm(300),
+  x2 = rnorm(300)
+)
+
+# arm has values: "no_label", "placebo_label", "focal_label".
+df$arm <- relevel(factor(df$arm), ref = "no_label")
+
+# We could use car
+m <- lm(y ~ arm + x1 + x2, data = df)
+V <- sandwich::vcovHC(m, type = "HC2")
+car::linearHypothesis(m, "armfocal_label = armplacebo_label", vcov. = V)
+
+# Or we could use lh_robust directly
+estimatr::lh_robust(
+  y ~ arm + x1 + x2,
+  data = df,
+  se_type = "HC2",
+  linear_hypothesis = "armfocal_label - armplacebo_label = 0"
+)
+```
