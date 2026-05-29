@@ -4,3 +4,6 @@
 .httr-oauth
 .DS_Store
 .quarto
+data_raw/
+gpt_pro_context.zip
+_gpt_pro_context/

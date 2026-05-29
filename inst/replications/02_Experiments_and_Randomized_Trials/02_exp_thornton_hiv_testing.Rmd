@@ -4,8 +4,19 @@ subtitle: "Randomized incentives, VCT distance, and encouragement-design logic i
 author: "Weiheng Zhang"
 date: "`r Sys.Date()`"
 output:
-  pdf_document: 
-    template: template.tex
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    keep_tex: false
+    latex_engine: xelatex
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+link-citations: true
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics_replication/02_Experiments_and_Randomized_Trials/thornton2008demand/Thornton-HIV-Testing-Data.dta"
 ---
 
 ```{r setup, include = FALSE}
@@ -13,26 +24,1291 @@ knitr::opts_chunk$set(
   collapse  = TRUE,
   comment   = "#>",
   fig.align = "center",
-  fig.width = 7,
+  fig.width = 8,
   fig.height = 4.5,
+  out.width="80%",
   dpi       = 150,
   message   = FALSE,
-  warning   = FALSE
+  warning   = FALSE,
+  echo      = FALSE
 )
 
-optional_packages <- c(
-  "dplyr", "ggplot2", "haven", "broom", "estimatr", "fixest", "modelsummary"
+required_pkgs <- c(
+  "haven", "dplyr", "tidyr", "purrr", "tibble", "stringr",
+  "ggplot2", "ggthemes", "scales", "estimatr", "modelsummary",
+  "kableExtra", "knitr", "broom"
 )
-missing_packages <- optional_packages[
-  !vapply(optional_packages, requireNamespace, logical(1), quietly = TRUE)
-]
-if (length(missing_packages) > 0) {
-  message(
-    "Optional packages not installed: ",
-    paste(missing_packages, collapse = ", "),
-    ". Install them before running the empirical chunks."
+
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Please install the following packages before knitting: ", paste(missing_pkgs, collapse = ", "))
+}
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+options(modelsummary_factory_latex = "kableExtra")
+options(modelsummary_factory_html = "kableExtra")
+
+# These helper functions are local to this Rmd. They are not package exports.
+fmt_num <- function(x, digits = 3) {
+  ifelse(is.na(x), "", formatC(x, digits = digits, format = "f", big.mark = ","))
+}
+
+fmt_sd <- function(x, digits = 3) {
+  ifelse(is.na(x), "", paste0("(", formatC(x, digits = digits, format = "f", big.mark = ","), ")"))
+}
+
+
+plot_task <- function(data, mapping, ...) {
+  ggplot(data = data, mapping = mapping, ...) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+group_mean_ci <- function(data, group_var, outcome_var) {
+  data %>%
+    filter(!is.na(.data[[group_var]]), !is.na(.data[[outcome_var]])) %>%
+    group_by(group = .data[[group_var]]) %>%
+    summarise(
+      n = n(),
+      mean = mean(.data[[outcome_var]], na.rm = TRUE),
+      se = sd(.data[[outcome_var]], na.rm = TRUE) / sqrt(n),
+      lb = mean - 1.96 * se,
+      ub = mean + 1.96 * se,
+      .groups = "drop"
+    )
+}
+
+safe_var <- function(data, var) {
+  if (var %in% names(data)) data[[var]] else rep(NA_real_, nrow(data))
+}
+
+first_existing <- function(data, vars) {
+  hit <- vars[vars %in% names(data)]
+  if (length(hit) == 0) NA_character_ else hit[[1]]
+}
+
+clean_binary01 <- function(x) {
+  dplyr::case_when(
+    x %in% c(0, 1) ~ as.numeric(x),
+    is.na(x) ~ NA_real_,
+    TRUE ~ NA_real_
   )
 }
+
+coef_map_common <- c(
+  "any" = "Any incentive",
+  "tinc_usd" = "Incentive amount (USD)",
+  "I(tinc_usd^2)" = "Incentive amount squared",
+  "distvct" = "Distance to VCT center (km)",
+  "I(distvct^2)" = "Distance squared",
+  "over" = "Over 1.5 km",
+  "simave" = "Simulated average distance",
+  "simaverage" = "Simulated average distance",
+  "got" = "Learned HIV results",
+  "hiv_got" = "Learned results x HIV-positive",
+  "hiv2004" = "HIV-positive",
+  "male" = "Male",
+  "age" = "Age",
+  "age2" = "Age squared",
+  "rumphi" = "Rumphi",
+  "balaka" = "Balaka",
+  "mar" = "Married",
+  "tb" = "Had previous HIV test",
+  "thinktreat" = "Think treatment will become available",
+  "ll" = "Believed infected at baseline",
+  "got_ll" = "Learned results x prior belief",
+  "(Intercept)" = "Constant"
+)
+
+gof_main <- tibble::tribble(
+  ~raw, ~clean, ~fmt,
+  "nobs", "Sample size", 0,
+  "r.squared", "$R^2$", 2,
+  "statistic", "F-statistic", 2
+)
 ```
 
+```{r load-data, include=FALSE}
+if (!file.exists(params$data_path)) {
+  stop(
+    "Data file not found: ", params$data_path,
+    "\nUpdate params$data_path in the YAML header to point to Thornton-HIV-Testing-Data.dta."
+  )
+}
 
+thornton_raw <- haven::read_dta(params$data_path)
+
+# Construct scale-corrected and analysis variables. The original audit found that
+# raw `tinc` generated incentive means around 106/111 instead of about 1.01/1.05 dollars.
+if (!"tinc_usd" %in% names(thornton_raw)) {
+  thornton_raw$tinc_usd <- thornton_raw$tinc * 0.009456
+}
+if (!"age2" %in% names(thornton_raw) && "age" %in% names(thornton_raw)) {
+  thornton_raw$age2 <- thornton_raw$age^2
+}
+if (!"any" %in% names(thornton_raw)) {
+  thornton_raw$any <- as.integer(thornton_raw$tinc_usd > 0)
+}
+if (!"over" %in% names(thornton_raw)) {
+  thornton_raw$over <- as.integer(thornton_raw$distvct > 1.5)
+}
+if (!"under" %in% names(thornton_raw)) {
+  thornton_raw$under <- as.integer(thornton_raw$distvct <= 1.5)
+}
+if (!"rumphi" %in% names(thornton_raw)) {
+  thornton_raw$rumphi <- as.integer(thornton_raw$site == 3)
+}
+if (!"balaka" %in% names(thornton_raw)) {
+  thornton_raw$balaka <- as.integer(thornton_raw$site == 2)
+}
+
+trich_source <- first_existing(
+  thornton_raw,
+  c("T_final_trich", "T_final_result_trich", "T_final_result_tv", "T_final_tv", "trich2004", "trich")
+)
+
+trich_raw <- if (!is.na(trich_source)) thornton_raw[[trich_source]] else rep(NA_real_, nrow(thornton_raw))
+
+thornton <- thornton_raw %>%
+  mutate(
+    tinc2_usd = tinc_usd^2,
+    dist2 = distvct^2,
+    simave = if ("simave" %in% names(.)) simave else simaverage,
+    inter98 = if_else(m1out == 2, 1, 0, missing = 0),
+    inter01 = if_else(m2out == 2, 1, 0, missing = 0),
+    MainSample = if_else(
+      test2004 == 1 &
+        !is.na(age) &
+        !is.na(villnum) &
+        !is.na(tinc_usd) &
+        !is.na(distvct) &
+        hiv2004 != -1 &
+        coalesce(followup_tested != 1, TRUE),
+      1, 0, missing = 0
+    ),
+    T_final_result_gc_clean = clean_binary01(T_final_result_gc),
+    T_final_result_ct_clean = clean_binary01(T_final_result_ct),
+    T_final_trich_clean = clean_binary01(trich_raw),
+    ll = case_when(
+      a8 == 0 ~ 0,
+      !is.na(a8) ~ 1,
+      TRUE ~ NA_real_
+    ),
+    ll_fo = case_when(
+      likelihoodhiv_fo == 1 ~ 0,
+      !is.na(likelihoodhiv_fo) ~ 1,
+      TRUE ~ NA_real_
+    ),
+    hiv_got = hiv2004 * got,
+    got_ll = got * ll,
+    more1_fo = case_when(
+      numsex_fo > 1 & !is.na(numsex_fo) ~ 1,
+      numsex_fo %in% c(0, 1) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    incentive_bin = case_when(
+      tinc_usd == 0 ~ "0",
+      tinc_usd < 0.2 ~ "(0, 0.2)",
+      tinc_usd < 0.5 ~ "[0.2, 0.5)",
+      tinc_usd < 1.0 ~ "[0.5, 1.0)",
+      tinc_usd < 1.5 ~ "[1.0, 1.5)",
+      tinc_usd < 2.0 ~ "[1.5, 2.0)",
+      tinc_usd < 2.8 ~ "[2.0, 2.8)",
+      TRUE ~ "[2.8, 3.0]"
+    ),
+    incentive_bin = factor(
+      incentive_bin,
+      levels = c("0", "(0, 0.2)", "[0.2, 0.5)", "[0.5, 1.0)", "[1.0, 1.5)", "[1.5, 2.0)", "[2.0, 2.8)", "[2.8, 3.0]")
+    ),
+    distance_bin = cut(
+      distvct,
+      breaks = c(-Inf, 0.5, 1, 1.5, 2, 2.5, 3, 4, Inf),
+      labels = c("0--0.5", "0.5--1", "1--1.5", "1.5--2", "2--2.5", "2.5--3", "3--4", "4+"),
+      right = FALSE
+    ),
+    any_label = factor(if_else(any == 1, "Some incentive", "No incentive"), levels = c("No incentive", "Some incentive")),
+    over_label = factor(if_else(over == 1, "Over 1.5 km", "Within 1.5 km"), levels = c("Within 1.5 km", "Over 1.5 km")),
+    hiv_label = factor(if_else(hiv2004 == 1, "HIV-positive", "HIV-negative"), levels = c("HIV-negative", "HIV-positive")),
+    got_label = factor(if_else(got == 1, "Learned results", "Did not learn results"), levels = c("Did not learn results", "Learned results"))
+  )
+
+main_sample <- thornton %>% filter(MainSample == 1)
+followup_eligible <- main_sample %>% filter(site != 1)
+followup_sample <- followup_eligible %>% filter(followupsurvey == 1)
+sex_followup_sample <- followup_sample %>% filter(hadsex12 == 1)
+
+# Excluded instruments and included exogenous covariates for the IV sections.
+iv_controls <- paste(c("hiv2004", "male", "age", "age2", "simave", "rumphi"), collapse = " + ")
+iv_excluded_instruments <- paste(c(
+  "any", "tinc_usd", "I(tinc_usd^2)", "distvct", "I(distvct^2)",
+  "I(any * male)", "I(tinc_usd * male)", "I(tinc_usd^2 * male)", "I(distvct * male)", "I(distvct^2 * male)",
+  "I(any * hiv2004)", "I(tinc_usd * hiv2004)", "I(tinc_usd^2 * hiv2004)", "I(distvct * hiv2004)", "I(distvct^2 * hiv2004)",
+  "I(any * male * hiv2004)", "I(tinc_usd * male * hiv2004)", "I(tinc_usd^2 * male * hiv2004)",
+  "I(distvct * male * hiv2004)", "I(distvct^2 * male * hiv2004)"
+), collapse = " + ")
+iv_all_instruments <- paste(iv_excluded_instruments, iv_controls, sep = " + ")
+```
+
+# Research question
+
+Thornton studies two linked questions.
+
+First, what raises demand for learning HIV status? The experiment tests whether small monetary incentives and reduced travel distance increase attendance at a VCT center where respondents can obtain their test results.
+
+Second, what is the effect of learning HIV status on later preventive behavior? The main measured behavioral outcome is condom purchase after respondents had the opportunity to learn their results.
+
+The main empirical problem is selection. People who choose to learn results may differ from people who do not in expected infection risk, stigma concerns, travel costs, patience, and willingness to adopt safer behavior. A comparison of those who learned results to those who did not is therefore not causal.
+
+# Experimental design
+
+The experiment has three core elements.
+
+1. Respondents were offered free door-to-door HIV testing.
+2. Respondents received randomly assigned monetary incentives redeemable when they obtained results.
+3. Temporary VCT centers were placed at randomized locations within geographic zones, creating variation in distance to the assigned center.
+
+A wording correction matters for the replication note. The note should not say that the "distance incentive" is simply not randomized. The more precise statement is:
+
+> VCT-center placement was randomized, but realized household distance is not equivalent to independently randomized individual distance. Households closer to the center of a VCT zone may be closer to many possible randomized center locations. Therefore, the paper controls for simulated average distance.
+
+This is why the first-stage regressions include the simulated average distance control.
+
+# Data and sample construction
+
+The paper's sample path is important because later behavior is observed only for follow-up respondents in Balaka and Rumphi. Therefore, the table below should be read as both a sample-construction table and an attrition diagnostic.
+
+Panel C is especially important for internal validity. If randomized incentives or realized distance directly predicted attrition, the outcome sample would be more concerning. In the paper, follow-up participation is related to having obtained results and to HIV-positive status, but the randomized encouragement variables themselves are not the main attrition drivers.
+
+```{r sample-attrition}
+#-------------------------------------------
+# Table 1 
+#-------------------------------------------
+table1PanelA <- data.frame(
+  item = c(
+    "Percent of 1998 adult sample interviewed in 2001",
+    "Percent of 1998 adult sample interviewed in 2004",
+    "Main sample (accepted HIV test with covariate data)",
+    "Follow-up sample (main sample interviewed at follow-up)",
+    "Percent accepting a test for HIV",
+    "Percent of main sample (Balaka and Rumphi) interviewed at 2004 follow-up survey"
+  ),
+  col1 = rep("", 6),
+  col2 = c(
+    thornton %>%
+      filter(inter98 == 1) %>%
+      summarise(x = mean(inter01 == 1, na.rm = TRUE)) %>%
+      pull(x) %>%
+      scales::number(accuracy = 0.01),
+
+    thornton %>%
+      filter(inter98 == 1) %>%
+      summarise(x = mean(survey2004 == 1, na.rm = TRUE)) %>%
+      pull(x) %>%
+      scales::number(accuracy = 0.01),
+
+    nrow(main_sample) %>%
+      scales::number(accuracy = 1, big.mark = ","),
+
+    nrow(followup_sample) %>%
+      scales::number(accuracy = 1, big.mark = ","),
+
+    thornton %>%
+      filter(!is.na(test2004)) %>%
+      summarise(x = mean(test2004 == 1, na.rm = TRUE)) %>%
+      pull(x) %>%
+      scales::number(accuracy = 0.01),
+
+    followup_eligible %>%
+      summarise(x = mean(followupsurvey == 1, na.rm = TRUE)) %>%
+      pull(x) %>%
+      scales::number(accuracy = 0.01)
+  )
+)
+
+# Panel B: Determinants of accepting an HIV test
+table1panelBreg1 <- estimatr::lm_robust(
+  test2004 ~ male + age + age2 + mar + tb + rumphi + balaka,
+  data = thornton,
+  clusters = villnum
+)
+
+# The new cleaning process creates `ll`, a baseline belief indicator.
+# This better matches the original Table 1 Panel B column (2).
+table1panelBreg2 <- estimatr::lm_robust(
+  test2004 ~ male + age + age2 + mar + tb + thinktreat + ll + rumphi + balaka,
+  data = thornton,
+  clusters = villnum
+)
+
+gof <- tibble::tribble(
+  ~raw,        ~clean,          ~fmt,
+  "nobs",      "Sample size",      0,
+  "r.squared", "$R^2$",           2
+)
+
+cm <- c(
+  "male"       = "Male",
+  "age"        = "Age",
+  "age2"       = "Age-squared",
+  "mar"        = "Married",
+  "tb"         = "Had a previous HIV test",
+  "thinktreat" = "Think treatment will become available",
+  "ll"         = "Think there is a likelihood of being HIV positive"
+)
+
+table1PanelB <- modelsummary::msummary(
+  list(table1panelBreg1, table1panelBreg2),
+  stars = TRUE,
+  gof_map = gof,
+  coef_map = cm,
+  output = "data.frame"
+) %>%
+  select(term, `(1)`, `(2)`) %>%
+  rename(` ` = term) %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("V0") %>%
+  t() %>%
+  as.data.frame() %>%
+  `colnames<-`(c("item", "col1", "col2"))
+
+# Blank out standard-error rows.
+table1PanelB[
+  grepl("^\\(", table1PanelB$col1) | grepl("^\\(", table1PanelB$col2),
+  "item"
+] <- ""
+
+# Panel C: Determinants of participation in the follow-up survey
+# Important update:
+# - Use `tinc_usd`, not raw `tinc`.
+# - Use `tinc2_usd`, not `tinc2 = tinc^2`.
+# - Use `dist2`, not locally-created `distvct2`.
+# - Use `simave`, not `simaverage`.
+cm2 <- c(
+  "got"       = "Got results",
+  "any"       = "Any incentive",
+  "tinc_usd"  = "Amount of incentive",
+  "tinc2_usd" = "Amount of incentive$^2$",
+  "distvct"   = "Distance (km)",
+  "dist2"     = "Distance$^2$",
+  "hiv2004"   = "HIV positive"
+)
+
+table1panelCreg1 <- estimatr::lm_robust(
+  followupsurvey ~ got + any + tinc_usd + tinc2_usd +
+    distvct + dist2 + hiv2004 + male + age + age2 + simave + rumphi,
+  data = followup_eligible,
+  clusters = villnum
+)
+
+table1PanelC <- modelsummary::msummary(
+  list(table1panelCreg1),
+  stars = TRUE,
+  gof_map = gof,
+  coef_map = cm2,
+  output = "data.frame"
+) %>%
+  select(term, `(1)`) %>%
+  mutate(`  ` = "", .before = `(1)`) %>%
+  rename(` ` = term) %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("V0") %>%
+  t() %>%
+  as.data.frame() %>%
+  `colnames<-`(c("item", "col1", "col2"))
+
+# Blank out standard-error rows.
+table1PanelC[
+  grepl("^\\(", table1PanelC$col2),
+  "item"
+] <- ""
+
+# Combine panels
+table1_combined <- table1PanelA %>%
+  bind_rows(table1PanelB) %>%
+  bind_rows(table1PanelC) %>%
+  `rownames<-`(NULL) %>%
+  `colnames<-`(NULL)
+
+# Dynamic row indices, so the table does not break if Panel B has one more variable.
+nA <- nrow(table1PanelA)
+nB <- nrow(table1PanelB)
+nC <- nrow(table1PanelC)
+
+table1_combined %>%
+  kbl(
+    caption = "Sample Size and Determinants of Participation\\label{tab:1}",
+    align = "lcc",
+    escape = FALSE,
+    booktabs = TRUE
+  ) %>%
+  kable_styling(latex_options = "HOLD_position") %>%
+  pack_rows(
+    "Panel A: Sample size and attrition",
+    1,
+    nA
+  ) %>%
+  pack_rows(
+    "Panel B: Determinants of accepting an HIV test",
+    nA + 1,
+    nA + nB,
+    hline_before = TRUE
+  ) %>%
+  pack_rows(
+    "Panel C: Determinants of participation in the follow-up survey",
+    nA + nB + 1,
+    nA + nB + nC,
+    hline_before = TRUE
+  ) %>%
+  footnote(
+    general = paste0(
+      "Panel B reports OLS regressions of accepting an HIV test among respondents ",
+      "offered a test. Panel C reports an OLS regression for participation in the ",
+      "follow-up survey among respondents eligible for follow-up, namely those tested ",
+      "for HIV in Balaka and Rumphi. Robust standard errors are clustered by village. ",
+      "District fixed effects are included. Any is an indicator for receiving a nonzero ",
+      "monetary incentive. Amount is the total value of the incentive in dollars, using ",
+      "the cleaned variable `tinc_usd`."
+    ),
+    threeparttable = TRUE,
+    general_title = "Notes: ",
+    footnote_as_chunk = TRUE
+  ) %>%
+  add_footnote(
+    c(
+      "*** Significantly different from zero at 99 percent confidence level.",
+      "** Significantly different from zero at 95 percent confidence level.",
+      "* Significantly different from zero at 90 percent confidence level."
+    ),
+    notation = "none"
+  )
+```
+
+# Descriptive statistics and data checks
+
+Using Table 2, this section describes the economic and health environment of the experiment:
+
+* The study population is rural, has meaningful exposure to HIV risk, limited prior HIV testing, and low baseline condom use. Because many respondents had not previously learned their HIV status, obtaining test results could plausibly change subsequent preventive behavior.
+
+* The table also summarizes the randomized encouragements and follow-up outcomes, including monetary incentives, distance to VCT centers, VCT attendance, condom purchases, and sexual activity. 
+
+```{r table-2-summary-statistics}
+#-------------------------------------------
+# Table 2: Summary statistics
+#-------------------------------------------
+
+summary_function <- function(x) {
+  c(
+    Mean = scales::number(mean(x, na.rm = TRUE), accuracy = 0.001),
+    SD   = paste0("(", scales::number(sd(x, na.rm = TRUE), accuracy = 0.01), ")")
+  )
+}
+
+summary_full_sample <- main_sample %>%
+  {
+    sapply(
+      c(
+        # Panel A: respondent characteristics
+        list(
+          Male = .$male,
+          Age = .$age,
+          Married = .$mar,
+          `Years of education` = .$educ2004,
+          `Owns land` = .$land2004
+        ),
+
+        # Panel B: health and baseline behavior
+        list(
+          `HIV positive` = .$hiv2004,
+          `Gonorrhea positive` = .$T_final_result_gc[.$T_final_result_gc < 8],
+          `Chlamydia positive` = .$T_final_result_ct[.$T_final_result_ct < 8],
+          `Trichomoniasis positive` = .$T_final_trich[.$female == 1 | .$male == 0],
+          `Ever had an HIV test (before 2004)` = .$tb,
+          `Thinks treatment will be available in five years` = .$thinktreat,
+          `Reported having sex during 2004` = .$hadsex12,
+          `Reported using condoms during 2004` = .$usecondom04,
+          `Sexual acts in one month (if > 0)` =
+            .$timeshadsex_s[.$timeshadsex_s != 88 & .$timeshadsex_s != 0]
+        ),
+
+        # Panel C: randomized encouragements and result-taking
+        list(
+          `Monetary incentive (dollars)` = .$tinc_usd,
+          `Distance to VCT center (km)` = .$distvct,
+          `Attended VCT center` = .$got,
+          `Attended VCT center (if incentive = 0)` = .$got[.$tinc_usd == 0]
+        )
+      ),
+      summary_function
+    )
+  } %>%
+  as.data.frame() %>%
+  mutate(
+    `Purchased condoms at the follow-up` = "-",
+    `Number of condoms purchased (if > 0)` = "-",
+    `Reported purchasing condoms` = "-",
+    `Reported having sex after VCT` = "-",
+    `Reported having sex with more than one partner after VCT` = "-"
+  )
+
+summary_follow_up <- followup_sample %>%
+  mutate(
+    more1_fo = case_when(
+      numsex_fo > 1 & !is.na(numsex_fo) ~ 1,
+      numsex_fo == 1 | numsex_fo == 0 ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  {
+    sapply(
+      c(
+        # Panel A: respondent characteristics
+        list(
+          Male = .$male,
+          Age = .$age,
+          Married = .$mar,
+          `Years of education` = .$educ2004,
+          `Owns land` = .$land2004
+        ),
+
+        # Panel B: health and baseline behavior
+        list(
+          `HIV positive` = .$hiv2004,
+          `Gonorrhea positive` = .$T_final_result_gc[.$T_final_result_gc < 8],
+          `Chlamydia positive` = .$T_final_result_ct[.$T_final_result_ct < 8],
+          `Trichomoniasis positive` = .$T_final_trich[.$female == 1 | .$male == 0],
+          `Ever had an HIV test (before 2004)` = .$tb,
+          `Thinks treatment will be available in five years` = .$thinktreat,
+          `Reported having sex during 2004` = .$hadsex12,
+          `Reported using condoms during 2004` = .$usecondom04,
+          `Sexual acts in one month (if > 0)` =
+            .$timeshadsex_s[.$timeshadsex_s != 88 & .$timeshadsex_s != 0]
+        ),
+
+        # Panel C: randomized encouragements and result-taking
+        list(
+          `Monetary incentive (dollars)` = .$tinc_usd,
+          `Distance to VCT center (km)` = .$distvct,
+          `Attended VCT center` = .$got,
+          `Attended VCT center (if incentive = 0)` = .$got[.$tinc_usd == 0]
+        ),
+
+        # Panel D: follow-up condom sales and sexual behavior
+        list(
+          `Purchased condoms at the follow-up` = .$anycond,
+          `Number of condoms purchased (if > 0)` = .$numcond[.$anycond != 0],
+          `Reported purchasing condoms` = .$bought,
+          `Reported having sex after VCT` = .$havesex_fo,
+          `Reported having sex with more than one partner after VCT` = .$more1_fo
+        )
+      ),
+      summary_function
+    )
+  } %>%
+  as.data.frame()
+
+obs_full_sample <- nrow(main_sample)
+obs_follow_up <- nrow(followup_sample)
+
+table2 <- cbind(
+  t(summary_full_sample),
+  t(summary_follow_up)
+) 
+
+kbl(
+  table2,
+  caption = "Summary Statistics\\label{tab:summary-statistics}",
+  align = "lcccc",
+  escape = FALSE,
+  booktabs = TRUE
+) %>%
+  kable_styling(latex_options = "HOLD_position") %>%
+  add_header_above(c("Observations", 2, 2) %>% 
+                         `names<-`(c("", scales::comma(obs_full_sample), scales::comma(obs_follow_up)))) %>% 
+    add_header_above(c("", "Full sample" = 2, "Follow-up sample" = 2)) %>% 
+  pack_rows("Panel A: Respondent characteristics", 1, 5) %>%
+  pack_rows("Panel B: Health and baseline behavior", 6, 14) %>%
+  pack_rows("Panel C: Incentives, distance, and attendance at results centers", 15, 18) %>%
+  pack_rows("Panel D: Follow-up condom sales and sexual behavior", 19, 23) %>%
+  footnote(
+    general = paste0(
+      "The full sample includes respondents who accepted an HIV test in 2004 ",
+      "and have basic covariate data. The follow-up sample includes respondents ",
+      "in Balaka and Rumphi who were reinterviewed after VCT results became available. ",
+      "The monetary incentive is reported in dollars using the cleaned variable ",
+      "`tinc_usd`. Distance is measured in kilometers. Trichomoniasis was tested ",
+      "only among women. Follow-up condom outcomes are observed only in the ",
+      "follow-up sample."
+    ),
+    general_title = "Notes: ",
+    footnote_as_chunk = TRUE,
+    threeparttable = TRUE
+  )
+```
+
+# Randomization and balance diagnostics
+
+* Randomized encouragements should be unrelated to baseline respondent types -> selection into higher incentives or lower travel costs would confound the first stage -> Table 3 tests whether baseline characteristics predict `any`, incentive amount, incentive squared, distance, and distance squared.
+
+* The incentive variation should not be targeted toward people with different health risk or prevention behavior -> otherwise higher VCT attendance could reflect pre-existing motivation rather than incentives -> Table 3 checks balance on HIV status, prior HIV testing, baseline sexual activity, and baseline condom use.
+
+* The distance variation should not simply proxy for respondent socioeconomic or demographic differences -> otherwise the distance effect could reflect village composition rather than travel cost -> Table 3 checks whether age, gender, education, marriage, and land ownership are systematically related to distance measures.
+
+* Some statistically significant differences may appear by chance because many covariates are tested -> over-interpreting isolated stars would exaggerate imbalance -> Table 3’s relevant pattern is whether imbalances are large and systematic, not whether every coefficient is insignificant.
+
+* If baseline characteristics are broadly balanced across incentives and distance -> the randomized encouragements are credible sources of exogenous variation -> this supports the next section’s interpretation that changes in VCT attendance are driven by incentives and travel costs rather than pre-existing respondent differences.
+
+
+```{r table-3-balance-diagnostics}
+# -------------------------------------------------------------------
+# Table 3: Baseline characteristics by incentives and distance
+# Published-style Table 3 balance regressions
+# -------------------------------------------------------------------
+
+table3_sample <- thornton %>%
+  filter(MainSample == 1) %>%
+  mutate(
+    tinc2_usd = tinc_usd^2,
+    dist2 = distvct^2
+  )
+
+balance_outcomes <- c(
+  "male",
+  "age",
+  "hiv2004",
+  "educ2004",
+  "land2004",
+  "hadsex12",
+  "usecondom04"
+)
+
+balance_labels <- c(
+  "Male",
+  "Age",
+  "HIV positive",
+  "Years of education",
+  "Owns land",
+  "Had sex in 2004",
+  "Used a condom in 2004"
+)
+
+table3_models <- purrr::map(
+  balance_outcomes,
+  function(y) {
+    fml <- as.formula(
+      paste0(
+        y,
+        " ~ any + tinc_usd + tinc2_usd + distvct + dist2 + rumphi + balaka"
+      )
+    )
+
+    estimatr::lm_robust(
+      formula = fml,
+      data = table3_sample,
+      clusters = villnum
+    )
+  }
+)
+
+names(table3_models) <- paste0(
+  "(",
+  seq_along(balance_labels),
+  ") ",
+  balance_labels
+)
+
+coef_map_table3 <- c(
+  "any"        = "Any incentive",
+  "tinc_usd"   = "Amount of incentive",
+  "tinc2_usd"  = "Amount of incentive$^2$",
+  "distvct"    = "Distance (km)",
+  "dist2"      = "Distance$^2$",
+  "(Intercept)" = "Constant"
+)
+
+gof_table3 <- tibble::tribble(
+  ~raw,        ~clean,        ~fmt,
+  "nobs",      "Sample size",  0,
+  "r.squared", "$R^2$",        2
+)
+
+modelsummary::modelsummary(
+  table3_models,
+  coef_map = coef_map_table3,
+  gof_map = gof_table3,
+  stars = TRUE,
+  fmt = 3,
+  escape = FALSE,
+  output = "kableExtra",
+  title = "Baseline Characteristics by Incentives and Distance"
+) %>%
+  kableExtra::kable_styling(latex_options = c("HOLD_position", "scale_down")) %>%
+  kableExtra::footnote(
+    general = paste0(
+      "Sample includes individuals who tested for HIV and have demographic data. ",
+      "Each column is a separate OLS regression using the baseline characteristic ",
+      "listed in the column header as the dependent variable. Robust standard errors ",
+      "are clustered by village. District fixed effects are included through Rumphi ",
+      "and Balaka indicators. Any incentive is an indicator for receiving a nonzero ",
+      "monetary incentive. Amount of incentive is measured in dollars using ",
+      "`tinc_usd`. Distance is the straight-line distance from the respondent's home ",
+      "to the assigned VCT center."
+    ),
+    general_title = "Notes: ",
+    footnote_as_chunk = TRUE,
+    threeparttable = TRUE
+  )
+
+```
+
+# Model-free first-stage evidence
+
+- Incentives should raise result-taking -> otherwise they cannot serve as encouragements -> Figure \ref{fig:1} shows VCT attendance increasing with positive and larger incentives.
+
+- Distance should lower result-taking -> otherwise VCT placement would not generate useful variation -> Figure \ref{fig:2} shows lower VCT attendance among respondents farther from the assigned VCT center.
+
+- These are first-stage patterns only -> avoid interpreting them as behavioral effects -> Figures \ref{fig:1} and \ref{fig:2} use VCT attendance as the outcome, not condom purchases.
+
+- Clear model-free patterns justify the formal first stage -> weak visual patterns would undermine the IV design -> Figures \ref{fig:1} and \ref{fig:2} motivate the regression evidence in the next section.
+
+
+```{r figure-incentive-first-stage, fig.height=3, fig.width=10, fig.cap="Model-free incentive first stage: VCT attendance is higher when respondents receive any monetary incentive and generally rises with larger incentive amounts. The outcome is learning HIV results, not later condom purchases.\\label{fig:1}"}
+fig_any <- group_mean_ci(main_sample, "any_label", "got") %>%
+  plot_task(aes(x = group, y = mean)) +
+  geom_col(width = 0.45) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.12) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Share learning HIV results",
+    title = "A. Any incentive"
+  )
+
+fig_amt <- group_mean_ci(main_sample, "incentive_bin", "got") %>%
+  plot_task(aes(x = group, y = mean)) +
+  geom_col(width = 0.55) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.12) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  labs(
+    x = "Total incentive amount (USD)",
+    y = "Share learning HIV results",
+    title = "B. Incentive amount"
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+ggpubr::ggarrange(fig_any, fig_amt)
+```
+
+```{r figure-distance-first-stage, fig.cap="Model-free distance first stage: VCT attendance is lower for respondents living farther from the assigned VCT center. This supports the role of travel cost as a second encouragement for learning HIV results.\\label{fig:2}"}
+distance_means <- group_mean_ci(main_sample, "distance_bin", "got")
+
+plot_task(distance_means, aes(x = group, y = mean, group = 1)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.12) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  coord_cartesian(ylim = c(0.55, 1)) +
+  labs(
+    x = "Distance to assigned VCT center (km, binned)",
+    y = "Share learning HIV results",
+    title = "Model-free distance first stage"
+  )
+```
+
+# Regression analysis
+
+$$GotResults_{ij} = \alpha + \beta_1 Any_{if} + \beta_2 Amt_{ij} + \beta_3 Amt_{ij}^2 + \beta_4 Dist_{ij} + \beta_5 Dist_{ij}^2 + \mathbf{X_{ij}'}\mu + \varepsilon_{ij}$$
+
+Attendance at the VCT center is indicated by $GotResults_{ij} = 1$ for person i in village j. Because the locations of the centers were chosen randomly, as opposed to randomly assigning the distance needed to travel, I draw 1000 simulated random locations in each VCT zone and calculate the average distance of each tested respondent from each of the 1000 simulated locations. I average this distance for each respondent and take the mean across all respondents living in each zeon. Not controlling for this simulated average term would ignore the fact that each VCT zone is bounded and that, in expectation, more central households have shorter distances to travel from any randomized location (although including this term does not significantly change any of the estimates). although the dependent variable is binary, the linear specifications do not differ greatly from estimations from probits; both results are presented.
+
+```{r table-4-first-stage-regression, results='asis'}
+# -------------------------------------------------------------------
+# Table 4: Impact of monetary incentives and distance on learning HIV results
+# OLS + marginal probit, updated for cleaned variables
+# -------------------------------------------------------------------
+
+ols1 <- lm_robust(got ~ any + male + hiv2004 + age + age2 + rumphi + balaka,
+              data = main_sample,
+              cluster = villnum)
+
+ols2 <- lm_robust(got ~ any + tinc_usd + male + hiv2004 + age + age2 + rumphi + balaka,
+              data = main_sample,
+              cluster = villnum)
+
+ols3 <- lm_robust(got ~ any + tinc_usd + tinc2_usd + male + hiv2004 + age + age2 + rumphi + balaka,
+              data = main_sample,
+              cluster = villnum)
+
+ols4 <- lm_robust(got ~ any + tinc_usd + tinc2_usd + distvct + dist2 + simave + male + hiv2004 + age + age2 + rumphi + balaka,
+              data = main_sample,
+              cluster = villnum)
+
+ols5 <- lm_robust(got ~ any + tinc_usd + tinc2_usd + over + simave + male + hiv2004 + age + age2 + rumphi + balaka,
+              data = main_sample,
+              cluster = villnum)
+
+# probit part
+library(mfx)
+
+probit1 <- probitmfx(got ~ any + male + hiv2004 + age + age2 + rumphi + balaka,
+               data = main_sample,
+               clustervar1 = "villnum")
+
+probit2 <- probitmfx(got ~ any + tinc_usd + male + hiv2004 + age + age2 + rumphi + balaka,
+               data = main_sample,
+               clustervar1 = "villnum")
+
+probit3 <- probitmfx(got ~ any + tinc_usd + tinc2_usd + male + hiv2004 + age + age2 + rumphi + balaka,
+               data = main_sample,
+               clustervar1 = "villnum")
+
+probit4 <- probitmfx(got ~ any + tinc_usd + tinc2_usd + distvct + dist2 + simave + male + hiv2004 + age + age2 + rumphi + balaka,
+               data = main_sample,
+               clustervar1 = "villnum")
+
+probit5 <- probitmfx(got ~ any + tinc_usd + tinc2_usd + over + simave + male + hiv2004 + age + age2 + rumphi + balaka,
+               data = main_sample,
+               clustervar1 = "villnum")
+
+glance_custom.probitmfx <- function(x, ...) {
+  r.squared <-  DescTools::PseudoR2(glm(eval(x$call[[2]]),
+               data = eval(x$call[[3]]), family = binomial(link = "probit")))
+  r.squared <- sprintf("%.3f", r.squared)
+  data.table::data.table(r.squared = r.squared)
+}
+
+cm <- c("any" = "Any incentive",
+        "tinc_usd" = "Amount of incentive",
+        "male" = "Male",
+        "hiv2004" = "HIV",
+        "age" = "Age",
+        "age2" = "Age$^2$",
+        "rumphi" = "Rumphi",
+        "balaka" = "Balaka",
+        "tinc2_usd" = "Amount of incentive$^2$",
+        "distvct" = "Distance",
+        "dist2" = "Distance$^2$",
+        "simave" = "Simulated average distance",
+        "over" = "Over 1.5 km")
+
+msummary(list(ols1, ols2, ols3, ols4, ols5, probit1, probit2, probit3, probit4, probit5) ,
+         stars = c('*' = .1, '**' = .05, '***' = .01),
+         coef_rename = function(x) sapply(str_trim(str_remove(x, "marginal")), function(x) cm[[x]]),
+         shape =  term:component  ~ model, coef_omit = "conditional|Intercept", escape = FALSE,
+         gof_map = list(list("raw" = "nobs", "clean" = "Sample size", "fmt" = function(x) number(x, big.mark = ",")),
+                        list("raw" = "r.squared", "clean" = "$R^2$", "fmt" = function(x) number(x, accuracy = 0.01))),
+         title = "Impact of Monetary Incentives and Distance on Learning HIV Test Results\\label{tab:4}", output = "latex") %>% 
+    kable_styling(latex_options="scale_down") %>% 
+    landscape() %>% 
+    add_header_above(c("", "OLS" = 5, "Marginal probit" = 5))
+```
+
+Seeking HIV results was highly responsive to incentives. The average VCT center attendance of those receiving any positive-valued voucher is more than twice that of those receiving no incentie, a difference of 43 percentage points. Moreover, the probability of center attendance increased by an additional 9.1 percentage points with every additional dollar of incentive (Table \ref{tab:4} column 2), with the nonlinear effect of the incentive also important (Table \ref{tab:4}, column 3). Distance and distance-squared also had a significant impact on the likelihood of obtaining HIV results(Table \ref{tab:4}, column 4). Those living more than 1.5 kilometers from the center were 3.8 percentage points less likely to seek their HIV results than those living within 1.5 kilometers (Table \ref{tab:4}, column 5). The effect of offering ten cents (as compared to offering no incentive) was greater than the effect of distance. The effects of incentives and distance are similar when using a nonlinear model (Table 4, column 6-10).
+
+
+# Extension: Impact of Learning HIV Status
+
+### Variable definition
+
+* Difficulty: sexual behavior, like number of sexual partners, is likely to underroported; and contraceptive use is sometimes overreported.
+* The demand of save sex is the actual purchase of condoms from survey interviewers.
+
+### Summary Statistics
+
+The subsidized condoms were offered at the end of follow up interview, 24 percent purchased at least one condom; of those who purchased any condoms, the average number purchased was 3.7 (Table 2 Panel D). This rate of condom purchases is similar to the condom use reported in the 2004 main survey, where 21 percent of all respondonts reported using a condom with a sexual partner during the prior year (Table 2 Panel B).
+
+### regression analysis
+
+Baseline model:
+
+$$Y = \alpha + \beta_1 GotResults + \beta_2  (GotResults \times HIV) + HIV + \mathbf{X}'\mathbf{\mu} + \varepsilon$$
+
+where $Y$ is the indicator of condom purchaseat the time of the follow-up survey; or if the respondent reported having sex. The fact that individuals choose to learn their HIV status, the selection bias, means that OLS estimates are likely to be biased. But this bias can be correct by instruments, such as any incentive, the amount of the incentive, the amount of incentive squared. 
+
+First stage:
+
+$$GotResults = \alpha + \beta_1 Any + \beta_2 Amt + \beta_3 Amt^2 + \beta_4 Dist + \beta_5 Dist^2 + \cdots + \mathbf{X}'\mathbf{\mu} + \varepsilon$$
+
+```{r}
+# ------------------------------------------------------------
+# Table 6: First stage of IV
+# Updated for cleaned variable names
+# ------------------------------------------------------------
+
+iv_sample <- main_sample %>%
+  filter(followupsurvey == 1, hadsex12 == 1) %>%
+  mutate(
+    age2 = age^2,
+    tinc2_usd = tinc_usd^2,
+    dist2 = distvct^2,
+    hiv_got = got * hiv2004
+  )
+
+first_stage_rhs <- paste(
+  c(
+    "any",
+    "tinc_usd",
+    "tinc2_usd",
+    "distvct",
+    "dist2",
+    "I(any * male)",
+    "I(tinc_usd * male)",
+    "I(tinc2_usd * male)",
+    "I(distvct * male)",
+    "I(dist2 * male)",
+    "I(any * male * hiv2004)",
+    "I(tinc_usd * male * hiv2004)",
+    "I(tinc2_usd * male * hiv2004)",
+    "I(distvct * male * hiv2004)",
+    "I(dist2 * male * hiv2004)",
+    "I(any * hiv2004)",
+    "I(tinc_usd * hiv2004)",
+    "I(tinc2_usd * hiv2004)",
+    "I(distvct * hiv2004)",
+    "I(dist2 * hiv2004)",
+    "hiv2004",
+    "male",
+    "simave",
+    "rumphi",
+    "age",
+    "age2"
+  ),
+  collapse = " + "
+)
+
+tab6reg1 <- lm_robust(
+  as.formula(paste("got ~", first_stage_rhs)),
+  data = iv_sample,
+  clusters = villnum
+)
+
+tab6reg2 <- lm_robust(
+  as.formula(paste("hiv_got ~", first_stage_rhs)),
+  data = iv_sample,
+  clusters = villnum
+)
+
+msummary(
+  list(tab6reg1, tab6reg2),
+  stars = TRUE,
+  coef_map = c(
+    "any" = "Any incentive",
+    "tinc_usd" = "Amount of incentive",
+    "tinc2_usd" = "Amount of incentive$^2$",
+    "distvct" = "Distance",
+    "dist2" = "Distance$^2$",
+    "hiv2004" = "HIV",
+    "male" = "Male",
+    "(Intercept)" = "Constant"
+  ),
+  escape = FALSE,
+  title = "First Stage",
+  gof_map = gof
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Table 7: IV regression
+# Updated for cleaned variable names
+# ------------------------------------------------------------
+
+second_stage_rhs <- paste(
+  c(
+    "got",
+    "hiv_got",
+    "hiv2004",
+    "male",
+    "age",
+    "age2",
+    "simave",
+    "rumphi"
+  ),
+  collapse = " + "
+)
+
+run_ols <- function(y) {
+  lm_robust(
+    as.formula(paste(y, "~", second_stage_rhs)),
+    data = iv_sample,
+    clusters = villnum
+  )
+}
+
+run_iv <- function(y) {
+  iv_robust(
+    as.formula(paste(y, "~", second_stage_rhs, "|", first_stage_rhs)),
+    data = iv_sample,
+    clusters = villnum
+  )
+}
+
+tab7ols1 <- run_ols("anycond")
+tab7IV1  <- run_iv("anycond")
+
+tab7ols2 <- run_ols("numcond")
+tab7IV2  <- run_iv("numcond")
+
+tab7ols3 <- run_ols("bought")
+tab7IV3  <- run_iv("bought")
+
+tab7ols4 <- run_ols("havesex_fo")
+tab7IV4  <- run_iv("havesex_fo")
+
+msummary(
+  list(tab7ols1, tab7IV1, tab7ols2, tab7IV2, tab7ols3, tab7IV3, tab7ols4, tab7IV4),
+  stars = TRUE,
+  coef_map = c(
+    "got" = "Got results",
+    "hiv_got" = "Got results x HIV",
+    "hiv2004" = "HIV",
+    "male" = "Male",
+    "age" = "Age",
+    "age2" = "Age$^2$",
+    "rumphi" = "Rumphi",
+    "simave" = "Simulated average distance",
+    "(Intercept)" = "Constant"
+  ),
+  title = "Reactions to Learning HIV Results among Sexually Active at Baseline",
+  escape = FALSE,
+  gof_map = gof
+) %>%
+  add_header_above(
+    c("", rep(1, 8)) %>%
+      `names<-`(c("", rep(c("OLS", "IV"), 4)))
+  ) %>%
+  add_header_above(
+    c(
+      "",
+      "Bought condoms" = 2,
+      "Number of condoms bought" = 2,
+      "Reported buying condoms" = 2,
+      "Reported having sex at follow-up" = 2
+    )
+  ) %>%
+  kable_styling(latex_options = "scale_down")
+```
+
+Row 1 of Table 7 shows no significant effects of learning HIV negative results on any measure of condom purchase of recent sexual activity among those who had sex at baseline. However standard error of the iV estimates are large, making it impossible to reject "no impact of learning HIV-negative status."
+
+Overall, while HIV positive individuals were significantly less likely to purchase condoms from the survey interviewers (Row 3). Receiving an HIV-positive diagnosis resulted in an increase in condom purchases(Row 2). 
+
+In the linear specification, the estimated impact of learning HIV-positive results on the likelihood of purchasing any condoms is large, although statistically insignificant at traditional confidence levels (Table 7, column 2). However, there is a statistically significant effect of learning HIV-positive results on the total number of condoms purchased (Table 7, column 4).
+
+# Robustness
+
+The paper discussed two extensions: whether to believe the HIV test results
+
+### Prior beliefs about infection
+
+Thornton next asks whether the effect of learning HIV status depends on what respondents already believed. This is a natural question because information should matter most when it is surprising. The paper first checks whether beliefs actually update after VCT and then interacts result learning with a baseline belief indicator.
+
+\[
+Y_i
+=
+\alpha + \beta_1 \text{GotResults}_i
++ \beta_2 \left(\text{GotResults}_i \times \text{PriorBelief}_i\right)
++ \beta_3 \text{PriorBelief}_i + X_i' \gamma + u_i.
+\]
+
+```{r prior-beliefs}
+# ------------------------------------------------------------
+# Prior beliefs and condom purchases
+# Updated for cleaned variable names
+# ------------------------------------------------------------
+
+# Belief table: approximate Table 10
+belief_table <- tibble(
+  Group = c(
+    "HIV-negative: baseline",
+    "HIV-negative: follow-up, did not get results",
+    "HIV-negative: follow-up, got results",
+    "HIV-positive: baseline",
+    "HIV-positive: follow-up, did not get results",
+    "HIV-positive: follow-up, got results"
+  ),
+  Mean = c(
+    mean(main_sample$ll[main_sample$hiv2004 == 0], na.rm = TRUE),
+    mean(followup_sample$ll_fo[followup_sample$hiv2004 == 0 & followup_sample$got == 0], na.rm = TRUE),
+    mean(followup_sample$ll_fo[followup_sample$hiv2004 == 0 & followup_sample$got == 1], na.rm = TRUE),
+    mean(main_sample$ll[main_sample$hiv2004 == 1], na.rm = TRUE),
+    mean(followup_sample$ll_fo[followup_sample$hiv2004 == 1 & followup_sample$got == 0], na.rm = TRUE),
+    mean(followup_sample$ll_fo[followup_sample$hiv2004 == 1 & followup_sample$got == 1], na.rm = TRUE)
+  )
+)
+
+# Analysis sample for prior-belief regressions
+prior_sample <- sex_followup_sample %>%
+  filter(hadsex12 == 1) %>%
+  mutate(
+    age2 = age^2,
+    tinc_usd = as.numeric(tinc_usd),
+    under = as.integer(distvct <= 1.5),
+
+    got_ll = got * ll,
+
+    any_male = any * male,
+    tinc_male = tinc_usd * male,
+    under_male = under * male,
+
+    any_ll = any * ll,
+    tinc_ll = tinc_usd * ll,
+    under_ll = under * ll,
+
+    any_male_ll = any * male * ll,
+    tinc_male_ll = tinc_usd * male * ll,
+    under_male_ll = under * male * ll
+  )
+
+# HIV positive
+prior_pos_ols <- lm_robust(
+  anycond ~ got + got_ll + ll + male + age + age2 + simave + rumphi,
+  data = prior_sample %>% filter(hiv2004 == 1),
+  clusters = villnum
+)
+
+prior_pos_iv <- iv_robust(
+  anycond ~ got + got_ll + ll + male + age + age2 + simave + rumphi |
+    any_male + tinc_male + under_male +
+    any + tinc_usd + under +
+    any_ll + tinc_ll + under_ll +
+    any_male_ll + tinc_male_ll + under_male_ll +
+    ll + male + age + age2 + simave + rumphi,
+  data = prior_sample %>% filter(hiv2004 == 1),
+  clusters = villnum
+)
+
+# HIV negative
+prior_neg_ols <- lm_robust(
+  anycond ~ got + got_ll + ll + male + age + age2 + simave + rumphi,
+  data = prior_sample %>% filter(hiv2004 == 0),
+  clusters = villnum
+)
+
+prior_neg_iv <- iv_robust(
+  anycond ~ got + got_ll + ll + male + age + age2 + simave + rumphi |
+    any_male + tinc_male + under_male +
+    any + tinc_usd + under +
+    any_ll + tinc_ll + under_ll +
+    any_male_ll + tinc_male_ll + under_male_ll +
+    ll + male + age + age2 + simave + rumphi,
+  data = prior_sample %>% filter(hiv2004 == 0),
+  clusters = villnum
+)
+
+belief_table %>%
+  mutate(
+    Mean = scales::number(Mean, accuracy = 0.001)
+  ) %>%
+  kableExtra::kbl(
+    caption = "Beliefs about current HIV infection before and after VCT.\\label{tab:prior-beliefs}",
+    align = "lc",
+    escape = FALSE,
+    booktabs = TRUE
+  ) %>%
+  kableExtra::kable_styling(
+    latex_options = "HOLD_position"
+  ) %>%
+  kableExtra::footnote(
+    general = paste0(
+      "Approximate replication of Table 10. ",
+      "The indicator equals one for any stated likelihood of infection and zero for none."
+    ),
+    general_title = "Notes: ",
+    footnote_as_chunk = TRUE,
+    threeparttable = TRUE
+  )
+
+coef_map_prior <- c(
+  "got" = "Got results",
+  "got_ll" = "Got results x prior belief",
+  "ll" = "Prior belief: any likelihood of HIV infection",
+  "male" = "Male",
+  "age" = "Age",
+  "age2" = "Age$^2$",
+  "simave" = "Simulated average distance",
+  "rumphi" = "Rumphi",
+  "(Intercept)" = "Constant"
+)
+
+modelsummary(
+  list(
+    "OLS" = prior_pos_ols,
+    "IV" = prior_pos_iv,
+    "OLS" = prior_neg_ols,
+    "IV" = prior_neg_iv
+  ),
+  coef_map = coef_map_prior,
+  gof_map = gof,
+  title = "Prior beliefs and condom purchases.",
+  escape = FALSE,
+  stars = TRUE
+) %>% 
+  add_header_above(c("", "HIV-positive" = 2, "HIV-negative" = 2))
+
+```
+
+The belief-updating table closely matches the paper's headline pattern: HIV-negative respondents who learned their result became much less likely to think they were infected. But the interaction regressions show little evidence that prior beliefs strongly moderate condom purchases. That is also Thornton's conclusion: beliefs move, yet the prior-belief interaction does not explain much of the behavioral response.
+
+
+### Mechanism discussion following the paper
+
+The mechanism discussion in the paper is mainly conceptual rather than a new regression section, so I keep it in that spirit.
+
+- Travel cost: distance strongly lowers attendance, which is the clearest direct evidence that physical transaction costs matter.
+- Direct monetary cost: even very small vouchers substantially raise attendance, so the private cost of collecting results need not be large to deter take-up.
+- Psychological cost: the fact that a very small payment can double attendance makes it hard to argue that fear alone is an overwhelming barrier in this setting.
+- Stigma or a "public excuse" channel: Thornton explicitly notes that incentives may work not only by offsetting cost, but also by giving respondents a socially acceptable reason to visit the center.
+
+The causal point is that the experiment identifies the effect of these shifters on attendance, but it does not separately decompose their effect into pure travel-cost, cash-on-hand, fear, and stigma components. The paper is careful on this distinction, and the note should be too.
+
+### Cost-effectiveness
+
+Thornton's cost-effectiveness discussion is deliberately cautious. The IV estimates suggest some increased condom demand among HIV-positive respondents, but the treated group is small and the effect size is modest. That makes it difficult for broad door-to-door testing to dominate other prevention interventions on infections averted per dollar.
+
+The right interpretation is not that HIV testing has no value. It is that, in these data, door-to-door testing is not obviously a high-leverage HIV-prevention tool if the outcome of interest is short-run condom purchase alone. Thornton is more positive about testing when it is linked to treatment access or targeted to higher-risk groups.
+
+
+## Conclusion / policy interpretation
+
+The paper's policy message is narrow but important. What is randomized here is the ease of learning one's status, not HIV status itself. The experiment shows that modest incentives and lower travel costs substantially increase result retrieval, and IV then shows that learning HIV-positive status can increase condom demand among compliers.
+
+The internal-validity threat to the behavioral analysis is not the first stage, but the fact that only follow-up respondents are observed and that the IV estimand is local. The resulting effect is therefore a LATE for respondents whose result-learning decision is shifted by incentives and distance. Externally, Thornton is explicit that the Malawi setting has low prevalence and specific social conditions, so one should be cautious about exporting the magnitudes mechanically.
+
+
+
+
+
+
+
+
+# Appendix
+
+```{r setup-appendix-labels, echo=FALSE}
+# 1. Get all chunk labels in the document in order
+all_chunks <- knitr::all_labels()
+
+# 2. Find the numerical index of the 'sample-attrition' chunk
+start_pos <- match("sample-attrition", all_chunks)
+
+# 3. Subset the list to only include chunks that come AFTER that position
+appendix_chunks <- all_chunks[(start_pos):length(all_chunks)]
+```
+
+```{r ref.label=appendix_chunks, echo=TRUE, eval=FALSE}
+```
