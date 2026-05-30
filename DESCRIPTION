@@ -1,39 +1,39 @@
 Package: causalmetrics
-Title: Causal Inference Toolkit for Applied Empirical Research
+Title: Utility Functions and New Methods for Empirical Causal Inference
 Version: 0.0.1
-Authors@R: 
-    person("Weiheng", "Zhang", email = "weiheng.zhang@utdallas.edu", role = c("aut", "cre"))
-Description: An opinionated workflow layer for causal inference and
-    reduced-form empirical analysis. Wraps fixest, grf, rdrobust, and other
-    backends with unified diagnostics, data preparation utilities, and
-    publication-ready output. Built on data.table for performance.
+Authors@R:
+    person("Your", "Name", email = "you@email.com", role = c("aut", "cre"))
+Description: Data cleaning utilities, descriptive table functions, diagnostics,
+    and from-scratch estimation methods (Double ML, synthetic DiD) for applied
+    empirical research. Attaching the package also attaches the standard
+    empirical analysis toolkit (data.table, fixest, estimatr, broom,
+    modelsummary, ggplot2).
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 Depends:
-    R (>= 4.1.0)
-Imports:
+    R (>= 4.1.0),
+    tidyverse,
     data.table,
     fixest,
-    checkmate,
-    rlang,
-    generics,
-    ggplot2
-Suggests:
-    testthat (>= 3.0.0),
+    estimatr,
     broom,
     modelsummary,
     kableExtra,
-    grf,
-    rdrobust,
-    did,
-    MatchIt,
+Imports:
+    checkmate,
+    rlang,
+    generics,
+    knitr
+Suggests:
+    testthat (>= 3.0.0),
     ranger,
     xgboost,
     glmnet,
-    estimatr,
+    grf,
+    kableExtra,
+    huxtable,
     DBI,
-    knitr,
     rmarkdown
 Config/testthat/edition: 3
 VignetteBuilder: knitr

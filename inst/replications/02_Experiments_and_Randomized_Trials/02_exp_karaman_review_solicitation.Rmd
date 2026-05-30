@@ -1,0 +1,1384 @@
+---
+title: "Replication: Review Solicitation and Future Spending"
+subtitle: "Randomized encouragement, ITT, LATE, heterogeneity, and multiple testing in Karaman (2026)"
+author: "Weiheng Zhang"
+date: "`r Sys.Date()`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    toc_depth: 4
+    keep_tex: false
+    latex_engine: xelatex
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/02_Experiments_and_Randomized_Trials/karaman2026asymmetric/ReviewPosting_SampleData.dta"
+header-includes: |
+  \usepackage{tikz}
+  \usetikzlibrary{arrows.meta, decorations.pathreplacing, positioning, calc}
+  % --- Color Definitions ---
+  \definecolor{darktext}{HTML}{222222}
+  \definecolor{bgcream}{HTML}{FDFDF8}
+  \definecolor{complier}{HTML}{4A90E2}
+  \definecolor{alwaystaker}{HTML}{E94E77}
+  \definecolor{nevertaker}{HTML}{F5A623}
+  \definecolor{highlight}{HTML}{7ED321}
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  echo = FALSE,
+  fig.width = 7,
+  fig.height = 4.2,
+  out.width = "80%",
+  fig.align = "center",
+  size="footnotesize"
+)
+
+library(causalmetrics)
+library(haven)
+
+table_task <- function(...){
+    kbl(..., booktab = T,
+          linesep = "") %>% 
+        kableExtra::kable_styling(position = 'center',
+                  latex_options = "HOLD_position")
+}
+
+set.seed(12345)
+```
+
+```{r data-load, include=FALSE}
+review_data <- haven::read_dta(params$data_path) %>%
+  tibble::as_tibble()
+
+subgroup_vars <- c(
+  "Silver6", "Silver8", "Silver9", "Silver10",
+  "Gold6", "Gold8", "Gold9", "Gold10",
+  "Platinum6", "Platinum8", "Platinum9", "Platinum10"
+)
+
+subgroup_map <- tibble::tibble(
+  subgroup = subgroup_vars,
+  loyalty = rep(c("Silver", "Gold", "Platinum"), each = 4),
+  satisfaction_group = rep(c("<=6", "8", "9", "10"), times = 3)
+) %>%
+  dplyr::mutate(
+    loyalty = factor(loyalty, levels = c("Silver", "Gold", "Platinum")),
+    satisfaction_group = factor(satisfaction_group, levels = c("<=6", "8", "9", "10"))
+  )
+
+numeric_vars <- c(
+  "STspend", "LTspend", "solicit", "review", "satisfactionscore",
+  "positivereview", "negativereview", "response", subgroup_vars
+)
+
+review_data <- review_data %>%
+  dplyr::mutate(
+    dplyr::across(dplyr::all_of(numeric_vars), ~ as.numeric(.x)),
+    row_id = dplyr::row_number(),
+    satisfaction_group_raw = dplyr::case_when(
+      satisfactionscore <= 6 ~ "<=6",
+      satisfactionscore == 8 ~ "8",
+      satisfactionscore == 9 ~ "9",
+      satisfactionscore == 10 ~ "10",
+      TRUE ~ "Other"
+    ),
+    satisfaction_group_raw = factor(
+      satisfaction_group_raw,
+      levels = c("<=6", "8", "9", "10", "Other")
+    ),
+    n_subgroup_cells = rowSums(dplyr::pick(dplyr::all_of(subgroup_vars)), na.rm = TRUE)
+  )
+
+cell_lookup <- review_data %>%
+  dplyr::select(row_id, dplyr::all_of(subgroup_vars)) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(subgroup_vars),
+    names_to = "subgroup",
+    values_to = "in_cell"
+  ) %>%
+  dplyr::filter(in_cell == 1) %>%
+  dplyr::select(row_id, subgroup) %>%
+  dplyr::left_join(subgroup_map, by = "subgroup")
+
+review_data <- review_data %>%
+  dplyr::left_join(cell_lookup, by = "row_id")
+
+
+```
+
+# Research Question
+
+* **Research question.** 
+  * Does posting an online review change the reviewer’s future spending on the reviewed brand, and 
+  * does soliciting a review change spending by inducing customers to post? 
+  * The paper also asks whether these effects differ by customer satisfaction and loyalty.
+
+* **Mechanism.** The causal story is that solicitation increases the probability of posting a review, and posting a review makes the customer’s evaluation of the stay more salient and cognitively accessible. For dissatisfied customers, writing the review reinforces a negative experience, so future spending on the reviewed brand falls. For highly loyal customers, even a less-than-perfect positive review can make disappointment salient enough to reduce future spending. For perfectly satisfied customers, posting a positive review does not meaningfully change future spending.
+
+Why this design. Posting is self-selected, so randomized review solicitation is appropriate as an encouragement/IV for actual posting, while also identifying the ITT effect of solicitation itself.
+
+
+To fully understand the LATE estimator, let's consider the following plot:
+
+\begin{tikzpicture}[
+    every node/.style={font=\sffamily},
+    title/.style={font=\sffamily\bfseries\Large, text=darktext},
+    subtitle/.style={font=\sffamily\bfseries\large, text=darktext},
+    desc/.style={font=\sffamily\small, text=darktext, align=center},
+    mathlabel/.style={font=\large, text=darktext},
+]
+ 
+% ============================================================
+% TITLE
+% ============================================================
+\node[title] at (5.5, 15.0) {LATE vs.\ ATE: Who Does Each Estimator Cover?};
+ 
+% ============================================================
+% PANEL A — EULER DIAGRAM (Venn-style)
+% ============================================================
+\node[subtitle, anchor=west] at (-0.5, 13.8) {(A) Population Subgroups under an Instrument $Z$};
+\node[desc, anchor=west, text width=14cm] at (-0.3, 13.0)
+  {Assuming monotonicity (no defiers), individuals fall into three types based on
+   potential treatment $D(z)$:};
+ 
+% Background rectangle — the full population
+\fill[bgcream, rounded corners=8pt] (-0.5, 4.8) rectangle (11.5, 12.4);
+\draw[darktext, thick, rounded corners=8pt] (-0.5, 4.8) rectangle (11.5, 12.4);
+\node[anchor=north east, font=\sffamily\itshape\small, text=darktext] at (11.3, 12.2)
+  {Entire Population};
+ 
+% Large circle: D(1) = 1  (would take treatment if assigned)
+\fill[complier!18] (4.5, 8.8) circle (3.4cm);
+\draw[complier!80!black, very thick] (4.5, 8.8) circle (3.4cm);
+ 
+% Small circle: D(0) = 1  (would take treatment even if NOT assigned)
+\fill[alwaystaker!25] (4.5, 9.4) circle (1.5cm);
+\draw[alwaystaker!80!black, very thick] (4.5, 9.4) circle (1.5cm);
+ 
+% ---- Labels inside the diagram ----
+% Always-takers (inner circle)
+\node[font=\sffamily\bfseries, text=alwaystaker!80!black] at (4.5, 9.9) {Always-Takers};
+\node[desc, text=alwaystaker!70!black] at (4.5, 9.25) {$D(1){=}1,\; D(0){=}1$};
+\node[desc, text=alwaystaker!70!black, text width=3cm] at (4.5, 8.6) {\footnotesize Take treatment\\regardless of $Z$};
+ 
+% Compliers (ring between the two circles - Consolidated)
+\node[font=\sffamily\bfseries, text=complier!80!black] at (1.4, 7.6) {Compliers};
+\node[desc, text=complier!70!black] at (1.4, 7.05) {$D(1){=}1,\; D(0){=}0$};
+\node[desc, text=complier!70!black, text width=3.8cm] at (1.4, 6.35) {\footnotesize Would take if assigned\\Follow the instrument};
+ 
+% Arrow from complier label into the ring region
+\draw[-{Stealth[length=5pt]}, complier!60!black, thick]
+  (2.8, 7.4) -- (3.3, 7.4);
+ 
+% Never-takers (outside both circles)
+\node[font=\sffamily\bfseries, text=nevertaker!70!black] at (9.2, 11.4) {Never-Takers};
+\node[desc, text=nevertaker!60!black] at (9.2, 10.85) {$D(1){=}0,\; D(0){=}0$};
+\node[desc, text=nevertaker!60!black, text width=3cm] at (9.2, 10.25)
+  {\footnotesize Never take\\treatment};
+ 
+% Circle annotations (Always-takers only now)
+\draw[alwaystaker!80!black, thick, dashed, -{Stealth[length=5pt]}]
+  (2.1, 10.4) -- (3.3, 10.4);
+\node[font=\sffamily\footnotesize, text=alwaystaker!80!black, anchor=south, align=center] at (1, 9.8)
+  {$D(0)=1$\\Would take even\\if not assigned};
+ 
+ 
+% ============================================================
+% PANEL B — LINEAR PARTITION with ATE / LATE brackets
+% ============================================================
+\node[subtitle, anchor=west] at (-0.5, 4.0) {(B) What Each Estimator Averages Over};
+ 
+% Bar partitions
+\def\barL{-0.3}
+\def\barR{11.3}
+\def\barBot{0.5}   
+\def\barTop{2.0}   
+\def\splitA{2.8}   % end of always-takers
+\def\splitB{7.8}   % end of compliers
+ 
+% Always-takers block
+\fill[alwaystaker!30] (\barL,\barBot) rectangle (\splitA,\barTop);
+\draw[alwaystaker!70!black, thick] (\barL,\barBot) rectangle (\splitA,\barTop);
+\node[font=\sffamily\bfseries, text=alwaystaker!80!black] at ({(\barL+\splitA)/2}, 1.45)
+  {Always-};
+\node[font=\sffamily\bfseries, text=alwaystaker!80!black] at ({(\barL+\splitA)/2}, 1.0)
+  {Takers};
+ 
+% Compliers block
+\fill[complier!25] (\splitA,\barBot) rectangle (\splitB,\barTop);
+\draw[complier!70!black, thick] (\splitA,\barBot) rectangle (\splitB,\barTop);
+\node[font=\sffamily\bfseries\large, text=complier!80!black] at ({(\splitA+\splitB)/2}, 1.25)
+  {Compliers};
+ 
+% Never-takers block
+\fill[nevertaker!20] (\splitB,\barBot) rectangle (\barR,\barTop);
+\draw[nevertaker!70!black, thick] (\splitB,\barBot) rectangle (\barR,\barTop);
+\node[font=\sffamily\bfseries, text=nevertaker!70!black] at ({(\splitB+\barR)/2}, 1.45)
+  {Never-};
+\node[font=\sffamily\bfseries, text=nevertaker!70!black] at ({(\splitB+\barR)/2}, 1.0)
+  {Takers};
+ 
+% LATE bracket — compliers only
+\draw[complier!80!black, ultra thick,
+      decorate, decoration={brace, amplitude=8pt, mirror}]
+  (\splitA, \barBot-0.15) -- (\splitB, \barBot-0.15);
+\node[font=\sffamily\bfseries\large, text=complier!80!black] at ({(\splitA+\splitB)/2}, -0.3)
+  {LATE};
+\node[desc, text=complier!70!black] at ({(\splitA+\splitB)/2}, -0.8)
+  {$\displaystyle E\!\bigl[Y(1)-Y(0) \;\big|\; \text{Complier}\bigr]$};
+ 
+% ATE bracket — entire population
+\draw[highlight!80!black, ultra thick,
+      decorate, decoration={brace, amplitude=8pt}]
+  (\barL, \barTop+0.15) -- (\barR, \barTop+0.15);
+\node[font=\sffamily\bfseries\large, text=highlight!70!black] at ({(\barL+\barR)/2}, 2.8)
+  {ATE};
+\node[desc, text=highlight!60!black] at ({(\barL+\barR)/2}, 3.3)
+  {$\displaystyle E\!\bigl[Y(1)-Y(0)\bigr]$ \;---\; averaged over \emph{everyone}};
+ 
+% ============================================================
+% PANEL C — KEY TAKEAWAY BOX
+% ============================================================
+% Added more vertical padding inside the box to separate title and body
+\fill[highlight!10, rounded corners=6pt] (-0.5, -3.4) rectangle (11.5, -1.5);
+\draw[highlight!80!black, thick, rounded corners=6pt] (-0.5, -3.4) rectangle (11.5, -1.5);
+\node[font=\sffamily\bfseries, text=darktext, anchor=west] at (-0.1, -1.9)
+  {Key insight:};
+\node[font=\sffamily\small, text=darktext, anchor=west, text width=10.8cm] at (-0.1, -2.7)
+  {IV/2SLS estimates LATE, not ATE. It captures the causal effect \emph{only} for
+   compliers---those whose treatment is actually changed by the instrument.
+   If compliers differ from always-/never-takers, LATE $\neq$ ATE.};
+ 
+\end{tikzpicture}
+
+And in this experiment, the design is:
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  every node/.style = {font=\small},
+  box/.style = {draw, rounded corners, align=center, minimum width=3.2cm, minimum height=1cm},
+  smallbox/.style = {draw, rounded corners, align=center, minimum width=3.0cm, minimum height=0.9cm},
+  note/.style = {align=left, font=\footnotesize},
+  arrow/.style = {-Latex, thick}
+]
+
+% Top node
+\node[box] (pop) {Full sample\\Customers completing the June 2014 survey};
+
+% Assignment split
+\node[box, below=1.5cm of pop, xshift=-3.5cm] (sol1) {Solicited\\$Z_i = 1$};
+\node[box, below=1.5cm of pop, xshift=3.5cm] (sol0) {Not solicited\\$Z_i = 0$};
+
+\draw[arrow] (pop.south) -- (sol1.north);
+\draw[arrow] (pop.south) -- (sol0.north);
+
+% Second layer: posting behavior (Color coded)
+\node[smallbox, fill=blue!15, below=1.5cm of sol1, xshift=-1.8cm] (rev11) {Posted review\\$D_i = 1$};
+\node[smallbox, fill=red!15, below=1.5cm of sol1, xshift=1.8cm] (rev10) {Did not post\\$D_i = 0$};
+
+\node[smallbox, fill=green!15, below=1.5cm of sol0, xshift=-1.8cm] (rev01) {Posted review\\$D_i = 1$\\(rare)};
+\node[smallbox, fill=orange!15, below=1.5cm of sol0, xshift=1.8cm] (rev00) {Did not post\\$D_i = 0$};
+
+\draw[arrow] (sol1.south) -- (rev11.north);
+\draw[arrow] (sol1.south) -- (rev10.north);
+\draw[arrow] (sol0.south) -- (rev01.north);
+\draw[arrow] (sol0.south) -- (rev00.north);
+
+% Outcome note
+\node[box, below=2.5cm of $(rev11)!0.5!(rev00)$, minimum width=6.8cm] (outcome) 
+{Outcome: future spending\\$Y_i \in \{STspend_i,\; LTspend_i\}$};
+
+% Arrows down to outcome
+\draw[arrow] (rev11.south) -- (outcome.north);
+\draw[arrow] (rev10.south) -- (outcome.north);
+\draw[arrow] (rev01.south) -- (outcome.north);
+\draw[arrow] (rev00.south) -- (outcome.north);
+
+% ITT bracket
+\node[note, above=0.3cm of $(sol1)!0.5!(sol0)$] (itt) 
+{\textbf{ITT:} compare $E[Y_i \mid Z_i=1] - E[Y_i \mid Z_i=0]$};
+
+% First stage note
+\node[note, below=0.8cm of $(rev10)!0.5!(rev01)$] (fs)
+{\textbf{First stage:} $E[D_i \mid Z_i=1] - E[D_i \mid Z_i=0]$};
+
+% LATE note
+\node[note, below=0.5cm of outcome, align=center] (late)
+{\textbf{LATE:} 
+$\displaystyle 
+\frac{E[Y_i \mid Z_i=1] - E[Y_i \mid Z_i=0]}
+     {E[D_i \mid Z_i=1] - E[D_i \mid Z_i=0]}
+$
+\hspace{0.2cm} = effect of posting on compliers};
+
+% Color Legend
+\node[draw, rounded corners, below=0.6cm of late, align=left, inner sep=2ex, fill=black!2] (legend) {
+    \textbf{Subgroup Composition}\vspace{0.15cm}\\
+    \begin{tabular}{@{}ll@{ \hspace{0.8cm} }ll@{}}
+    \fcolorbox{black}{blue!15}{\phantom{X}} & $\approx$ Compliers + Always-takers &
+    \fcolorbox{black}{green!15}{\phantom{X}} & $\approx$ Always-takers (rare) \\[0.2cm]
+    \fcolorbox{black}{red!15}{\phantom{X}} & $\approx$ Never-takers &
+    \fcolorbox{black}{orange!15}{\phantom{X}} & $\approx$ Compliers + Never-takers
+    \end{tabular}
+};
+
+\end{tikzpicture}
+\caption{\label{fig:encouragement_design} Encouragement design underlying the ITT and LATE estimates.}
+\end{figure}
+
+
+
+# Data, timing, and satisfaction-to-valence mapping
+
+This section defines the timing, variables, and subgroup cells needed to interpret the first-stage, ITT, and LATE estimates that follow.
+
+The unit of observation is an individual loyalty-program customer who completed a June 2014 post-stay satisfaction survey. The treatment assignment is review solicitation, randomized after survey completion. The endogenous treatment is actual review posting, which occurs only after solicitation or non-solicitation status is realized.
+
+![](Figures/karaman-2025-the-asymmetric-effects-of-posting-an-online-review-on-future-spending-and-the-dark-side-of-solicitations.jpeg)
+
+* Pre-period: spending history before the June 2014 stay and survey.
+* Assignment point: customer completes the June 2014 survey and is randomly solicited or not solicited to post a review.
+* Post-period: future spending is measured after assignment.
+* Short-term outcome: `STspend_i`, spending in the first post-treatment window.
+* Long-term outcome: `LTspend_i`, spending in the later post-treatment window.
+
+**Core variables.**
+
+* `Solicit_i`: indicator equal to 1 if customer `i` was randomly solicited to post a review.
+* `Review_i`: indicator equal to 1 if customer `i` actually posted a review.
+* `STspend_i`: short-term future spending.
+* `LTspend_i`: long-term future spending.
+* `Satisfaction_i`: survey satisfaction score from 1 to 10.
+* `Loyalty_i`: loyalty tier: Silver, Gold, or Platinum.
+
+**Pre-treatment versus post-treatment variables.**
+
+* Pre-treatment or assignment-time variables: satisfaction score, loyalty tier, solicitation assignment.
+* Post-treatment variables: actual review posting and future spending.
+* This ordering matters because heterogeneity by satisfaction and loyalty does not condition on outcomes or post-treatment behavior.
+
+Figure \ref{fig:satisfaction_valence} shows that satisfaction scores 1–6 correspond to negative reviews, while scores 8–10 correspond to positive reviews. This justifies the main satisfaction grouping: `≤6`, `8`, `9`, and `10`.
+
+```{r sec2-satisfaction-valence-data}
+#-------------------------------------
+# Figure 3
+#-------------------------------------
+valence_data <- review_data %>%
+  filter(
+    review == 1,
+    satisfactionscore %in% c(1, 2, 3, 4, 5, 6, 8, 9, 10)
+  ) %>%
+  group_by(satisfactionscore) %>%
+  summarise(
+    `Negative review` = mean(negativereview, na.rm = TRUE),
+    `Positive review` = mean(positivereview, na.rm = TRUE),
+    n_reviewers = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(`Negative review`, `Positive review`),
+    names_to = "review_type",
+    values_to = "probability"
+  )
+```
+
+```{r fig-satisfaction-valence, fig.cap="\\label{fig:satisfaction_valence} Probability of posting a negative versus positive review by satisfaction score", fig.width=7, fig.height=4}
+ggplot(valence_data, aes(x = factor(satisfactionscore), y = probability, fill = review_type)) +
+    # Create the stacked bars with a black outline
+    geom_col(color = "black", width = 0.5) +
+    
+    # Add percentage labels only for segments > 10% to prevent clutter
+    geom_text(
+        aes(label = ifelse(probability > 0.10, scales::percent(probability, accuracy = 1), "")),
+        position = position_stack(vjust = 0.5),
+        size = 4
+    ) +
+    
+    # Format Y-axis as percentages and remove gap below 0
+    scale_y_continuous(labels = scales::percent_format(), expand = expansion(mult = c(0, 0.05))) +
+    
+    # Set custom colors and legend labels
+    scale_fill_manual(
+        values = c("Negative review" = "#BDBDBD", "Positive review" = "#FFFFFF"),
+        labels = c("Negative review" = "probability of posting a negative review (1/2/3 out of 5)",
+                   "Positive review" = "probability of posting a positive review (4/5 out of 5)")
+    ) +
+    
+    # Add titles and remove axis labels where unnecessary
+    labs(
+        # title = "Figure 3. Probability of Posting a Negative vs. Positive Review",
+        x = "Satisfaction score",
+        y = NULL,
+        fill = NULL
+    ) +
+    
+    # Apply theme modifications to match the image
+    theme_minimal() +
+    theme(
+        legend.position = "bottom",
+        legend.direction = "vertical", # Stack legend items vertically
+        legend.justification = "left", # Align legend to the left
+        panel.grid.major.x = element_blank(), # Remove vertical grid lines
+        panel.grid.minor = element_blank(),
+        axis.line.x = element_line(color = "black"), # Solid black line for x-axis
+        axis.ticks.x = element_line(color = "black"),
+        plot.title = element_text(face = "bold", hjust = 0, margin = margin(b = 15)),
+        axis.text = element_text(color = "black", size = 10)
+    )
+```
+
+**Subgroup construction.** The heterogeneous estimates use 12 mutually exclusive loyalty-by-satisfaction cells:
+
+* Silver: `Silver6`, `Silver8`, `Silver9`, `Silver10`
+* Gold: `Gold6`, `Gold8`, `Gold9`, `Gold10`
+* Platinum: `Platinum6`, `Platinum8`, `Platinum9`, `Platinum10`
+
+The $\leq 6$ cells pool highly dissatisfied customers because their reviews are negative. Scores 8, 9, and 10 are kept separate because the paper’s core asymmetry depends on distinguishing perfect satisfaction from less-than-perfect positive experiences.
+
+# First stage — solicitation drives review posting
+
+**Argument:** Random solicitation strongly increases actual review posting, establishing instrument relevance and motivating the one-sided-noncompliance interpretation used in the LATE section.
+
+**Evidence 1:** Solicited customers are much more likely to post reviews, while unsolicited customers almost never post. Figure \ref{fig:first_stage_visual} visualizes the probability of observing a posted review across solicitation status, satisfaction groups, and loyalty tiers. The pattern shows a clear first stage: solicitation substantially increases the probability of review posting in every subgroup.
+
+```{r sec3-first-stage-visual-data}
+#-------------------------------------
+# Figure 4
+#-------------------------------------
+fig_first_stage_data <- purrr::map_dfr(
+  subgroup_vars,
+  function(g) {
+    review_data %>%
+      dplyr::filter(.data[[g]] == 1) %>%
+      dplyr::group_by(solicit) %>%
+      dplyr::summarise(
+        review_rate = mean(review, na.rm = TRUE),
+        N = dplyr::n(),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(subgroup = g)
+  }
+) %>%
+  dplyr::left_join(subgroup_map, by = "subgroup") %>%
+  dplyr::mutate(
+    solicit_status = dplyr::if_else(solicit == 1, "Solicited", "Unsolicited"),
+    solicit_status = factor(solicit_status, levels = c("Solicited", "Unsolicited")),
+    loyalty = factor(loyalty, levels = c("Silver", "Gold", "Platinum")),
+    satisfaction_group = factor(satisfaction_group, levels = c("<=6", "8", "9", "10"))
+  )
+
+```
+
+```{r sec3-first-stage-visual, fig.cap="\\label{fig:first_stage_visual} One-sided noncompliance: review posting by solicitation status", fig.width=7, fig.height=4.5}
+ggplot2::ggplot(
+  fig_first_stage_data,
+  ggplot2::aes(x = satisfaction_group, y = review_rate)
+) +
+  ggplot2::geom_col(width = 0.7) +
+  # Add scales = "free_y" right here:
+  ggplot2::facet_grid(solicit_status ~ loyalty, scales = "free_y") + 
+  ggplot2::scale_y_continuous(
+    labels = scales::percent_format() 
+  ) +
+  ggplot2::labs(
+    x = "Satisfaction score",
+    y = "Observed probability of posting"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+**Evidence 2:** In Online Appendix C, Table OC1, the author estimates first-stage regressions overall and separately within the 12 loyalty-by-satisfaction cells. These regressions test the IV relevance condition: solicitation must strongly predict actual review posting.
+
+$$Review_i = \pi_0 + \pi_1 Solicit_i + v_i$$
+
+```{r}
+#-------------------------------------
+# Online Appendix C, Table OC1
+#-------------------------------------
+fit_first_stage <- function(data) {
+  estimatr::lm_robust(
+    review ~ solicit,
+    data = data,
+    se_type = "HC1"
+  )
+}
+
+first_stage_models <- c(
+  list(Overall = fit_first_stage(review_data)),
+  purrr::map(
+    subgroup_vars,
+    ~ fit_first_stage(dplyr::filter(review_data, .data[[.x]] == 1))
+  ) %>%
+    purrr::set_names(subgroup_vars)
+)
+
+extract_first_stage <- function(model, subgroup_name) {
+  broom::tidy(model) %>%
+    dplyr::filter(term == "solicit") %>%
+    dplyr::transmute(
+      subgroup = subgroup_name,
+      estimate = estimate,
+      std_error = std.error,
+      p_value = p.value,
+      robust_f = statistic^2,
+      N = stats::nobs(model)
+    )
+}
+
+first_stage_table <- purrr::imap_dfr(
+  first_stage_models,
+  extract_first_stage
+) %>%
+  dplyr::left_join(subgroup_map, by = "subgroup") %>%
+  dplyr::mutate(
+    Tier = dplyr::if_else(
+      subgroup == "Overall",
+      "All customers",
+      as.character(loyalty)
+    ),
+    Score = dplyr::if_else(
+      subgroup == "Overall",
+      "",
+      as.character(satisfaction_group)
+    ),
+    `Solicit coefficient (SE)` = sprintf("%.2f (%.2f)", estimate, std_error),
+    `Robust F` = sprintf("%.2f", robust_f),
+    `p-value` = sprintf("%.3f", p_value)
+  ) %>%
+  dplyr::select(
+    Tier,
+    Score,
+    `Solicit coefficient (SE)`,
+    `Robust F`,
+    `p-value`,
+    N
+  )
+
+table_task(
+  first_stage_table,
+  caption = "\\label{tab:first_stage} First-stage estimates for review posting"
+) %>% 
+    collapse_rows(1, latex_hline="major")
+```
+
+# ITT — solicitation changes future spending
+
+**Argument:** Randomly assigning customers to review solicitation reduces future spending on the solicited brand, with the strongest effects among dissatisfied customers and less-than-perfect Platinum customers.
+
+To establish the argument, the section first uses the overall ITT regression to test whether randomized solicitation reduces future spending on average. It then uses subgroup ITT estimates to show that this average effect is driven by dissatisfied customers and less-than-perfect Platinum customers. The score-10 estimates serve as the contrast case, showing that solicitation is not uniformly harmful.
+
+**Evidence 1: Overall ITT**
+
+- **Claim:** Solicitation reduces future spending on the solicited brand on average.
+- **Table/Figure:** `\label{tab:itt_overall}` — Table 2
+- **Specification:** The paper estimates:
+
+\[
+FutureSpending_i^h = \gamma_0 + \gamma_1 Solicitation_i + \varepsilon_i,
+\]
+
+where \(h\) indexes the short-term and long-term spending windows.
+
+- **Key coefficient:** \(\gamma_1\), the coefficient on \(Solicitation_i\).
+
+  - **Direction:** The solicitation coefficient is negative for both short-term and long-term spending.
+  - **Interpretation:** Random assignment to solicitation lowers future spending on the solicited brand.
+  - **Design role:** This is the reduced-form effect needed before estimating the LATE of actual review posting.
+
+```{r}
+#-------------------------------------
+# Table 2
+#-------------------------------------
+fit_itt <- function(data, outcome) {
+  estimatr::lm_robust(
+    stats::as.formula(paste0(outcome, " ~ solicit")),
+    data = data,
+    se_type = "HC1"
+  )
+}
+
+sig_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "",
+    p < 0.01 ~ "***",
+    p < 0.05 ~ "**",
+    p < 0.10 ~ "*",
+    TRUE ~ ""
+  )
+}
+
+extract_solicit <- function(model) {
+  broom::tidy(model) %>%
+    dplyr::filter(term == "solicit") %>%
+    dplyr::transmute(
+      estimate = estimate,
+      std_error = std.error,
+      p_value = p.value,
+      N = length(stats::residuals(model))
+    )
+}
+
+fmt_est_se <- function(estimate, std_error, p_value) {
+  paste0(
+    sprintf("%.2f", estimate),
+    sig_stars(p_value),
+    " (",
+    sprintf("%.2f", std_error),
+    ")"
+  )
+}
+```
+
+
+```{r}
+itt_overall_results <- tibble::tibble(
+  outcome = c("STspend", "LTspend"),
+  outcome_label = c("Short-term future spending", "Long-term future spending")
+) %>%
+  dplyr::mutate(
+    model = purrr::map(outcome, ~ fit_itt(review_data, .x)),
+    result = purrr::map(model, extract_solicit)
+  ) %>%
+  tidyr::unnest(result) %>%
+  dplyr::mutate(
+    ITT = fmt_est_se(estimate, std_error, p_value),
+  ) %>%
+  dplyr::select(
+    Outcome = outcome_label,
+    ITT,
+    N
+  )
+
+# itt_overall_results <- itt_overall_results %>% 
+#   add_row(Outcome = "No. of Observations", 
+#           ITT = as.character(unique(itt_overall_results$N))) %>% 
+#   dplyr::select(Outcome, ITT)
+
+table_task(itt_overall_results, caption="ITT Effect on Future Spending on the Solicited Brand")
+```
+
+**Evidence 2: Heterogeneous ITT by satisfaction and loyalty**
+
+- **Claim:** The negative ITT effect is concentrated among highly dissatisfied customers and less-than-perfect Platinum customers.
+- **Table/Figure:** `\label{tab:itt_hetero}` — Table 3
+- **Specification:** The paper estimates the ITT separately within each loyalty-by-satisfaction cell \(g\):
+
+\[
+FutureSpending_i^h = \gamma_{0g} + \gamma_{1g} Solicitation_i + \varepsilon_i,
+\]
+
+where \(h\) indexes the short-term and long-term spending windows.
+
+- **Key coefficient:** \(\gamma_{1g}\), the coefficient on \(Solicitation_i\).
+
+  - **Highly dissatisfied customers:** In the \( \le 6 \) satisfaction column, the solicitation coefficients are negative across all loyalty tiers and both time horizons. In the replication table, the largest magnitudes appear for Platinum customers: \(-78.96\) in the short term and \(-84.78\) in the long term.
+
+  - **Less-than-perfect Platinum customers:** Within the Platinum panel, solicitation also reduces spending for customers with satisfaction scores 8 and 9. The score-8 short-term estimate is \(-95.96\), and the score-9 long-term estimate is \(-96.40\).
+
+  - **Perfectly satisfied customers as contrast:** For score-10 customers, the estimates are not statistically significant across loyalty tiers. This shows that solicitation is not mechanically harmful for everyone.
+
+  - **Design interpretation:** The \( \le 6 \) cells correspond to negative reviews from Figure \ref{fig:satisfaction_valence}, while Platinum scores 8 and 9 correspond to positive but less-than-perfect experiences. Thus, the heterogeneous ITT pattern supports the paper’s asymmetry: solicitation is most harmful when it induces reviews from dissatisfied customers, and among the most loyal customers, even less-than-perfect positive experiences can reduce future spending.
+
+  - **Robustness link:** Because Table \ref{tab:itt_hetero} tests many subgroup effects, this pattern should be read together with the Romano--Wolf correction in Table \ref{tab:romano_wolf}.
+
+
+
+
+```{r sec4-heterogeneous-itt-estimation, include=FALSE}
+#-------------------------------------
+# Table 3
+#-------------------------------------
+fit_itt_by_cell <- function(outcome, subgroup) {
+  cell_data <- review_data %>%
+    dplyr::filter(.data[[subgroup]] == 1)
+
+  fit_itt(cell_data, outcome)
+}
+
+itt_hetero_long <- tidyr::expand_grid(
+  outcome = c("STspend", "LTspend"),
+  subgroup = subgroup_vars
+) %>%
+  dplyr::mutate(
+    model = purrr::map2(outcome, subgroup, fit_itt_by_cell),
+    result = purrr::map(model, extract_solicit)
+  ) %>%
+  tidyr::unnest(result) %>%
+  dplyr::left_join(subgroup_map, by = "subgroup") %>%
+  dplyr::mutate(
+    outcome_label = dplyr::recode(
+      outcome,
+      STspend = "Short-term",
+      LTspend = "Long-term"
+    ),
+    estimate_se = fmt_est_se(estimate, std_error, p_value),
+    p_value_fmt = sprintf("%.3f", p_value)
+  ) %>%
+  dplyr::arrange(loyalty, satisfaction_group, outcome)
+```
+
+```{r}
+# 1. Define a custom Goodness-of-Fit (GOF) map 
+# We only want to keep the Number of Observations and format it with a comma.
+gof_mapping <- list(
+  list("raw" = "nobs", "clean" = "No. of observations", "fmt" = function(x) format(x, big.mark=","))
+)
+
+# 2. Create a helper function to process a single tier
+get_tier_df <- function(data, tier_name) {
+  
+  # Extract lists of models and name them so modelsummary uses them as columns
+  mods_st <- data %>% filter(loyalty == tier_name, outcome == "STspend") %>% pull(model)
+  names(mods_st) <- c("<=6", "8", "9", "10")
+  
+  mods_lt <- data %>% filter(loyalty == tier_name, outcome == "LTspend") %>% pull(model)
+  names(mods_lt) <- c("<=6", "8", "9", "10")
+  
+  # Summarize Short-Term models (No 'N' row needed here based on your image)
+  df_st <- modelsummary(
+    mods_st,
+    coef_map = c("solicit" = "Solicitation"),
+    gof_map = NA, 
+    stars = c('*' = .1, '**' = .05, '***' = .01),
+    output = "data.frame"
+  ) %>%
+    mutate(Horizon = "Short-term (0-5 months)")
+  
+  # Summarize Long-Term models (Include 'N' row)
+  df_lt <- modelsummary(
+    mods_lt,
+    coef_map = c("solicit" = "Solicitation"),
+    gof_map = gof_mapping,
+    stars = c('*' = .1, '**' = .05, '***' = .01),
+    output = "data.frame"
+  ) %>%
+    mutate(Horizon = "Long-term (6-10 months)")
+  
+  # Bind them together and clean up the term names for standard errors
+  bind_rows(df_st, df_lt) %>%
+    mutate(
+      term = ifelse(statistic == "std.error", "", term) # Make SE rows blank in column 2
+    ) %>%
+    select(Horizon, term, `<=6`, `8`, `9`, `10`)
+}
+
+# 3. Build the final unified dataframe
+df_final <- bind_rows(
+  get_tier_df(itt_hetero_long, "Silver"),
+  get_tier_df(itt_hetero_long, "Gold"),
+  get_tier_df(itt_hetero_long, "Platinum")
+)
+
+df_final %>% 
+    table_task(output="latex") %>% 
+    add_header_above(c(" " = 2, "Satisfaction" = 4)) %>%
+    pack_rows(
+        index = c("Silver" = 5, "Gold" = 5, "Platinum" = 5),
+        latex_align = "c"
+      ) %>%
+    collapse_rows(columns = 1, latex_hline = "none", valign = "top") %>%
+    wrap_latex_table(note = "All estimations include a constant term that is not tabulated for confidentiality reasons. Robust standard errors are shown in parentheses.\\\\$^{***} p < 0.01; ^{**} p < 0.05; ^{*} p < 0.1$.", caption = "ITT Effects on Future Spending on the Solicited Brand", label = "tab:itt_hetero_dissatisfied")
+```
+
+# LATE — posting changes future spending for compliers
+
+**Argument:** Instrumenting actual review posting with randomized solicitation shows that posting a review reduces future spending, especially for dissatisfied reviewers and less-than-perfect Platinum reviewers.
+
+To establish this argument, the section first estimates the overall IV/LATE effect by instrumenting (Review_i) with (Solicitation_i). This converts the reduced-form ITT from Section 4 into the causal effect of actual review posting for compliers. The section then estimates the same IV specification within the 12 loyalty-by-satisfaction cells to show that the largest effects occur in the same cells where the ITT effects were strongest.
+
+**Evidence 1: Overall LATE**
+
+- **Claim:** Posting a review reduces future spending on the reviewed brand on average.
+- **Table/Figure:** `\label{tab:late_overall}` — Table 4
+- **Specification:** The paper estimates:
+
+\[
+FutureSpending_i^h = \alpha_0 + \tau Review_i + u_i,
+\]
+
+with \(Review_i\) instrumented by \(Solicitation_i\), where \(h\) indexes the short-term and long-term spending windows.
+
+- **Key coefficient:** \(\tau\), the IV coefficient on \(Review_i\).
+
+  - **Direction:** The review coefficient is negative for both short-term and long-term spending.
+  - **Magnitude:** Posting reduces future spending by roughly the ITT effect divided by the first-stage effect.
+  - **Interpretation:** Among customers whose posting behavior is shifted by solicitation, posting a review lowers future spending on the reviewed brand.
+  - **Design role:** This is the causal counterpart to the ITT estimate in Section 4: ITT measures assignment to solicitation, while LATE measures actual posting induced by solicitation.
+
+- **Robustness link:** This estimate depends on the first stage in Section 3 and the IV assumptions from Phase A.
+
+```{r}
+#-------------------------------------
+# Section 5 setup: LATE / IV estimates
+#-------------------------------------
+
+fit_late <- function(data, outcome) {
+  estimatr::iv_robust(
+    stats::as.formula(paste0(outcome, " ~ review | solicit")),
+    data = data,
+    se_type = "HC1"
+  )
+}
+
+extract_review_iv <- function(model) {
+  broom::tidy(model) %>%
+    dplyr::filter(term == "review") %>%
+    dplyr::transmute(
+      estimate = estimate,
+      std_error = std.error,
+      p_value = p.value,
+      N = stats::nobs(model)
+    )
+}
+```
+
+
+```{r sec5-overall-late}
+#-------------------------------------
+# Table 4: Overall LATE
+#-------------------------------------
+
+late_overall_models <- list(
+  "Short-term (0-5 months)" = fit_late(review_data, "STspend"),
+  "Long-term (6-10 months)" = fit_late(review_data, "LTspend")
+)
+
+modelsummary::modelsummary(
+  late_overall_models,
+  coef_map = c("review" = "Review"),
+  gof_map = list(
+    list(
+      "raw"   = "nobs",
+      "clean" = "No. of observations",
+      "fmt"   = function(x) format(x, big.mark = ",")
+    )
+  ),
+  stars  = c("*" = .1, "**" = .05, "***" = .01)
+) %>%
+  wrap_latex_table(
+    notes   = "All estimations include a constant term that is not tabulated for confidentiality reasons. Robust standard errors are shown in parentheses. $^{***}p<0.01;\\, ^{**}p<0.05;\\, ^{*}p<0.1$.",
+    caption = "Overall LATE of Posting a Review on Future Spending",
+    label   = "tab:late_overall"
+  )
+```
+
+
+**Evidence 2: Heterogeneous LATE by satisfaction and loyalty**
+    
+- **Claim:** The negative posting effect is concentrated among highly dissatisfied reviewers and less-than-perfect Platinum reviewers.
+- **Table/Figure:** `\label{tab:late_hetero}` — Table 5
+- **Specification:** The paper estimates the IV model separately within each loyalty-by-satisfaction cell \(g\):
+    
+    \[
+        FutureSpending_i^h = \alpha_{0g} + \tau_g Review_i + u_i,
+        \]
+
+with \(Review_i\) instrumented by \(Solicitation_i\).
+
+- **Key coefficient:** \(\tau_g\), the IV coefficient on \(Review_i\).
+
+- **Highly dissatisfied reviewers:** In the \( \le 6 \) satisfaction column, the LATE estimates are negative across loyalty tiers. In the published long-term results, posting reduces spending by about \(\$50\) for Silver, \(\$122\) for Gold, and \(\$211\) for Platinum reviewers.
+
+- **Less-than-perfect Platinum reviewers:** In the Platinum panel, posting reduces long-term spending for score-8 and score-9 customers. The published estimates are about \(-\$250\) for score 8 and \(-\$191\) for score 9.
+
+- **Perfectly satisfied reviewers as contrast:** For score-10 customers, the estimates are not statistically significant across loyalty tiers. This shows that posting is not mechanically harmful for everyone.
+
+- **Design interpretation:** The \( \le 6 \) cells correspond to negative reviews, while Platinum score-8 and score-9 cells correspond to positive but less-than-perfect experiences. Thus, the LATE results sharpen the Section 4 ITT pattern: the spending decline operates through induced review posting.
+
+- **Robustness link:** Because Table \ref{tab:late_hetero} tests many subgroup effects, these estimates should be read together with the Romano--Wolf correction in Table \ref{tab:romano_wolf}.
+
+```{r sec5-heterogeneous-late-estimation, include=FALSE}
+#-------------------------------------
+# Table 5: Heterogeneous LATE
+#-------------------------------------
+
+fit_late_by_cell <- function(outcome, subgroup) {
+    cell_data <- review_data %>%
+        dplyr::filter(.data[[subgroup]] == 1)
+    
+    fit_late(cell_data, outcome)
+}
+
+late_hetero_long <- tidyr::expand_grid(
+    outcome = c("STspend", "LTspend"),
+    subgroup = subgroup_vars
+) %>%
+    dplyr::mutate(
+        model = purrr::map2(outcome, subgroup, fit_late_by_cell),
+        result = purrr::map(model, extract_review_iv)
+    ) %>%
+    tidyr::unnest(result) %>%
+    dplyr::left_join(subgroup_map, by = "subgroup") %>%
+    dplyr::mutate(
+        outcome_label = dplyr::recode(
+            outcome,
+            STspend = "Short-term",
+            LTspend = "Long-term"
+        ),
+        estimate_se = fmt_est_se(estimate, std_error, p_value),
+        p_value_fmt = sprintf("%.3f", p_value)
+    ) %>%
+    dplyr::arrange(loyalty, satisfaction_group, outcome)
+```
+
+```{r sec5-heterogeneous-late-table}
+# 1. Define GOF map: keep only number of observations
+gof_mapping <- list(
+    list(
+        "raw" = "nobs",
+        "clean" = "No. of observations",
+        "fmt" = function(x) format(x, big.mark = ",")
+    )
+)
+
+# 2. Helper function for one loyalty tier
+get_late_tier_df <- function(data, tier_name) {
+    
+    mods_st <- data %>%
+        dplyr::filter(loyalty == tier_name, outcome == "STspend") %>%
+        dplyr::pull(model)
+    
+    names(mods_st) <- c("<=6", "8", "9", "10")
+    
+    mods_lt <- data %>%
+        dplyr::filter(loyalty == tier_name, outcome == "LTspend") %>%
+        dplyr::pull(model)
+    
+    names(mods_lt) <- c("<=6", "8", "9", "10")
+    
+    df_st <- modelsummary::modelsummary(
+        mods_st,
+        coef_map = c("review" = "Review"),
+        gof_map = NA,
+        stars = c("*" = .1, "**" = .05, "***" = .01),
+        output = "data.frame"
+    ) %>%
+        dplyr::mutate(Horizon = "Short-term (0-5 months)")
+    
+    df_lt <- modelsummary::modelsummary(
+        mods_lt,
+        coef_map = c("review" = "Review"),
+        gof_map = gof_mapping,
+        stars = c("*" = .1, "**" = .05, "***" = .01),
+        output = "data.frame"
+    ) %>%
+        dplyr::mutate(Horizon = "Long-term (6-10 months)")
+    
+    dplyr::bind_rows(df_st, df_lt) %>%
+        dplyr::mutate(
+            term = ifelse(statistic == "std.error", "", term)
+        ) %>%
+        dplyr::select(Horizon, term, `<=6`, `8`, `9`, `10`)
+}
+
+# 3. Build final table
+df_late_final <- dplyr::bind_rows(
+    get_late_tier_df(late_hetero_long, "Silver"),
+    get_late_tier_df(late_hetero_long, "Gold"),
+    get_late_tier_df(late_hetero_long, "Platinum")
+)
+
+df_late_final %>%
+    table_task() %>%
+    add_header_above(c(" " = 2, "Satisfaction" = 4)) %>%
+    pack_rows(
+        index = c("Silver" = 5, "Gold" = 5, "Platinum" = 5),
+        latex_align = "c"
+    ) %>%
+    collapse_rows(columns = 1, latex_hline = "none", valign = "top") %>%
+    wrap_latex_table(
+        note = "All estimations include a constant term that is not tabulated for confidentiality reasons. Robust standard errors are shown in parentheses.\\\\$^{***} p < 0.01; ^{**} p < 0.05; ^{*} p < 0.1$.",
+        caption = "LATE Effects of Posting a Review on Future Spending on the Reviewed Brand",
+        label = "tab:late_hetero"
+    )
+```
+
+# Robustness — multiple testing and design sensitivity
+
+**Argument:** The main ITT and LATE patterns remain credible after checking whether they are driven by multiple hypothesis testing, prior reviewer selection, subgroup-specification choices, distributional outliers, or spending substitution across brands.
+
+To assess whether the heterogeneous ITT and LATE patterns are fragile, the available replication table focuses on the Romano--Wolf multiple-testing correction in Table \ref{tab:romano_wolf}. Because the paper estimates many loyalty-by-satisfaction effects, raw subgroup significance can overstate the strength of the evidence; the adjusted p-values ask whether the key cells remain important after controlling family-wise error. The main pattern remains concentrated in the same places as Sections 4 and 5: dissatisfied customers and less-than-perfect Platinum customers. The remaining robustness checks are not reproduced with the public sample data, but each addresses a specific threat in the original paper: Online Appendix F excludes prior review posters to rule out habitual-reviewer selection; Online Appendix E uses a pooled interaction specification to show that the 12-cell pattern is not an artifact of separate regressions; Online Appendix G estimates quantile treatment effects to check that the Platinum dissatisfied result is not driven by outliers; Online Appendix I uses nonreviewed-brand spending to test whether customers simply substitute across company brands; and Online Appendix J discusses survey-participation selection, which limits external validity because satisfaction is observed only for survey takers.
+
+```{r sec6-romano-wolf-functions, include=FALSE}
+#-------------------------------------
+# Section 6 setup: Romano-Wolf MHT
+#-------------------------------------
+
+hc1_t_stats <- function(y, x, inv_xx) {
+  beta <- inv_xx %*% crossprod(x, y)
+  resid <- as.numeric(y - x %*% beta)
+
+  n <- nrow(x)
+  k <- ncol(x)
+
+  meat <- crossprod(x * resid, x * resid)
+  vcov_hc1 <- (n / (n - k)) * inv_xx %*% meat %*% inv_xx
+
+  se <- sqrt(diag(vcov_hc1))
+  t_stat <- as.numeric(beta) / se
+  names(t_stat) <- colnames(x)
+
+  t_stat
+}
+
+romano_wolf_stepdown <- function(obs_abs, boot_abs) {
+  ord <- order(obs_abs, decreasing = TRUE)
+  adj_ord <- numeric(length(obs_abs))
+
+  for (j in seq_along(ord)) {
+    remaining <- ord[j:length(ord)]
+    boot_max <- apply(boot_abs[, remaining, drop = FALSE], 1, max)
+    adj_ord[j] <- mean(boot_max >= obs_abs[ord[j]])
+  }
+
+  adj_ord <- cummax(adj_ord)
+
+  out <- numeric(length(obs_abs))
+  out[ord] <- pmin(adj_ord, 1)
+  names(out) <- names(obs_abs)
+
+  out
+}
+
+romano_wolf_itt <- function(data, subgroups, reps = 5000, seed = 12345) {
+
+  sol_vars <- paste0("sol", subgroups)
+
+  data_rw <- data %>%
+    dplyr::mutate(
+      subgroup_count = rowSums(dplyr::pick(dplyr::all_of(subgroups)), na.rm = TRUE)
+    ) %>%
+    dplyr::filter(subgroup_count == 1) %>%
+    dplyr::select(STspend, LTspend, solicit, dplyr::all_of(subgroups)) %>%
+    tidyr::drop_na()
+
+  data_rw <- data_rw %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::all_of(subgroups),
+        ~ solicit * .x,
+        .names = "sol{.col}"
+      )
+    )
+
+  x_full <- stats::model.matrix(
+    stats::as.formula(
+      paste("~ 0 +", paste(c(subgroups, sol_vars), collapse = " + "))
+    ),
+    data = data_rw
+  )
+
+  x_null <- stats::model.matrix(
+    stats::as.formula(
+      paste("~ 0 +", paste(subgroups, collapse = " + "))
+    ),
+    data = data_rw
+  )
+
+  inv_full <- solve(crossprod(x_full))
+  inv_null <- solve(crossprod(x_null))
+
+  fit_null <- function(y) {
+    beta <- inv_null %*% crossprod(x_null, y)
+    fitted <- as.numeric(x_null %*% beta)
+    resid <- as.numeric(y - fitted)
+
+    list(fitted = fitted, resid = resid)
+  }
+
+  obs_st <- hc1_t_stats(data_rw$STspend, x_full, inv_full)[sol_vars]
+  obs_lt <- hc1_t_stats(data_rw$LTspend, x_full, inv_full)[sol_vars]
+
+  obs_all <- c(obs_st, obs_lt)
+  names(obs_all) <- c(
+    paste0("ST_", subgroups),
+    paste0("LT_", subgroups)
+  )
+
+  null_st <- fit_null(data_rw$STspend)
+  null_lt <- fit_null(data_rw$LTspend)
+
+  boot_abs <- matrix(
+    NA_real_,
+    nrow = reps,
+    ncol = length(obs_all),
+    dimnames = list(NULL, names(obs_all))
+  )
+
+  set.seed(seed)
+
+  for (b in seq_len(reps)) {
+    idx <- sample.int(nrow(data_rw), nrow(data_rw), replace = TRUE)
+
+    y_st_star <- null_st$fitted + null_st$resid[idx]
+    y_lt_star <- null_lt$fitted + null_lt$resid[idx]
+
+    boot_abs[b, ] <- c(
+      abs(hc1_t_stats(y_st_star, x_full, inv_full)[sol_vars]),
+      abs(hc1_t_stats(y_lt_star, x_full, inv_full)[sol_vars])
+    )
+  }
+
+  adjusted <- romano_wolf_stepdown(abs(obs_all), boot_abs)
+
+  tibble::tibble(
+    subgroup = subgroups,
+    `ST RW p` = adjusted[paste0("ST_", subgroups)],
+    `LT RW p` = adjusted[paste0("LT_", subgroups)]
+  )
+}
+
+fmt_p_paren <- function(x) {
+  ifelse(is.na(x), "", paste0("(", sprintf("%.3f", x), ")"))
+}
+```
+
+```{r sec6-romano-wolf-estimation, include=FALSE}
+#-------------------------------------
+# Table 6: Raw and Romano-Wolf adjusted p-values
+#-------------------------------------
+
+rw_reps <- 5000L
+rw_seed <- 12345L
+
+raw_pvals <- itt_hetero_long %>%
+  dplyr::select(subgroup, outcome, p_value) %>%
+  dplyr::mutate(
+    p_type = dplyr::recode(
+      outcome,
+      STspend = "ST raw p",
+      LTspend = "LT raw p"
+    )
+  ) %>%
+  dplyr::select(subgroup, p_type, p_value) %>%
+  tidyr::pivot_wider(
+    names_from = p_type,
+    values_from = p_value
+  )
+
+rwolf_pvals <- romano_wolf_itt(
+  data = review_data,
+  subgroups = subgroup_vars,
+  reps = rw_reps,
+  seed = rw_seed
+)
+
+romano_wolf_long <- raw_pvals %>%
+  dplyr::left_join(rwolf_pvals, by = "subgroup") %>%
+  dplyr::left_join(subgroup_map, by = "subgroup") %>%
+  dplyr::arrange(loyalty, satisfaction_group)
+```
+
+```{r tab-romano-wolf}
+#-------------------------------------
+# Format Table 6 in the same style as Tables 3 and 5
+#-------------------------------------
+
+get_rw_tier_df <- function(data, tier_name) {
+
+  tier_data <- data %>%
+    dplyr::filter(loyalty == tier_name)
+
+  get_cell <- function(score, col) {
+    tier_data %>%
+      dplyr::filter(as.character(satisfaction_group) == score) %>%
+      dplyr::pull(.data[[col]]) %>%
+      dplyr::first() %>%
+      fmt_p_paren()
+  }
+
+  tibble::tibble(
+    Horizon = c(
+      "Short-term (0-5 months)",
+      "Short-term (0-5 months)",
+      "Long-term (6-10 months)",
+      "Long-term (6-10 months)"
+    ),
+    term = c(
+      "Raw p-value",
+      "Romano-Wolf p-value",
+      "Raw p-value",
+      "Romano-Wolf p-value"
+    ),
+    `<=6` = c(
+      get_cell("<=6", "ST raw p"),
+      get_cell("<=6", "ST RW p"),
+      get_cell("<=6", "LT raw p"),
+      get_cell("<=6", "LT RW p")
+    ),
+    `8` = c(
+      get_cell("8", "ST raw p"),
+      get_cell("8", "ST RW p"),
+      get_cell("8", "LT raw p"),
+      get_cell("8", "LT RW p")
+    ),
+    `9` = c(
+      get_cell("9", "ST raw p"),
+      get_cell("9", "ST RW p"),
+      get_cell("9", "LT raw p"),
+      get_cell("9", "LT RW p")
+    ),
+    `10` = c(
+      get_cell("10", "ST raw p"),
+      get_cell("10", "ST RW p"),
+      get_cell("10", "LT raw p"),
+      get_cell("10", "LT RW p")
+    )
+  )
+}
+
+df_rw_final <- dplyr::bind_rows(
+  get_rw_tier_df(romano_wolf_long, "Silver"),
+  get_rw_tier_df(romano_wolf_long, "Gold"),
+  get_rw_tier_df(romano_wolf_long, "Platinum")
+)
+
+df_rw_final %>%
+  table_task(output = "latex") %>%
+  add_header_above(c(" " = 2, "Satisfaction" = 4)) %>%
+  pack_rows(
+    index = c("Silver" = 4, "Gold" = 4, "Platinum" = 4),
+    latex_align = "c"
+  ) %>%
+  collapse_rows(columns = 1, latex_hline = "none", valign = "top") %>%
+  wrap_latex_table(
+    note = paste0(
+      "Raw p-values are based on robust standard errors. ",
+      "Romano--Wolf adjusted p-values are computed with ",
+      rw_reps,
+      " bootstrap resamples and seed ",
+      rw_seed,
+      ". By design, these adjusted p-values apply to the heterogeneous ITT tests and to the corresponding LATE tests.\\\\",
+      "$^{***} p < 0.01; ^{**} p < 0.05; ^{*} p < 0.1$."
+    ),
+    caption = "Adjusted p-values Under Multiple-Hypothesis Testing",
+    label = "tab:romano_wolf"
+  )
+```
+
+# Managerial response and design lessons
+
+**Purpose:** This section translates the ITT, LATE, and robustness results into the design lessons a researcher should take from the paper.
+
+The empirical argument leads to two decision rules. First, solicitation should be targeted: extremely satisfied customers are relatively safe to solicit, while highly dissatisfied customers should not be solicited because solicitation induces reviews that reduce their own future spending. Second, response strategy should prioritize the cells where posting is most harmful: highly dissatisfied reviewers, especially Platinum reviewers, and Platinum reviewers with positive but less-than-perfect experiences.
+
+Figure `\label{fig:response_rate}` — Paper Figure 5; replication-package Figure 6 — compares the company’s actual response rates across the same loyalty-by-satisfaction cells used in the ITT and LATE tables. The company responds to nearly all highly dissatisfied reviewers, which aligns with the estimated harm in the ( \le 6 ) cells. However, response rates are similar for satisfaction scores 8 and 9 across loyalty tiers, which misses the key heterogeneous result: Platinum customers with less-than-perfect positive experiences are also high-risk.
+
+The design lesson is that a randomized encouragement paper should not stop at the average ITT and LATE. The paper builds a full empirical case by linking the first stage, reduced form, IV estimate, heterogeneity cells, multiple-testing correction, and a final descriptive diagnostic on managerial behavior.
+
+**Forward pointer:** The note’s takeaway is that the same subgroup structure should organize the causal estimates, robustness checks, and practical implications.
+
+```{r sec7-response-rate-data, include=FALSE}
+#-------------------------------------
+# Section 7: Management response rates
+#-------------------------------------
+
+response_rate_long <- purrr::map_dfr(
+  subgroup_vars,
+  function(g) {
+    review_data %>%
+      dplyr::filter(.data[[g]] == 1) %>%
+      # Figure is about responses to posted reviews.
+      # If non-reviewers have response = NA, this filter gives the same object as mean(response, na.rm = TRUE).
+      dplyr::filter(review == 1 | !is.na(response)) %>%
+      dplyr::summarise(
+        response_rate = mean(response, na.rm = TRUE),
+        n_reviews = dplyr::n(),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(subgroup = g)
+  }
+) %>%
+  dplyr::left_join(subgroup_map, by = "subgroup") %>%
+  dplyr::mutate(
+    loyalty = factor(loyalty, levels = c("Silver", "Gold", "Platinum")),
+    satisfaction_group = factor(
+      satisfaction_group,
+      levels = c("<=6", "8", "9", "10")
+    )
+  ) %>%
+  dplyr::arrange(loyalty, satisfaction_group)
+```
+
+```{r tab-response-rate-values}
+#-------------------------------------
+# Values underlying Figure 5 / replication Figure 6
+#-------------------------------------
+
+response_rate_table <- response_rate_long %>%
+  dplyr::mutate(
+    `Response rate` = scales::percent(response_rate, accuracy = 0.1)
+  ) %>%
+  dplyr::select(
+    Loyalty = loyalty,
+    Satisfaction = satisfaction_group,
+    `No. of reviews` = n_reviews,
+    `Response rate`
+  )
+
+response_rate_table %>%
+  table_task(output = "latex") %>%
+  wrap_latex_table(
+    caption = "Management Response Rates by Loyalty and Satisfaction",
+    label = "tab:response_rate_values"
+  )
+```
+
+```{r fig-response-rate}
+#-------------------------------------
+# Paper Figure 5 / replication Figure 6
+#-------------------------------------
+
+fig5 <- ggplot2::ggplot(
+  response_rate_long,
+  ggplot2::aes(
+    x = satisfaction_group,
+    y = response_rate,
+    group = loyalty,
+    linetype = loyalty,
+    shape = loyalty
+  )
+) +
+  ggplot2::geom_line(linewidth = 0.9) +
+  ggplot2::geom_point(size = 2) +
+  ggplot2::scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  ggplot2::labs(
+    x = "Satisfaction subgroup",
+    y = "Share of reviews with a company response",
+    linetype = NULL,
+    shape = NULL
+  ) +
+  ggplot2::theme_minimal()
+
+wrap_latex_figure(fig5, caption = "Management response rate by loyalty and satisfaction", label = "fig:response_rate")
+```
+
+# Appendix
+
+```{r setup-appendix-labels, echo=FALSE}
+# 1. Get all chunk labels in the document in order
+all_chunks <- knitr::all_labels()
+
+# 2. Find the numerical index of the 'sample-attrition' chunk
+start_pos <- match("data-load", all_chunks)
+
+# 3. Subset the list to only include chunks that come AFTER that position
+appendix_chunks <- all_chunks[(start_pos + 1):length(all_chunks)]
+```
+
+```{r ref.label=appendix_chunks, echo=TRUE, eval=FALSE}
+```
+

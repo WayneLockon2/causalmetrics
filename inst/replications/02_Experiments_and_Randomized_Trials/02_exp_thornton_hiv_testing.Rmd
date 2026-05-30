@@ -16,7 +16,7 @@ output:
     fig_caption: true
 link-citations: true
 params:
-  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics_replication/02_Experiments_and_Randomized_Trials/thornton2008demand/Thornton-HIV-Testing-Data.dta"
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/02_Experiments_and_Randomized_Trials/thornton2008demand/Thornton-HIV-Testing-Data.dta"
 ---
 
 ```{r setup, include = FALSE}
