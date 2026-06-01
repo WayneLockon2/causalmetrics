@@ -1,0 +1,2464 @@
+---
+title: "Replication: Comparing Experimental and Nonexperimental Methods"
+subtitle: "Comparing Experimental and Nonexperimental Methods Four Decades After LaLonde (1986)"
+author: "Weiheng Zhang"
+date: "`r Sys.Date()`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    keep_tex: false
+    latex_engine: xelatex
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+link-citations: true
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/03_Selection_on_Observables/imbens2025comparing/"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi       = 150,
+  message   = FALSE,
+  warning   = FALSE,
+  echo = FALSE
+)
+
+library(causalmetrics)
+library(tibble)
+library(purrr)
+library(dplyr)
+
+repo_root <- params$data_path
+
+fmt0 <- function(x) formatC(x, format = "f", digits = 0, big.mark = ",")
+
+coef_treat <- function(data, fml) {
+  vars <- all.vars(fml)
+  d <- data[, vars, drop = FALSE]
+  d <- d[complete.cases(d), , drop = FALSE]
+
+  fit <- estimatr::lm_robust(fml, data = d, se_type = "stata")
+  co <- summary(fit)$coefficients
+
+  tibble(
+    estimate = co["treat", "Estimate"],
+    se = co["treat", "Std. Error"],
+    n = nrow(d)
+  )
+}
+
+make_lalonde_reg_table <- function(samples, specs) {
+  map_dfr(names(samples), function(sname) {
+    map_dfr(names(specs), function(mname) {
+      coef_treat(samples[[sname]], specs[[mname]]) |>
+        mutate(sample = sname, specification = mname)
+    })
+  }) |>
+    mutate(cell = paste0(fmt0(estimate), " (", fmt0(se), ")")) |>
+    select(sample, specification, cell) |>
+    pivot_wider(names_from = specification, values_from = cell)
+}
+```
+
+# Benchmark setup — NSW, LDW, CPS/PSID, and treatment timing
+
+**Research Question**:
+
+> When estimating the ATT of NSW job training using nonexperimental CPS/PSID controls, do modern methods—propensity scores, trimming, matching, weighting, DML, AIPW—produce stable estimates, and do placebo tests support interpreting those estimates causally?
+
+The empirical object is the National Supported Work (NSW) job-training evaluation. The benchmark comes from randomized assignment: eligible applicants were assigned either to a control condition or to a treatment offering up to 12 months of supported work, supervision, counseling, and placement help.
+
+The replication note uses the LaLonde-Dehejia-Wahba (LDW) male samples as the main spine because they contain two pretreatment earnings histories. The key comparison is not “training versus no training” in the abstract; it is whether nonexperimental controls can reproduce the experimental benchmark for treated NSW participants.
+
+**Timing and variables**
+
+* \(W_i = 1\): individual participated in NSW training.
+* \(Y_i\): real earnings in 1978, the post-treatment outcome.
+* \(X_i\): pretreatment covariates: age, schooling, high-school dropout/no-degree, married, Black, Hispanic, 1974 earnings, 1975 earnings, 1974 unemployment, and 1975 unemployment.
+* \(Y_i^{pl}\): 1975 earnings, used later as a placebo outcome because it predates treatment.
+
+**Samples**
+
+* Original LaLonde male experimental sample: \(N_{tr}=297\) treated and \(N_{co}=425\) controls.
+* External nonexperimental controls: CPS-SSA-1 and PSID-1.
+* LDW experimental sample: \(N_{tr}=185\) treated and \(N_{co}=260\) controls.
+* LDW-CPS: the LDW treated units plus CPS controls.
+* LDW-PSID: the LDW treated units plus PSID controls.
+
+```{r tab-summary-stats}
+load(file.path(params$data_path, "data/lalonde.RData"))
+
+vars <- c("age", "education", "nodegree", "married", "black", "hispanic",
+          "re75", "u75", "re74", "u74")
+labs <- c("Age", "Years of school", "Proportion high school dropouts",
+          "Proportion married", "Proportion Black", "Proportion Hispanic",
+          "Real earnings in 1975 (thousand)", "Proportion unemployed in 1975",
+          "Real earnings in 1974 (thousand)", "Proportion unemployed in 1974")
+
+cell <- function(d, v) {
+  if (!v %in% names(d)) return("NA")
+  x <- d[[v]] / ifelse(v %in% c("re74", "re75"), 1000, 1)
+  sprintf("%.2f (%.2f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+}
+
+make_col <- function(d) vapply(vars, \(v) cell(d, v), character(1))
+
+tab_summary_stats <- tibble::tibble(
+  Variable = labs,
+  `LaLonde Treated` = make_col(nsw_tr),
+  `LaLonde Control` = make_col(nsw_co),
+  `CPS Controls` = make_col(cps1),
+  `PSID Controls` = make_col(psid1),
+  `LDW Treated` = make_col(ldw_tr),
+  `LDW Control` = make_col(ldw_co)
+)
+
+tab_summary_stats %>% 
+    table_task() %>% 
+    kable_styling(latex_options = "scale_down") %>% 
+    add_header_above(
+        c(" " = 1, 
+          "LaLonde\nExperimental" = 2, 
+          "LaLonde\nComparison Groups" = 2, 
+          "LaLonde-Dehejia-Wahba\nExperimental" = 2)
+      ) %>%
+    wrap_latex_table(caption = "Male samples used in the LaLonde and LDW comparisons.", label = "tab:summary_stats")
+```
+
+
+
+# Estimands and comparison logic — stability is not identification
+
+**Purpose:** Define what is being compared when the paper asks whether modern nonexperimental methods can recover the experimental benchmark.
+
+The target causal estimand is the average treatment effect on the treated:
+
+\[
+ATT = E[Y_i(1)-Y_i(0)\mid W_i=1].
+\]
+
+In the NSW setting, this is the average effect of job training on 1978 earnings for people who actually participated. The experimental sample estimates this object directly by comparing randomized treated and control units.
+
+The nonexperimental samples cannot observe the treated units’ untreated counterfactual. Instead, modern methods use CPS or PSID controls to estimate the adjusted statistical comparison:
+
+\[
+E[Y_i\mid W_i=1] -
+E\left\{E[Y_i\mid W_i=0,X_i]\mid W_i=1\right\}.
+\]
+
+This quantity is not automatically causal. It becomes an estimate of the ATT only if the selection-on-observables design is credible: after conditioning on pretreatment covariates \(X_i\), CPS/PSID controls must represent what NSW treated units would have earned without training.
+
+The paper therefore makes two comparisons:
+
+* **Estimator-stability comparison:** Do modern methods—propensity scores, trimming, matching, weighting, DML, and AIPW—produce similar adjusted estimates once overlap is improved?
+* **Causal-validity comparison:** Do placebo tests support the claim that the adjusted comparison can be interpreted as the causal ATT?
+
+These are different questions. Agreement across estimators shows that the statistical estimand is being estimated more stably. Placebo success is what supports the stronger claim that the statistical estimand equals the causal ATT.
+
+The design bridge has two parts: unconfoundedness and overlap. Overlap is checked before estimation because without comparable controls, methods rely on extrapolation. Unconfoundedness is probed after estimation using placebo outcomes, because it cannot be verified directly.
+
+
+# Historical validation problem — old nonexperimental estimators miss the randomized benchmark
+
+**Argument:** LaLonde’s original exercise shows why the NSW data became a benchmark: standard regression and selection-model estimators did not reliably reproduce the randomized experimental effect when CPS/PSID controls replaced experimental controls.
+
+**Evidence 3.1: Male regression validation**
+
+* **Claim:** The original male sample shows the central LaLonde failure: the experimental comparison gives a positive training-effect benchmark, while the same specifications using CPS or PSID controls can produce much smaller, negative, or unstable estimates.
+* **Table/Figure:** \label{tab:lalonde_male_regression} — data-based replication of LaLonde-style male regression specifications.
+* **Specification:** The table estimates the treatment coefficient in linear earnings models:
+  [
+  Y_i = \alpha + \tau W_i + f(X_i) + \varepsilon_i,
+  \]
+  plus difference-in-differences specifications using \(Y_{i,1978}-Y_{i,1975}\), quasi-difference specifications that include \(Y_{i,1975}\), and a full-control specification.
+* **Key coefficient:** Compare the treatment coefficient \(\hat{\tau}\) across the three rows: NSW experimental controls, CPS-SSA-1 controls, and PSID-1 controls. The design-relevant contrast is not one single column; it is that the experimental row remains close to the randomized benchmark, while the CPS/PSID rows change substantially across the post-earnings, DID, quasi-DID, and full-control columns.
+* **Design notes:**
+
+  * The treated group is held fixed; the comparison group changes.
+  * Experimental controls are randomized; CPS and PSID controls are selected external samples.
+  * Adding controls changes the adjustment model, but it does not create comparability where the external controls are not comparable.
+* **Robustness link:** This table motivates the later overlap diagnostics. Specification robustness is weak evidence when the comparison group itself is poorly supported.
+
+---
+
+**Evidence 3.2: Female regression analogue**
+
+* **Claim:** The female reconstruction is useful as a parallel validation exercise, but it should be labelled as an analogue rather than an exact replication of LaLonde’s Appendix Table 4.
+* **Table/Figure:** \label{tab:lalonde_female_regression} — data-based female regression analogue using the reconstructed LCS sample, if `data/lcs.RData` is available.
+* **Specification:** The table estimates the same class of linear specifications:
+  [
+  Y_i = \alpha + \tau W_i + f(X_i) + \varepsilon_i,
+  \]
+  with post-training earnings as the main outcome, 1975 earnings as the placebo/pre-treatment outcome, DID-style earnings changes, and full covariate adjustment.
+* **Key coefficient:** Compare \(\hat{\tau}\) in the experimental-control row with \(\hat{\tau}\) in the PSID-control row. The point is whether the external comparison group reproduces the experimental benchmark after applying the same regression logic.
+* **Design notes:**
+
+  * This table is not a one-for-one reconstruction of Appendix A Table 4 because the original female raw file is not redistributed in the provided scripts.
+  * Its role is to show the same validation logic in the reconstructed female sample: randomized controls define the benchmark; external controls test whether the nonexperimental design can recover it.
+* **Robustness link:** This belongs in the historical-validation section only if the note clearly flags the data limitation. Otherwise, move it to an extension section.
+
+
+```{r}
+male_specs <- list(
+  "Placebo: 1975 earnings" =
+    re75 ~ treat,
+
+  "Placebo + age/educ/race" =
+    re75 ~ treat + age + education + black + hispanic,
+
+  "Post: 1978 earnings" =
+    re78 ~ treat,
+
+  "Post + age/educ/race" =
+    re78 ~ treat + age + education + black + hispanic,
+
+  "DID: 1978 - 1975 earnings" =
+    I(re78 - re75) ~ treat,
+
+  "DID + age" =
+    I(re78 - re75) ~ treat + age,
+
+  "Quasi-DID: controls for 1975 earnings" =
+    re78 ~ treat + re75,
+
+  "Quasi-DID + age" =
+    re78 ~ treat + re75 + age,
+
+  "Full controls" =
+    re78 ~ treat + age + education + black + hispanic +
+      married + nodegree + re75 + u75
+)
+
+male_samples <- list(
+  "NSW experimental controls" = nsw,
+  "CPS-SSA-1 controls" = nsw_cps,
+  "PSID-1 controls" = nsw_psid
+)
+
+tab_lalonde_male_regression <- make_lalonde_reg_table(
+  samples = male_samples,
+  specs = male_specs
+)
+
+tab_lalonde_male_regression %>% 
+  table_task() %>% 
+  kable_styling(latex_options = "scale_down") %>% 
+  wrap_latex_table(caption = "Data-based replication of LaLonde-style male regression specifications.",
+  label = "tab:lalonde_male_regression")
+```
+
+
+```{r}
+load(file.path(params$data_path, "data/lcs.RData"))
+
+
+
+  lcs2 <- lcs |>
+    rename(education = educ, hispanic = hisp)
+
+  lcs_psid2 <- lcs_psid |>
+    rename(education = educ, hispanic = hisp)
+
+  female_specs <- list(
+    "Placebo: 1975 earnings" =
+      re75 ~ treat,
+
+    "Placebo + age/educ/race" =
+      re75 ~ treat + age + education + black + hispanic,
+
+    "Post: 1979 earnings" =
+      re79 ~ treat,
+
+    "Post + age/educ/race" =
+      re79 ~ treat + age + education + black + hispanic,
+
+    "DID: 1979 - 1975 earnings" =
+      I(re79 - re75) ~ treat,
+
+    "DID + age" =
+      I(re79 - re75) ~ treat + age,
+
+    "Quasi-DID: controls for 1975 earnings" =
+      re79 ~ treat + re75,
+
+    "Quasi-DID + age" =
+      re79 ~ treat + re75 + age,
+
+    "Full controls" =
+      re79 ~ treat + age + education + black + hispanic +
+        married + nodegree + re75 + u75
+  )
+
+  female_samples <- list(
+    "Experimental controls" = lcs2,
+    "PSID-1 controls" = lcs_psid2
+  )
+
+  tab_lalonde_female_regression <- make_lalonde_reg_table(
+    samples = female_samples,
+    specs = female_specs
+  )
+
+  knitr::kable(
+    tab_lalonde_female_regression,
+    caption = "Data-based female regression analogue using the LCS-PSID sample.\\label{tab:lalonde_female_regression}"
+  )
+
+```
+
+**Evidence 3.3: Available-variable selection-model replication**
+
+* **Claim:** The selection-model exercise tests whether explicitly modelling participation resolves the benchmark problem; in the provided data, it can only be replicated as an available-variable approximation because some original exclusion variables are missing.
+* **Table/Figure:** \label{tab:lalonde_selection_available} — available-variable replication of LaLonde-style treatment-selection models.
+* **Method:** The table uses a two-step probit control-function approach. First, estimate a participation equation for \(W_i\). Second, include the estimated selection correction in the earnings equation for \(Y_{i,1978}\).
+* **Key coefficient:** The key coefficient is \(\hat{\tau}\), the treatment coefficient in the second-stage earnings equation. Compare it across NSW experimental controls, CPS-SSA-1 controls, and PSID-1 controls. If the CPS/PSID estimates remain sensitive to the comparison group or exclusion set, the selection model has not solved the validation problem.
+* **Design notes:**
+
+  * This table uses the same original male samples as the male regression table: `nsw`, `nsw_cps`, and `nsw_psid`.
+  * It omits original participation-equation variables that are unavailable in the processed objects. Therefore, label the table as “available-variable replication,” not “exact replication of Appendix A Table 6.”
+  * The design lesson is about dependence on participation-equation assumptions, not exact numerical recovery of LaLonde’s Table 6.
+* **Robustness link:** This is a robustness failure in design terms: changing from regression adjustment to a selection model does not remove the need for credible comparison groups and credible identifying restrictions.
+
+```{r}
+two_step_treat_cf <- function(data, y, treat, outcome_controls, exclusion_vars) {
+  outcome_controls <- intersect(outcome_controls, names(data))
+
+  available_exclusions <- setdiff(intersect(exclusion_vars, names(data)),
+                                  outcome_controls)
+  omitted_exclusions <- setdiff(exclusion_vars, names(data))
+
+  selection_controls <- unique(c(outcome_controls, available_exclusions))
+  needed <- unique(c(y, treat, outcome_controls, selection_controls))
+
+  d <- data[, needed, drop = FALSE]
+  d <- d[complete.cases(d), , drop = FALSE]
+  d[[treat]] <- as.numeric(d[[treat]])
+
+  if (length(unique(d[[treat]])) < 2) {
+    return(tibble(
+      estimate = NA_real_,
+      se = NA_real_,
+      n = nrow(d),
+      selection_only_used = paste(available_exclusions, collapse = ", "),
+      omitted = paste(omitted_exclusions, collapse = ", "),
+      note = "Treatment has no variation after complete-case restriction."
+    ))
+  }
+
+  selection_fml <- reformulate(selection_controls, response = treat)
+
+  first_stage <- tryCatch(
+    glm(selection_fml, data = d, family = binomial(link = "probit")),
+    error = function(e) e
+  )
+
+  if (inherits(first_stage, "error")) {
+    return(tibble(
+      estimate = NA_real_,
+      se = NA_real_,
+      n = nrow(d),
+      selection_only_used = paste(available_exclusions, collapse = ", "),
+      omitted = paste(omitted_exclusions, collapse = ", "),
+      note = paste("First-stage probit failed:", first_stage$message)
+    ))
+  }
+
+  eta <- as.numeric(predict(first_stage, type = "link"))
+  p1 <- pmin(pmax(pnorm(eta), 1e-8), 1 - 1e-8)
+  p0 <- 1 - p1
+
+  d$lambda_hat <- ifelse(
+    d[[treat]] == 1,
+    dnorm(eta) / p1,
+    -dnorm(eta) / p0
+  )
+
+  outcome_fml <- reformulate(
+    c(treat, outcome_controls, "lambda_hat"),
+    response = y
+  )
+
+  second_stage <- tryCatch(
+    estimatr::lm_robust(outcome_fml, data = d, se_type = "stata"),
+    error = function(e) e
+  )
+
+  if (inherits(second_stage, "error")) {
+    return(tibble(
+      estimate = NA_real_,
+      se = NA_real_,
+      n = nrow(d),
+      selection_only_used = paste(available_exclusions, collapse = ", "),
+      omitted = paste(omitted_exclusions, collapse = ", "),
+      note = paste("Second stage failed:", second_stage$message)
+    ))
+  }
+
+  co <- summary(second_stage)$coefficients
+
+  tibble(
+    estimate = co[treat, "Estimate"],
+    se = co[treat, "Std. Error"],
+    n = nrow(d),
+    selection_only_used = ifelse(length(available_exclusions) == 0,
+                                 "None",
+                                 paste(available_exclusions, collapse = ", ")),
+    omitted = ifelse(length(omitted_exclusions) == 0,
+                     "None",
+                     paste(omitted_exclusions, collapse = ", ")),
+    note = "Two-step probit control-function estimate; missing exclusions omitted."
+  )
+}
+
+run_selection_table_available <- function(samples) {
+  outcome_controls <- c("age", "education", "black", "hispanic", "re75")
+
+  exclusion_sets <- list(
+    "Set 1: LaLonde-style exclusions" =
+      c("married", "smsa", "emp76", "afdc75", "children"),
+
+    "Set 2: employment/children exclusions" =
+      c("emp76", "children"),
+
+    "No excluded variables" =
+      character(0)
+  )
+
+  map_dfr(names(samples), function(sname) {
+    map_dfr(names(exclusion_sets), function(ename) {
+      two_step_treat_cf(
+        data = samples[[sname]],
+        y = "re78",
+        treat = "treat",
+        outcome_controls = outcome_controls,
+        exclusion_vars = exclusion_sets[[ename]]
+      ) |>
+        mutate(sample = sname, exclusion_set = ename)
+    })
+  }) |>
+    mutate(
+      estimate_se = ifelse(
+        is.na(estimate),
+        NA_character_,
+        paste0(fmt0(estimate), " (", fmt0(se), ")")
+      )
+    ) |>
+    select(sample, exclusion_set, estimate_se, n,
+           selection_only_used, omitted, note)
+}
+
+selection_samples <- list(
+  "NSW experimental controls" = nsw,
+  "CPS-SSA-1 controls" = nsw_cps,
+  "PSID-1 controls" = nsw_psid
+)
+
+tab_lalonde_selection_available <- run_selection_table_available(selection_samples)
+
+
+tab_lalonde_selection_available %>% 
+    table_task() %>% 
+    kable_styling(latex_options = "scale_down") %>% 
+    wrap_latex_table(caption = "Available-variable replication of LaLonde-style treatment-selection models.",
+                     label = "tab:lalonde_selection_available")
+```
+
+# Overlap diagnostics — common support comes before estimator choice
+
+**Argument:** Before comparing estimators, the paper shows that the nonexperimental samples have poor common support; trimming is therefore a design step, not a cosmetic robustness check.
+
+```{r sec4-self-contained-helpers}
+library(grf)
+library(Matching)
+library(tibble)
+library(knitr)
+
+if (!exists("repo_root")) repo_root <- "."
+
+covar <- c("age", "education", "black", "hispanic", "married", "nodegree",
+           "re74", "re75", "u74", "u75")
+
+plot_overlap_hist <- function(data, var, treat, main = NULL, odds = FALSE,
+                              breaks = 40, density = TRUE,
+                              xlim = NULL, ylim = NULL, xlab = NULL,
+                              text.size = 1.2) {
+  x <- data[[var]]
+  w <- data[[treat]]
+
+  if (odds) {
+    x <- log(x / (1 - x))
+    if (is.null(xlab)) xlab <- "Log Odds"
+  } else {
+    if (is.null(xlab)) xlab <- "Propensity Score"
+  }
+
+  if (is.null(xlim)) xlim <- if (odds) range(x, finite = TRUE) else c(0, 1)
+
+  intervals <- seq(xlim[1], xlim[2], length.out = breaks + 1)
+
+  h0 <- as.numeric(table(cut(x[w == 0], breaks = intervals, include.lowest = TRUE)))
+  h1 <- as.numeric(table(cut(x[w == 1], breaks = intervals, include.lowest = TRUE)))
+
+  if (density) {
+    if (sum(h0) > 0) h0 <- h0 / sum(h0)
+    if (sum(h1) > 0) h1 <- h1 / sum(h1)
+  }
+
+  if (is.null(ylim)) {
+    ymax <- max(h0, h1, na.rm = TRUE) * 1.2
+    ylim <- c(-ymax, ymax)
+  }
+
+  mids <- seq_len(breaks)
+  labs <- sprintf("%.2f", intervals[-1])
+
+  barplot(-h0, names.arg = labs, ylim = ylim, xlab = xlab, ylab = "Density",
+          main = main, border = "gray40", col = "gray80", las = 2, cex.names = 0.6)
+  barplot(h1, add = TRUE, border = "gray20", col = "gray50")
+
+  abline(h = 0, lwd = 1.2)
+  box()
+
+  usr <- par("usr")
+  text(usr[1] + 0.03 * diff(usr[1:2]), usr[3] + 0.92 * diff(usr[3:4]),
+       paste0("Ntr = ", sum(w == 1)), pos = 4, cex = text.size)
+  text(usr[1] + 0.03 * diff(usr[1:2]), usr[3] + 0.84 * diff(usr[3:4]),
+       paste0("Nco = ", sum(w == 0)), pos = 4, cex = text.size)
+}
+
+add_grf_ps <- function(data, covar, treat = "treat", ps_name = "ps") {
+  pf <- grf::probability_forest(
+    X = data[, covar, drop = FALSE],
+    Y = as.factor(data[[treat]]),
+    seed = 1234,
+    num.trees = 4000
+  )
+
+  data[[ps_name]] <- pmin(pmax(pf$predictions[, 2], 1e-7), 1 - 1e-7)
+  data
+}
+```
+
+```{r sec4-rebuild-trimmed-samples}
+load(file.path(repo_root, "data/lalonde.RData"))
+
+make_trimmed_samples <- function(obs_data, exp_controls, control_sample, threshold) {
+  exp_controls2 <- exp_controls
+  exp_controls2$treat <- 1
+
+  plus <- rbind.data.frame(obs_data, exp_controls2)
+
+  plus <- add_grf_ps(plus, covar, treat = "treat", ps_name = "ps")
+
+  exp_trim <- subset(plus, sample %in% c(1, 2) & ps <= threshold)
+  exp_trim$treat[exp_trim$sample == 2] <- 0
+  exp_trim$ps <- NULL
+
+  match_data <- subset(plus, sample %in% c(1, control_sample) & ps <= threshold)
+
+  match_data <- add_grf_ps(match_data, covar, treat = "treat", ps_name = "ps")
+
+  set.seed(1234)
+  mout <- Matching::Match(
+    Y = match_data$re78,
+    Tr = match_data$treat,
+    X = matrix(match_data$ps, ncol = 1),
+    estimand = "ATT",
+    M = 1,
+    replace = FALSE,
+    ties = FALSE,
+    BiasAdjust = FALSE
+  )
+
+  obs_trim <- match_data[c(mout$index.treated, mout$index.control), ]
+
+  obs_trim <- add_grf_ps(obs_trim, covar, treat = "treat", ps_name = "ps_new")
+
+  list(exp_trim = exp_trim, obs_trim = obs_trim)
+}
+
+cps_trim <- make_trimmed_samples(
+  obs_data = ldw_cps,
+  exp_controls = ldw_co,
+  control_sample = 3,
+  threshold = 0.9
+)
+
+psid_trim <- make_trimmed_samples(
+  obs_data = ldw_psid,
+  exp_controls = ldw_co,
+  control_sample = 4,
+  threshold = 0.8
+)
+
+ldw_trim_cps <- cps_trim$exp_trim
+ldw_cps_trim <- cps_trim$obs_trim
+
+ldw_trim_psid <- psid_trim$exp_trim
+ldw_psid_trim <- psid_trim$obs_trim
+```
+
+```{r fig-overlap-diagnostics, fig.width=10, fig.height=13, fig.cap="Propensity-score overlap diagnostics for the LDW experimental, nonexperimental, and trimmed samples.\\label{fig:overlap_diagnostics}"}
+ldw <- add_grf_ps(ldw, covar)
+ldw_cps <- add_grf_ps(ldw_cps, covar)
+ldw_psid <- add_grf_ps(ldw_psid, covar)
+ldw_trim_cps <- add_grf_ps(ldw_trim_cps, covar)
+ldw_trim_psid <- add_grf_ps(ldw_trim_psid, covar)
+
+ldw_cps_trim$ps <- ldw_cps_trim$ps_new
+ldw_psid_trim$ps <- ldw_psid_trim$ps_new
+
+par(mfrow = c(4, 2), mar = c(4, 4, 2, 1))
+
+plot_overlap_hist(ldw, "ps", "treat", breaks = 40, odds = TRUE,
+                  xlim = c(-2, 1.5), ylim = c(-0.15, 0.15),
+                  main = "LDW experimental")
+
+plot_overlap_hist(ldw_cps, "ps", "treat", breaks = 40, odds = TRUE,
+                  xlim = c(-15, 5), ylim = c(-0.2, 0.2),
+                  main = "LDW-CPS full")
+
+plot_overlap_hist(ldw_trim_cps, "ps", "treat", breaks = 40, odds = TRUE,
+                  xlim = c(-3, 3),
+                  main = "LDW experimental, CPS-trimmed")
+
+plot_overlap_hist(ldw_cps_trim, "ps", "treat", breaks = 40, odds = TRUE,
+                  xlim = c(-3, 3),
+                  main = "LDW-CPS trimmed/matched")
+
+plot_overlap_hist(ldw_psid, "ps", "treat", breaks = 40, odds = TRUE,
+                  xlim = c(-15, 5), ylim = c(-0.2, 0.2),
+                  main = "LDW-PSID full")
+
+plot_overlap_hist(ldw_trim_psid, "ps", "treat", breaks = 40, odds = TRUE,
+                  xlim = c(-3, 3),
+                  main = "LDW experimental, PSID-trimmed")
+
+plot_overlap_hist(ldw_psid_trim, "ps", "treat", breaks = 40, odds = TRUE,
+                  xlim = c(-3, 3),
+                  main = "LDW-PSID trimmed/matched")
+
+plot.new()
+```
+
+```{r tab-overlap-sample-sizes}
+overlap_sample_sizes <- tibble::tibble(
+  sample = c(
+    "LDW experimental",
+    "LDW-CPS full",
+    "LDW experimental, CPS-trimmed",
+    "LDW-CPS trimmed/matched",
+    "LDW-PSID full",
+    "LDW experimental, PSID-trimmed",
+    "LDW-PSID trimmed/matched"
+  ),
+  treated = c(
+    sum(ldw$treat == 1),
+    sum(ldw_cps$treat == 1),
+    sum(ldw_trim_cps$treat == 1),
+    sum(ldw_cps_trim$treat == 1),
+    sum(ldw_psid$treat == 1),
+    sum(ldw_trim_psid$treat == 1),
+    sum(ldw_psid_trim$treat == 1)
+  ),
+  controls = c(
+    sum(ldw$treat == 0),
+    sum(ldw_cps$treat == 0),
+    sum(ldw_trim_cps$treat == 0),
+    sum(ldw_cps_trim$treat == 0),
+    sum(ldw_psid$treat == 0),
+    sum(ldw_trim_psid$treat == 0),
+    sum(ldw_psid_trim$treat == 0)
+  )
+)
+
+knitr::kable(
+  overlap_sample_sizes,
+  caption = "Sample sizes before and after overlap trimming.\\label{tab:overlap_sample_sizes}"
+)
+```
+
+**Evidence 4.1: Experimental benchmark overlap**
+
+* **Claim:** The LDW experimental sample shows what a credible comparison looks like: treated and control units have similar propensity-score distributions.
+* **Table/Figure:** \label{fig:overlap_ldw_exp} — Figure 1(A) in the paper.
+* **Specification:** Estimate the propensity score \(\hat e_i=\widehat{\Pr}(W_i=1\mid X_i)\) using generalized random forest, then plot the log-odds \(\log{\hat e_i/(1-\hat e_i)}\) separately for treated and control units.
+* **Key coefficient:** None. The key diagnostic is distributional overlap: with \(N_{tr}=185\) and \(N_{co}=260\), the treated and experimental-control log-odds distributions are closely aligned.
+* **Design notes:**
+
+  * Randomization identifies the experimental benchmark, but this panel provides a visual reference for what good overlap should look like.
+  * The benchmark sample is later used to judge whether CPS/PSID controls can approximate the same treated population.
+* **Robustness link:** Balance and overlap diagnostics are the first robustness checks for selection-on-observables designs.
+
+---
+
+**Evidence 4.2: Full nonexperimental samples fail common support**
+
+* **Claim:** The full LDW-CPS and LDW-PSID samples contain many external controls that are unlike the NSW treated units, so estimates using these samples rely heavily on extrapolation.
+* **Table/Figure:** \label{fig:overlap_full_nonexperimental} — Figure 1(B)–(C) in the paper.
+* **Specification:** Use the same GRF propensity-score diagnostic in the LDW-CPS and LDW-PSID samples.
+* **Key coefficient:** None. The key diagnostic is the support gap: LDW-CPS has \(N_{tr}=185\) and \(N_{co}=15{,}992\); LDW-PSID has \(N_{tr}=185\) and \(N_{co}=2{,}490\). Despite many controls, large parts of the control distribution sit at very low log-odds, while treated units occupy regions with limited control support.
+* **Design notes:**
+
+  * More controls do not solve the design problem if they are not comparable controls.
+  * This explains why Section 3’s regression specifications can be unstable: the adjustment model is being asked to bridge unsupported covariate regions.
+* **Robustness link:** This is the overlap diagnostic that motivates trimming, matching, and later estimator-comparison checks.
+
+---
+
+**Evidence 4.3: Trimming changes the design sample and improves support**
+
+* **Claim:** Trimming and matching reduce the support problem, making subsequent estimator comparisons more meaningful as estimates of a statistical estimand.
+* **Table/Figure:** \label{fig:overlap_trimmed} — Figure 1(D)–(E) in the paper.
+* **Specification:** Estimate each unit’s probability of being in the experimental data using GRF, trim units outside preset support thresholds, re-estimate propensity scores in the trimmed sample, and perform one-to-one matching to refine the nonexperimental control group.
+* **Key coefficient:** None. The key diagnostic is the compressed support after trimming: trimmed LDW-CPS has \(N_{tr}=164\) and \(N_{co}=164\); trimmed LDW-PSID has \(N_{tr}=80\) and \(N_{co}=80\). The treated and control log-odds distributions become much more comparable.
+* **Design notes:**
+
+  * Trimming improves internal comparability but changes the target population from the full LDW treated group to a trimmed treated subset.
+  * The trimmed experimental benchmark must therefore be used when interpreting trimmed nonexperimental estimates.
+* **Robustness link:** This is common-support enforcement. Section 5 asks whether estimates stabilize after this design repair; Section 7 asks whether the repaired statistical comparison is causally credible.
+
+
+## ATT estimates — trimming makes modern estimators agree on the statistical estimand
+
+**Argument:** Once overlap is improved, modern nonexperimental estimators become more similar to one another, especially in LDW-CPS; this is evidence of stable statistical estimation, not yet evidence of causal identification.
+
+---
+
+**Evidence 5.1: Experimental ATT benchmarks**
+
+* **Claim:** The experimental rows define the benchmark that the nonexperimental estimators are trying to reproduce.
+* **Table/Figure:** \label{tab:att_benchmarks} — experimental benchmark rows from the data-based ATT table.
+* **Specification:** Estimate the difference in 1978 earnings between randomized treated and control units:
+  [
+  Y_i = \alpha + \tau W_i + \varepsilon_i.
+  \]
+* **Key coefficient:** The benchmark is \(\hat{\tau}\). In the full LDW experimental sample, the benchmark is about \($1{,}794\). The trimmed benchmarks should be reported separately because trimming changes the treated population: the CPS-trimmed benchmark is about \($1{,}900\), while the PSID-trimmed benchmark is much smaller and imprecise.
+* **Design notes:**
+
+  * The trimmed nonexperimental estimates should be compared to the corresponding trimmed experimental benchmark, not only to the full LDW benchmark.
+  * This prevents a common error: treating trimming as only a robustness check rather than a change in the target sample.
+* **Robustness link:** Experimental benchmarks are the validation target for the selection-on-observables estimators.
+
+---
+
+**Evidence 5.2: LDW-CPS ATT estimates**
+
+* **Claim:** In LDW-CPS, trimming makes the modern estimators cluster more tightly around the experimental benchmark.
+* **Table/Figure:** \label{fig:att_ldw_cps} — Figure 2, left panel; corresponding table \label{tab:att_ldw}.
+* **Specification:** Each method estimates the ATT or adjusted ATT-style comparison:
+  [
+  E[Y_i\mid W_i=1] -
+  E{E[Y_i\mid W_i=0,X_i]\mid W_i=1}.
+  \]
+  The methods include regression, regression with interactions, GRF outcome modeling, nearest-neighbor matching, IPW, CBPS, entropy balancing, DML-ElasticNet, and AIPW-GRF.
+* **Key coefficient:** The key coefficient is the ATT estimate for each method. In the full LDW-CPS sample, adjusted estimates are positive but dispersed; nearest-neighbor matching, CBPS, entropy balancing, and AIPW-GRF are close to the full experimental benchmark. After trimming, the estimates cluster more tightly around the CPS-trimmed benchmark.
+* **Design notes:**
+
+  * The comparison is across estimators holding the sample fixed, then across full versus trimmed samples holding the estimand logic fixed.
+  * The design lesson is not that one estimator wins. The point is that improving overlap reduces dependence on estimator choice.
+* **Robustness link:** This is estimator-sensitivity robustness after enforcing common support.
+
+---
+
+**Evidence 5.3: LDW-PSID ATT estimates**
+
+* **Claim:** LDW-PSID shows the limit of the overlap lesson: trimming reduces dispersion, but the trimmed estimates do not clearly recover a meaningful experimental benchmark.
+* **Table/Figure:** \label{fig:att_ldw_psid} — Figure 2, right panel; corresponding table \label{tab:att_ldw}.
+* **Specification:** Use the same ATT estimators and covariates as in Evidence 5.2, replacing CPS controls with PSID controls.
+* **Key coefficient:** The key coefficient is again the method-specific ATT estimate. In the full LDW-PSID sample, estimates are more dispersed than in LDW-CPS. After trimming, estimates become more similar to each other, but they center below the positive LDW benchmark and the trimmed experimental benchmark is small and noisy.
+* **Design notes:**
+
+  * PSID is a harder comparison group than CPS in this exercise.
+  * Stabilization across methods is not the same as recovery of the causal benchmark.
+* **Robustness link:** This panel is the cautionary counterpart to Evidence 5.2: common support can improve estimator stability without guaranteeing causal validity.
+
+---
+
+**Evidence 5.4: Difference-in-means as a diagnostic baseline**
+
+* **Claim:** The unadjusted difference-in-means shows why adjustment is necessary but not sufficient.
+* **Table/Figure:** \label{tab:att_ldw} — difference-in-means row in the data-based ATT table; omitted from the main Figure 2 plot because the full-sample values are extreme.
+* **Specification:** Estimate
+  [
+  Y_i = \alpha + \tau W_i + \varepsilon_i
+  \]
+  in the nonexperimental sample without covariate adjustment.
+* **Key coefficient:** In the full LDW-CPS and LDW-PSID samples, the unadjusted estimates are large and negative. After trimming, they move much closer to the adjusted estimates, showing that the raw comparison was dominated by lack of comparability.
+* **Design notes:**
+
+  * This row should be kept in the replication table even if it is visually omitted from the paper’s coefficient plot.
+  * Its role is diagnostic: it shows how much design work is being done by covariate adjustment and trimming.
+* **Robustness link:** Difference-in-means is the baseline against which overlap improvement and adjustment are judged.
+
+```{r sec5-att-helpers}
+library(estimatr)
+library(Matching)
+library(grf)
+library(CBPS)
+library(hbal)
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(knitr)
+
+if (!exists("repo_root")) repo_root <- "."
+
+quiet <- function(x) {
+  suppressWarnings(suppressMessages(x))
+}
+
+extract_lm_treat <- function(fit, treat) {
+  out <- summary(fit)$coefficients[treat, c(1, 2, 5, 6)]
+  names(out) <- c("Estimate", "SE", "CI_lower", "CI_upper")
+  out
+}
+
+att_diff <- function(data, Y, treat) {
+  fml <- as.formula(paste(Y, "~", treat))
+  extract_lm_treat(lm_robust(fml, data = data, se_type = "stata"), treat)
+}
+
+att_reg <- function(data, Y, treat, covar) {
+  fml <- as.formula(paste(Y, "~", treat, "+", paste(covar, collapse = " + ")))
+  extract_lm_treat(lm_robust(fml, data = data, se_type = "stata"), treat)
+}
+
+att_om_reg <- function(data, Y, treat, covar) {
+  tr <- which(data[[treat]] == 1)
+  co <- which(data[[treat]] == 0)
+
+  fml <- as.formula(paste(Y, "~", paste(covar, collapse = " + ")))
+  fit_co <- lm(fml, data = data[co, ])
+
+  y0hat_tr <- predict(fit_co, newdata = data[tr, covar, drop = FALSE])
+
+  stacked <- data.frame(
+    y = c(data[[Y]][tr], y0hat_tr),
+    w = rep(c(1, 0), each = length(tr))
+  )
+
+  extract_lm_treat(lm_robust(y ~ w, data = stacked, se_type = "stata"), "w")
+}
+
+att_om_grf <- function(data, Y, treat, covar) {
+  tr <- which(data[[treat]] == 1)
+  co <- which(data[[treat]] == 0)
+
+  fit_co <- grf::regression_forest(
+    X = data[co, covar, drop = FALSE],
+    Y = as.vector(data[[Y]][co]),
+    seed = 1234
+  )
+
+  y0hat_tr <- as.vector(predict(fit_co, newdata = data[tr, covar, drop = FALSE])$predictions)
+
+  stacked <- data.frame(
+    y = c(data[[Y]][tr], y0hat_tr),
+    w = rep(c(1, 0), each = length(tr))
+  )
+
+  extract_lm_treat(lm_robust(y ~ w, data = stacked, se_type = "stata"), "w")
+}
+
+att_matching <- function(data, Y, treat, covar) {
+  m <- Matching::Match(
+    Y = data[[Y]],
+    Tr = data[[treat]],
+    X = as.matrix(data[, covar, drop = FALSE]),
+    Z = as.matrix(data[, covar, drop = FALSE]),
+    estimand = "ATT",
+    M = 5,
+    replace = TRUE,
+    ties = TRUE,
+    BiasAdjust = TRUE
+  )
+
+  c(
+    Estimate = m$est[1],
+    SE = m$se[1],
+    CI_lower = m$est[1] - 1.96 * m$se[1],
+    CI_upper = m$est[1] + 1.96 * m$se[1]
+  )
+}
+
+att_ipw <- function(data, Y, treat, covar) {
+  ps <- grf::probability_forest(
+    X = data[, covar, drop = FALSE],
+    Y = as.factor(data[[treat]]),
+    seed = 1234
+  )$predictions[, 2]
+
+  ps <- pmin(pmax(ps, 1e-8), 1 - 1e-8)
+
+  weights <- rep(1, nrow(data))
+  co <- which(data[[treat]] == 0)
+  weights[co] <- ps[co] / (1 - ps[co])
+
+  fml <- as.formula(paste(Y, "~", treat))
+  extract_lm_treat(lm_robust(fml, data = data, weights = weights, se_type = "stata"), treat)
+}
+
+att_cbps <- function(data, Y, treat, covar) {
+  fml_ps <- as.formula(paste(treat, "~", paste(covar, collapse = " + ")))
+  ps <- quiet(CBPS::CBPS(fml_ps, data = data, standardize = TRUE)$fitted.values)
+  ps <- pmin(pmax(ps, 1e-8), 1 - 1e-8)
+
+  weights <- rep(1, nrow(data))
+  co <- which(data[[treat]] == 0)
+  weights[co] <- ps[co] / (1 - ps[co])
+
+  fml_y <- as.formula(paste(Y, "~", treat))
+  extract_lm_treat(lm_robust(fml_y, data = data, weights = weights, se_type = "stata"), treat)
+}
+
+att_ebal <- function(data, Y, treat, covar) {
+  efit <- quiet(hbal::hbal(Y = Y, Treat = treat, X = covar,
+                           data = data, expand.degree = 1))
+  out <- hbal::att(efit, dr = FALSE)[1, c(1, 2, 5, 6)]
+  names(out) <- c("Estimate", "SE", "CI_lower", "CI_upper")
+  out
+}
+
+att_dml <- function(data, Y, treat, covar) {
+  dat <- data[, c(Y, treat, covar), drop = FALSE]
+  dat <- na.omit(dat)
+
+  n_obs <- nrow(dat)
+  n_vars <- length(covar)
+
+  learner <- mlr3::lrn("regr.glmnet", lambda = sqrt(log(n_vars) / n_obs))
+  ml_l <- learner$clone()
+  ml_m <- learner$clone()
+
+  dml_dat <- DoubleML::DoubleMLData$new(
+    dat,
+    y_col = Y,
+    d_cols = treat,
+    use_other_treat_as_covariate = FALSE,
+    x_cols = covar
+  )
+
+  dml_dat$set_data_model(treat)
+
+  set.seed(1234)
+  dml_mod <- DoubleML::DoubleMLPLR$new(dml_dat, ml_l = ml_l, ml_m = ml_m)
+  quiet(dml_mod$fit())
+
+  ci <- dml_mod$confint()[treat, ]
+
+  c(
+    Estimate = dml_mod$coef[treat],
+    SE = dml_mod$se[treat],
+    CI_lower = ci[1],
+    CI_upper = ci[2]
+  )
+}
+
+att_aipw_grf <- function(data, Y, treat, covar) {
+  for (v in c(Y, treat, covar)) data[[v]] <- as.vector(data[[v]])
+
+  cf <- grf::causal_forest(
+    X = data[, covar, drop = FALSE],
+    Y = data[[Y]],
+    W = data[[treat]],
+    seed = 1234
+  )
+
+  att <- grf::average_treatment_effect(
+    cf,
+    target.sample = "treated",
+    method = "AIPW"
+  )
+
+  c(
+    Estimate = att[1],
+    SE = att[2],
+    CI_lower = att[1] - 1.96 * att[2],
+    CI_upper = att[1] + 1.96 * att[2]
+  )
+}
+
+estimate_all_att <- function(data, Y, treat, covar) {
+  methods <- list(
+    diff = function() att_diff(data, Y, treat),
+    reg = function() att_reg(data, Y, treat, covar),
+    om.reg = function() att_om_reg(data, Y, treat, covar),
+    om.grf = function() att_om_grf(data, Y, treat, covar),
+    matching = function() att_matching(data, Y, treat, covar),
+    ipw = function() att_ipw(data, Y, treat, covar),
+    cbps = function() att_cbps(data, Y, treat, covar),
+    ebal = function() att_ebal(data, Y, treat, covar),
+    dml = function() att_dml(data, Y, treat, covar),
+    aipw_grf = function() att_aipw_grf(data, Y, treat, covar)
+  )
+
+  out <- lapply(methods, function(f) f())
+  out <- as.data.frame(do.call(rbind, out))
+  rownames(out) <- names(methods)
+  out
+}
+```
+
+```{r sec5-estimate-ldw-att}
+load(file.path(repo_root, "data/lalonde.RData"))
+load(file.path(repo_root, "data/trimmed.RData"))
+
+Y <- "re78"
+treat <- "treat"
+covar <- c("age", "education", "black", "hispanic", "married",
+           "nodegree", "re74", "re75", "u74", "u75")
+
+set.seed(1234)
+
+out1 <- estimate_all_att(ldw, "re78", "treat", covar)
+out2 <- estimate_all_att(ldw_trim_cps, "re78", "treat", covar)
+out3 <- estimate_all_att(ldw_trim_psid, "re78", "treat", covar)
+
+out4 <- estimate_all_att(ldw_cps, "re78", "treat", covar)
+out5 <- estimate_all_att(ldw_psid, "re78", "treat", covar)
+out6 <- estimate_all_att(ldw_cps_trim, "re78", "treat", covar)
+out7 <- estimate_all_att(ldw_psid_trim, "re78", "treat", covar)
+```
+
+```{r sec5-format-att-tables}
+clean_att_out <- function(out) {
+  out <- as.data.frame(out)
+
+  needed <- c("Estimate", "SE", "CI_lower", "CI_upper")
+  missing <- setdiff(needed, names(out))
+  if (length(missing) > 0) {
+    stop("Missing columns in ATT output: ", paste(missing, collapse = ", "))
+  }
+
+  for (v in needed) {
+    out[[v]] <- as.numeric(unlist(out[[v]]))
+  }
+
+  out
+}
+
+out1 <- clean_att_out(out1)
+out2 <- clean_att_out(out2)
+out3 <- clean_att_out(out3)
+out4 <- clean_att_out(out4)
+out5 <- clean_att_out(out5)
+out6 <- clean_att_out(out6)
+out7 <- clean_att_out(out7)
+
+fmt_cell <- function(x) {
+  x <- as.data.frame(x)
+
+  est <- as.numeric(x[["Estimate"]][1])
+  se  <- as.numeric(x[["SE"]][1])
+
+  if (is.na(est) || is.na(se)) return(NA_character_)
+
+  paste0(
+    formatC(est, format = "f", digits = 0, big.mark = ","),
+    " (",
+    formatC(se, format = "f", digits = 0, big.mark = ","),
+    ")"
+  )
+}
+
+make_att_col <- function(out) {
+  out <- clean_att_out(out)
+  vapply(seq_len(nrow(out)), function(i) fmt_cell(out[i, , drop = FALSE]), character(1))
+}
+
+method_labels <- c(
+  diff = "Difference-in-means",
+  reg = "Regression",
+  om.reg = "Regression with interactions",
+  om.grf = "Outcome model: GRF",
+  matching = "Nearest-neighbor matching",
+  ipw = "IPW",
+  cbps = "CBPS",
+  ebal = "Entropy balancing",
+  dml = "DML-ElasticNet",
+  aipw_grf = "AIPW-GRF"
+)
+
+tab_att_ldw <- tibble::tibble(
+  Method = c("Experimental benchmark", unname(method_labels)),
+  `LDW-CPS` = c(fmt_cell(out1["diff", , drop = FALSE]), make_att_col(out4)),
+  `LDW-PSID` = c(fmt_cell(out1["diff", , drop = FALSE]), make_att_col(out5)),
+  `Trimmed LDW-CPS` = c(fmt_cell(out2["diff", , drop = FALSE]), make_att_col(out6)),
+  `Trimmed LDW-PSID` = c(fmt_cell(out3["diff", , drop = FALSE]), make_att_col(out7))
+)
+
+knitr::kable(
+  tab_att_ldw,
+  caption = "ATT estimates across methods for the LDW samples.\\label{tab:att_ldw}"
+)
+
+tab_att_benchmarks <- tibble::tibble(
+  sample = c(
+    "Full LDW experimental",
+    "Experimental benchmark after CPS-based trimming",
+    "Experimental benchmark after PSID-based trimming"
+  ),
+  estimate_se = c(
+    fmt_cell(out1["diff", , drop = FALSE]),
+    fmt_cell(out2["diff", , drop = FALSE]),
+    fmt_cell(out3["diff", , drop = FALSE])
+  ),
+  treated = c(
+    sum(ldw$treat == 1),
+    sum(ldw_trim_cps$treat == 1),
+    sum(ldw_trim_psid$treat == 1)
+  ),
+  controls = c(
+    sum(ldw$treat == 0),
+    sum(ldw_trim_cps$treat == 0),
+    sum(ldw_trim_psid$treat == 0)
+  )
+)
+
+knitr::kable(
+  tab_att_benchmarks,
+  caption = "Experimental ATT benchmarks for full and trimmed LDW samples.\\label{tab:att_benchmarks}"
+)
+```
+
+
+```{r fig-att-ldw, fig.width=12, fig.height=8, fig.cap="ATT estimates for LDW-CPS and LDW-PSID before and after trimming.\\label{fig:att_ldw}"}
+plot_att_panel <- function(full_out, trim_out, full_bench, trim_bench,
+                           main, show_labels = TRUE, xlim = c(-6000, 6000)) {
+
+  methods <- c("exp", "reg", "om.reg", "om.grf", "matching",
+               "ipw", "cbps", "ebal", "dml", "aipw_grf")
+
+  labels <- c(
+    "Experimental\nbenchmark",
+    "Regression",
+    "Regression w/\ninteractions",
+    "Outcome model:\nGRF",
+    "Nearest-neighbor\nmatching",
+    "IPW",
+    "CBPS",
+    "Entropy\nbalancing",
+    "DML-\nElasticNet",
+    "AIPW-GRF"
+  )
+
+  full <- rbind(full_bench["diff", , drop = FALSE], full_out[methods[-1], ])
+  trim <- rbind(trim_bench["diff", , drop = FALSE], trim_out[methods[-1], ])
+  rownames(full)[1] <- "exp"
+  rownames(trim)[1] <- "exp"
+
+  y_pos <- rev(seq_len(nrow(full)))
+
+  par(mar = if (show_labels) c(4, 12, 3, 2) else c(4, 2, 3, 2))
+
+  plot(full$Estimate, y_pos,
+       xlim = xlim,
+       ylim = c(0.5, length(y_pos) + 0.5),
+       type = "n",
+       axes = FALSE,
+       xlab = "",
+       ylab = "")
+
+  axis(1)
+  if (show_labels) {
+    axis(2, at = y_pos, labels = labels, las = 1, cex.axis = 0.85)
+  }
+
+  abline(v = 0, lwd = 1.5)
+  abline(h = y_pos[-1] + 0.5, lty = "dotted")
+  abline(v = axTicks(1), lty = "dotted")
+
+  segments(full$CI_lower, y_pos + 0.10, full$CI_upper, y_pos + 0.10, lwd = 2)
+  points(full$Estimate, y_pos + 0.10, pch = 16, cex = 1.2)
+
+  segments(trim$CI_lower, y_pos - 0.10, trim$CI_upper, y_pos - 0.10,
+           lwd = 2, lty = 2)
+  points(trim$Estimate, y_pos - 0.10, pch = 17, cex = 1.2)
+
+  title(main = main)
+  legend("topleft", legend = c("Full", "Trimmed"),
+         pch = c(16, 17), lty = c(1, 2), lwd = 2, bty = "n")
+  box()
+}
+
+par(mfrow = c(1, 2))
+
+plot_att_panel(
+  full_out = out4,
+  trim_out = out6,
+  full_bench = out1,
+  trim_bench = out2,
+  main = "LDW-CPS",
+  show_labels = TRUE
+)
+
+plot_att_panel(
+  full_out = out5,
+  trim_out = out7,
+  full_bench = out1,
+  trim_bench = out3,
+  main = "LDW-PSID",
+  show_labels = FALSE
+)
+```
+# Heterogeneity and distributional targets — CATT and QTE as harder stress tests
+
+**Argument:** Average ATT recovery is a weak validation target; CATT and QTE exercises ask whether the nonexperimental design can reproduce heterogeneity and distributional patterns, which are more demanding than matching one average.
+
+---
+
+**Evidence 6.1: Full-sample CATT comparison**
+
+* **Claim:** In the full LDW-CPS sample, nonexperimental CATT estimates do not reproduce the experimental heterogeneity pattern, even when the average ATT estimate looks relatively close.
+* **Table/Figure:** \label{fig:catt_ldw_cps_full} — Figure 3(A) in the paper.
+* **Specification:** Estimate conditional average treatment effects on the treated using causal forests:
+  [
+  \tau(X_i) = E[Y_i(1)-Y_i(0)\mid W_i=1, X_i].
+  \]
+  Plot \(\hat{\tau}*{exp}(X_i)\) on the x-axis and \(\hat{\tau}*{nonexp}(X_i)\) on the y-axis for treated LDW units.
+* **Key coefficient:** There is no single coefficient. The diagnostic object is the scatter around the 45-degree line. In the full sample, experimental CATT estimates range roughly from \(-236\) to \(3{,}817\), while nonexperimental CATT estimates range much more widely, roughly from \(-5{,}667\) to \(7{,}102\).
+* **Design notes:**
+
+  * The red cross marks the pair of ATT estimates; the dots show whether the same covariate profiles imply similar heterogeneous effects.
+  * The average can look acceptable while individual-level heterogeneity is badly distorted.
+* **Robustness link:** This is heterogeneity robustness: a design that only passes the average-effect comparison may still fail for conditional effects.
+
+---
+
+**Evidence 6.2: Trimmed CATT comparison**
+
+* **Claim:** Trimming improves the CATT comparison in LDW-CPS, showing that overlap matters for heterogeneity estimation even more than for average-effect estimation.
+* **Table/Figure:** \label{fig:catt_ldw_cps_trimmed} — Figure 3(B) in the paper.
+* **Specification:** Re-estimate CATTs using the CPS-trimmed LDW sample and the corresponding trimmed experimental benchmark:
+  [
+  \tau_{trim}(X_i) = E[Y_i(1)-Y_i(0)\mid W_i=1, X_i, i \in \mathcal{S}_{trim}].
+  \]
+* **Key coefficient:** The diagnostic object is again the alignment with the 45-degree line. After trimming, the nonexperimental CATT range narrows to roughly \(-2{,}877\) to \(5{,}758\), and the cloud aligns more closely with the experimental CATTs.
+* **Design notes:**
+
+  * Trimming removes treated units without comparable controls, so the target is the trimmed treated population.
+  * The correct benchmark is the trimmed experimental CATT distribution, not the full experimental distribution.
+* **Robustness link:** This is the heterogeneity analogue of the Section 5 estimator-stability result: overlap improvement makes the statistical object more stable.
+
+---
+
+**Evidence 6.3: PSID CATT extension**
+
+* **Claim:** LDW-PSID is a harder comparison group: trimming helps, but the CATT estimates remain less aligned with the experimental benchmark than in LDW-CPS.
+* **Table/Figure:** \label{fig:catt_ldw_psid} — PSID CATT extension figure from the replication scripts.
+* **Specification:** Estimate the same causal-forest CATTs using LDW-PSID and trimmed LDW-PSID:
+  [
+  \hat{\tau}*{exp}(X_i) \quad \text{versus} \quad \hat{\tau}*{psid}(X_i).
+  \]
+* **Key coefficient:** There is no single coefficient. The paper reports that LDW-PSID CATT estimates range roughly from \(-8{,}422\) to \(4{,}870\) in the full sample and from \(-5{,}088\) to \(1{,}571\) after trimming.
+* **Design notes:**
+
+  * The same method performs differently across comparison groups.
+  * This prevents overreading the CPS result as a general success of modern methods.
+* **Robustness link:** Alternative comparison groups are a core robustness check for selection-on-observables designs.
+
+---
+
+**Evidence 6.4: QTE extension**
+
+* **Claim:** Quantile treatment effects are an even more demanding target because the design must recover the untreated potential-outcome distribution for treated units, not just its mean.
+* **Table/Figure:** \label{fig:qte_ldw_trimmed} — QTE extension figures for trimmed LDW-CPS and trimmed LDW-PSID.
+* **Specification:** Estimate quantile treatment effects on the treated:
+  [
+  QTET(q) = Q_{Y(1)\mid W=1}(q) - Q_{Y(0)\mid W=1}(q),
+  ]
+  comparing experimental, unadjusted nonexperimental, and adjusted nonexperimental curves.
+* **Key coefficient:** The key object is the quantile-by-quantile gap between the adjusted nonexperimental QTET curve and the experimental QTET curve. The figure should be read as a distributional stress test rather than as a single-number estimate.
+* **Design notes:**
+
+  * QTE estimates require stronger effective support than ATT estimates because the full distribution of untreated outcomes for treated units must be recovered.
+  * The QTE extension should be presented after CATT because it is secondary to the paper’s main Figure 3 but useful for the same design lesson.
+* **Robustness link:** This is distributional robustness. It complements, but does not replace, the placebo validation in Section 7.
+
+```{r sec6-catt-helpers}
+library(grf)
+library(tibble)
+library(dplyr)
+library(knitr)
+
+if (!exists("repo_root")) repo_root <- "."
+
+estimate_catt <- function(data, Y, treat, covar, seed = 1234, num.trees = 4000) {
+  d <- data[, c(Y, treat, covar), drop = FALSE]
+  d <- d[complete.cases(d), , drop = FALSE]
+
+  cf <- grf::causal_forest(
+    X = d[, covar, drop = FALSE],
+    Y = as.numeric(d[[Y]]),
+    W = as.numeric(d[[treat]]),
+    seed = seed,
+    num.trees = num.trees
+  )
+
+  tau_hat <- if (!is.null(cf$predictions)) {
+    as.numeric(cf$predictions)
+  } else {
+    as.numeric(predict(cf)$predictions)
+  }
+
+  att_hat <- grf::average_treatment_effect(
+    cf,
+    target.sample = "treated",
+    method = "AIPW"
+  )
+
+  list(
+    catt = tau_hat[d[[treat]] == 1],
+    att = att_hat,
+    n_treated = sum(d[[treat]] == 1),
+    n_control = sum(d[[treat]] == 0)
+  )
+}
+
+plot_catt_local <- function(catt1, catt2, att1, att2,
+                            xlab = "CATT (Experimental)",
+                            ylab = "CATT (Nonexperimental)",
+                            main = NULL,
+                            axes.range = NULL) {
+  if (length(catt1) != length(catt2)) {
+    stop("CATT vectors have different lengths; align treated units before plotting.")
+  }
+
+  if (is.null(axes.range)) {
+    axes.range <- range(c(catt1, catt2), finite = TRUE)
+  }
+
+  drange <- diff(axes.range)
+  axes.range <- axes.range + c(-0.1, 0.1) * drange
+
+  den1 <- density(catt1)
+  den2 <- density(catt2)
+
+  max.den <- max(c(den1$y, den2$y), na.rm = TRUE)
+  adj <- drange * 0.15 / max.den
+
+  plot(
+    1,
+    xlim = axes.range,
+    ylim = axes.range,
+    type = "n",
+    xlab = xlab,
+    ylab = ylab,
+    main = main
+  )
+
+  abline(h = 0, v = 0, lty = 3)
+  abline(0, 1, lty = 2)
+
+  y1 <- adj * den1$y + axes.range[1] - drange * 0.03
+  polygon(den1$x, y1, border = NA)
+  lines(den1$x, y1)
+
+  y2 <- adj * den2$y + axes.range[1] - drange * 0.03
+  polygon(y2, den2$x, border = NA)
+  lines(y2, den2$x)
+
+  points(catt1, catt2, pch = 16, cex = 0.6)
+  points(catt1, catt2, pch = 1, cex = 0.6)
+
+  points(att1, att2, pch = 3, cex = 2, lwd = 2)
+
+  box()
+}
+
+summarize_catt <- function(label, obj) {
+  tibble(
+    sample = label,
+    n_treated = length(obj$catt),
+    min_catt = min(obj$catt, na.rm = TRUE),
+    max_catt = max(obj$catt, na.rm = TRUE),
+    share_negative = mean(obj$catt < 0, na.rm = TRUE),
+    att = as.numeric(obj$att[1]),
+    att_se = as.numeric(obj$att[2])
+  )
+}
+```
+
+```{r sec6-estimate-catt}
+load(file.path(repo_root, "data/lalonde.RData"))
+load(file.path(repo_root, "data/trimmed.RData"))
+
+Y <- "re78"
+treat <- "treat"
+
+covar <- c(
+  "age", "education", "black", "hispanic", "married",
+  "nodegree", "re74", "re75", "u74", "u75"
+)
+
+set.seed(1234)
+
+catt_ldw <- estimate_catt(ldw, Y, treat, covar)
+catt_cps <- estimate_catt(ldw_cps, Y, treat, covar)
+catt_psid <- estimate_catt(ldw_psid, Y, treat, covar)
+
+catt_ldw_cps_trim <- estimate_catt(ldw_trim_cps, Y, treat, covar)
+catt_cps_trim <- estimate_catt(ldw_cps_trim, Y, treat, covar)
+
+catt_ldw_psid_trim <- estimate_catt(ldw_trim_psid, Y, treat, covar)
+catt_psid_trim <- estimate_catt(ldw_psid_trim, Y, treat, covar)
+```
+
+```{r tab-catt-summary}
+tab_catt_summary <- bind_rows(
+  summarize_catt("LDW experimental", catt_ldw),
+  summarize_catt("LDW-CPS full", catt_cps),
+  summarize_catt("LDW-PSID full", catt_psid),
+  summarize_catt("LDW experimental, CPS-trimmed", catt_ldw_cps_trim),
+  summarize_catt("LDW-CPS trimmed", catt_cps_trim),
+  summarize_catt("LDW experimental, PSID-trimmed", catt_ldw_psid_trim),
+  summarize_catt("LDW-PSID trimmed", catt_psid_trim)
+) |>
+  mutate(
+    min_catt = round(min_catt, 0),
+    max_catt = round(max_catt, 0),
+    share_negative = round(share_negative, 3),
+    att = round(att, 0),
+    att_se = round(att_se, 0)
+  )
+
+knitr::kable(
+  tab_catt_summary,
+  caption = "CATT ranges and ATT estimates across experimental and nonexperimental samples.\\label{tab:catt_summary}"
+)
+```
+
+```{r fig-catt-ldw-cps, fig.width=11, fig.height=5.5, fig.cap="CATT estimates: experimental versus LDW-CPS, full and trimmed samples.\\label{fig:catt_ldw_cps}"}
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+
+plot_catt_local(
+  catt1 = catt_ldw$catt,
+  catt2 = catt_cps$catt,
+  att1 = catt_ldw$att[1],
+  att2 = catt_cps$att[1],
+  main = "LDW-CPS full",
+  axes.range = c(-8000, 8000)
+)
+
+plot_catt_local(
+  catt1 = catt_ldw_cps_trim$catt,
+  catt2 = catt_cps_trim$catt,
+  att1 = catt_ldw_cps_trim$att[1],
+  att2 = catt_cps_trim$att[1],
+  main = "LDW-CPS trimmed",
+  axes.range = c(-8000, 8000)
+)
+
+```
+
+```{r fig-catt-ldw-psid, fig.width=11, fig.height=5.5, fig.cap="CATT estimates: experimental versus LDW-PSID, full and trimmed samples.\\label{fig:catt_ldw_psid}"}
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+
+plot_catt_local(
+  catt1 = catt_ldw$catt,
+  catt2 = catt_psid$catt,
+  att1 = catt_ldw$att[1],
+  att2 = catt_psid$att[1],
+  main = "LDW-PSID full",
+  axes.range = c(-8000, 8000)
+)
+
+plot_catt_local(
+  catt1 = catt_ldw_psid_trim$catt,
+  catt2 = catt_psid_trim$catt,
+  att1 = catt_ldw_psid_trim$att[1],
+  att2 = catt_psid_trim$att[1],
+  main = "LDW-PSID trimmed",
+  axes.range = c(-8000, 8000)
+)
+
+```
+
+```{r sec6-qte-helpers, eval=FALSE}
+library(qte)
+
+est_qte_local <- function(Y, treat, covar, data,
+                          ps = TRUE,
+                          probs = seq(0.05, 0.95, 0.05),
+                          iters = 1000,
+                          cores = 2) {
+  if (is.null(covar)) {
+    fml <- as.formula(paste(Y, "~", treat))
+    xformla <- NULL
+  } else {
+    fml <- as.formula(paste(Y, "~", treat, "+", paste(covar, collapse = " + ")))
+    xformla <- as.formula(paste("~", paste(covar, collapse = " + ")))
+  }
+
+  if (is.null(covar) || ps == FALSE) {
+    qte::ci.qtet(
+      fml,
+      xformla = NULL,
+      data = data,
+      probs = probs,
+      se = TRUE,
+      iters = iters,
+      pl = TRUE,
+      cores = cores
+    )
+  } else {
+    qte::ci.qtet(
+      fml,
+      xformla = xformla,
+      data = data,
+      probs = probs,
+      se = TRUE,
+      iters = iters,
+      pl = TRUE,
+      cores = cores
+    )
+  }
+}
+
+plot_qte_local <- function(mod, mod_unadj = NULL, benchmark = NULL,
+                           main = "", ylim = NULL) {
+  vals <- c(mod$qte.lower, mod$qte.upper)
+
+  if (!is.null(mod_unadj)) {
+    vals <- c(vals, mod_unadj$qte.lower, mod_unadj$qte.upper)
+  }
+
+  if (!is.null(benchmark)) {
+    vals <- c(vals, benchmark$qte.lower, benchmark$qte.upper)
+  }
+
+  if (is.null(ylim)) ylim <- range(vals, na.rm = TRUE)
+
+  plot(
+    1,
+    type = "n",
+    xlim = c(0, 1),
+    ylim = ylim,
+    axes = FALSE,
+    xlab = "",
+    ylab = ""
+  )
+
+  box()
+  axis(1, at = seq(0.1, 0.9, 0.2))
+  axis(2)
+  mtext("QTET", 2, line = 2)
+  mtext("Quantile", 1, line = 2)
+  title(main, line = -1.5)
+  abline(h = 0, lwd = 1.5)
+
+  if (!is.null(mod_unadj)) {
+    polygon(
+      c(mod_unadj$probs, rev(mod_unadj$probs)),
+      c(mod_unadj$qte.lower, rev(mod_unadj$qte.upper)),
+      border = NA
+    )
+    lines(mod_unadj$probs, mod_unadj$qte, lwd = 2, lty = 2)
+    points(mod_unadj$probs, mod_unadj$qte, pch = 17, cex = 0.8)
+  }
+
+  if (!is.null(benchmark)) {
+    polygon(
+      c(benchmark$probs, rev(benchmark$probs)),
+      c(benchmark$qte.lower, rev(benchmark$qte.upper)),
+      border = NA
+    )
+    lines(benchmark$probs, benchmark$qte, lwd = 2)
+    points(benchmark$probs, benchmark$qte, pch = 16, cex = 0.8)
+  }
+
+  polygon(
+    c(mod$probs, rev(mod$probs)),
+    c(mod$qte.lower, rev(mod$qte.upper)),
+    border = NA
+  )
+  lines(mod$probs, mod$qte, lwd = 2)
+  points(mod$probs, mod$qte, pch = 16, cex = 0.8)
+}
+```
+
+```{r sec6-estimate-qte-optional, eval=FALSE}
+Y <- "re78"
+treat <- "treat"
+
+covar <- c(
+  "age", "education", "black", "hispanic", "married",
+  "nodegree", "re74", "re75", "u74", "u75"
+)
+
+qte_ldw <- est_qte_local(Y, treat, NULL, data = ldw)
+qte_ldw_cps_bm <- est_qte_local(Y, treat, NULL, data = ldw_trim_cps)
+qte_ldw_psid_bm <- est_qte_local(Y, treat, NULL, data = ldw_trim_psid)
+
+qte_ldw_cps_trim_adj <- est_qte_local(Y, treat, covar, data = ldw_cps_trim)
+qte_ldw_cps_trim_unadj <- est_qte_local(Y, treat, NULL, data = ldw_cps_trim)
+
+qte_ldw_psid_trim_adj <- est_qte_local(Y, treat, covar, data = ldw_psid_trim)
+qte_ldw_psid_trim_unadj <- est_qte_local(Y, treat, NULL, data = ldw_psid_trim)
+
+save(
+  qte_ldw,
+  qte_ldw_cps_bm,
+  qte_ldw_psid_bm,
+  qte_ldw_cps_trim_adj,
+  qte_ldw_cps_trim_unadj,
+  qte_ldw_psid_trim_adj,
+  qte_ldw_psid_trim_unadj,
+  file = file.path(repo_root, "output/qte_ldw_section6.rds")
+)
+```
+
+```{r fig-qte-trimmed-optional, eval=FALSE, fig.width=12, fig.height=5, fig.cap="QTE extension for trimmed LDW-CPS and LDW-PSID samples.\\label{fig:qte_ldw_trimmed}"}
+par(mfrow = c(1, 2), mar = c(3, 3, 2, 1))
+
+plot_qte_local(
+  mod = qte_ldw_cps_trim_adj,
+  mod_unadj = qte_ldw_cps_trim_unadj,
+  benchmark = qte_ldw_cps_bm,
+  main = "Trimmed LDW-CPS",
+  ylim = c(-25000, 15000)
+)
+
+legend(
+  "bottomleft",
+  legend = c("Adjusted", "Unadjusted", "Experimental"),
+  lty = c(1, 2, 1),
+  pch = c(16, 17, 16),
+  bty = "n"
+)
+
+plot_qte_local(
+  mod = qte_ldw_psid_trim_adj,
+  mod_unadj = qte_ldw_psid_trim_unadj,
+  benchmark = qte_ldw_psid_bm,
+  main = "Trimmed LDW-PSID",
+  ylim = c(-25000, 15000)
+)
+
+legend(
+  "bottomleft",
+  legend = c("Adjusted", "Unadjusted", "Experimental"),
+  lty = c(1, 2, 1),
+  pch = c(16, 17, 16),
+  bty = "n"
+)
+
+```
+
+# Placebo validation — estimator agreement is not causal identification
+
+**Argument:** The placebo exercise is the paper’s main causal-validity test: modern estimators can stabilize the adjusted comparison, but the nonexperimental design fails to reproduce the zero effect that should appear for a pretreatment outcome.
+
+---
+
+**Evidence 7.1: Experimental placebo benchmark**
+
+* **Claim:** The placebo design is calibrated correctly in the randomized sample: treatment assignment should not predict 1975 earnings, and the experimental placebo estimates are close to zero.
+* **Table/Figure:** \label{tab:placebo_benchmarks} — experimental placebo benchmark rows from Figure 4 / placebo table.
+* **Specification:** Estimate the treatment effect using the placebo outcome:
+  [
+  Y_i^{pl} = Y_{i,1975},
+  ]
+  where treatment occurs after 1975. For the experimental benchmark, estimate:
+  [
+  Y_i^{pl} = \alpha + \pi W_i + \varepsilon_i.
+  ]
+* **Key coefficient:** The key coefficient is \(\hat{\pi}\). In the experimental samples, the placebo estimates are small relative to the nonexperimental estimates: about \(265\) in the full LDW sample, \(264\) in the CPS-trimmed experimental sample, and \(-165\) in the PSID-trimmed experimental sample.
+* **Design notes:**
+
+  * The placebo outcome predates treatment, so the true causal effect must be zero.
+  * The placebo analysis excludes 1975 earnings and 1975 employment from the conditioning set and trimming rule; otherwise the placebo outcome would be mechanically controlled away.
+* **Robustness link:** This is the benchmark for the placebo-outcome robustness check.
+
+---
+
+**Evidence 7.2: LDW-CPS placebo estimates**
+
+* **Claim:** In LDW-CPS, the placebo estimates remain negative across modern estimators, so trimming improves stability but does not validate unconfoundedness.
+* **Table/Figure:** \label{fig:placebo_ldw_cps} — Figure 4, left panel; corresponding table \label{tab:placebo_ldw}.
+* **Specification:** Estimate the adjusted placebo comparison:
+  [
+  E[Y_i^{pl}\mid W_i=1] -
+  E{E[Y_i^{pl}\mid W_i=0,X_i^{-75}]\mid W_i=1},
+  ]
+  where \(X_i^{-75}\) excludes 1975 earnings and 1975 employment.
+* **Key coefficient:** The key coefficient is the method-specific placebo ATT. In the full LDW-CPS sample, representative estimates are negative: regression is about \(-1{,}135\) and AIPW-GRF is about \(-1{,}250\). In the trimmed LDW-CPS sample, the estimates remain negative: regression is about \(-1{,}366\) and AIPW-GRF is about \(-1{,}413\).
+* **Design notes:**
+
+  * This is the crucial distinction from Section 5: trimmed CPS estimates may agree on the 1978 ATT, but they also agree on a false negative effect for 1975 earnings.
+  * The failure could mean that 1975 earnings/employment are indispensable confounders, or that unobserved traits still jointly predict sample status and earnings.
+* **Robustness link:** Placebo-outcome failure weakens the causal interpretation of the Section 5 ATT estimates.
+
+---
+
+**Evidence 7.3: LDW-PSID placebo estimates**
+
+* **Claim:** LDW-PSID fails the placebo test even more strongly; the trimmed estimates are more stable but remain far from zero.
+* **Table/Figure:** \label{fig:placebo_ldw_psid} — Figure 4, right panel; corresponding table \label{tab:placebo_ldw}.
+* **Specification:** Use the same placebo estimators and covariate set as in Evidence 7.2, replacing CPS controls with PSID controls.
+* **Key coefficient:** The method-specific placebo ATT estimates are large and negative. In the full LDW-PSID sample, regression is about \(-2{,}757\) and AIPW-GRF is about \(-2{,}419\). In the trimmed LDW-PSID sample, regression is about \(-3{,}421\) and AIPW-GRF is about \(-3{,}695\).
+* **Design notes:**
+
+  * PSID already looked weaker than CPS in the ATT section; the placebo results explain why.
+  * A comparison group can produce more stable estimates after trimming while still failing the causal-validity check.
+* **Robustness link:** This is the alternative-control-group version of the placebo check.
+
+---
+
+**Evidence 7.4: Female-sample placebo extension**
+
+* **Claim:** The female sample can look more favorable on ATT recovery, but placebo evidence still limits causal interpretation.
+* **Table/Figure:** \label{tab:female_placebo} — female placebo extension table.
+* **Specification:** Replace the male LDW placebo outcome with the female-sample placebo outcome used in the extension, such as number of children in 1975:
+  [
+  Y_i^{pl} = \text{children}_{i,1975}.
+  ]
+* **Key coefficient:** The key coefficient is the method-specific placebo ATT. The extension should emphasize whether estimates concentrate near zero; in the cached results, several adjusted estimates remain negative rather than tightly centered at zero.
+* **Design notes:**
+
+  * This is an extension, not the main LDW validation exercise.
+  * Because the raw reconstructed female file is not redistributed in the provided scripts, label this table cautiously if using cached objects.
+* **Robustness link:** Placebo validation remains necessary even when the main ATT estimates look closer to the experimental benchmark.
+
+---
+
+**Evidence 7.5: IRS lottery contrast case**
+
+* **Claim:** The IRS lottery example shows what a more reassuring placebo pattern looks like: post-treatment effects appear where expected, while pre-treatment placebo estimates are much closer to zero.
+* **Table/Figure:** \label{tab:irs_placebo} — IRS lottery placebo contrast table.
+* **Specification:** Compare effects on average post-winning earnings with placebo effects on average pre-winning earnings:
+  [
+  Y_i^{post}=\overline{Y}*{i,\text{after}}, \qquad
+  Y_i^{pl}=\overline{Y}*{i,\text{before}}.
+  ]
+* **Key coefficient:** The post-treatment estimates are negative for lottery winners, while the placebo estimates are small relative to the LaLonde placebo failures. For example, AIPW-GRF gives a near-zero placebo estimate for big winners and a small placebo estimate for small winners in the cached extension table.
+* **Design notes:**
+
+  * The IRS example is not the main empirical target; it is a contrast case that clarifies what successful placebo validation would look like.
+  * Multiple pretreatment earnings measures make the placebo check more informative than a single lagged outcome.
+* **Robustness link:** This illustrates the positive version of the placebo diagnostic that the LaLonde nonexperimental samples fail.
+
+```{r sec7-placebo-helpers}
+library(estimatr)
+library(Matching)
+library(grf)
+library(CBPS)
+library(hbal)
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+library(dplyr)
+library(tibble)
+library(knitr)
+
+if (!exists("repo_root")) repo_root <- "."
+
+quiet <- function(x) suppressWarnings(suppressMessages(x))
+
+safe_vec <- function(expr) {
+  tryCatch(
+    {
+      out <- expr
+      out <- as.numeric(out)
+      names(out) <- c("Estimate", "SE", "CI_lower", "CI_upper")
+      out
+    },
+    error = function(e) {
+      out <- rep(NA_real_, 4)
+      names(out) <- c("Estimate", "SE", "CI_lower", "CI_upper")
+      out
+    }
+  )
+}
+
+extract_lm_treat <- function(fit, treat) {
+  out <- summary(fit)$coefficients[treat, c(1, 2, 5, 6)]
+  names(out) <- c("Estimate", "SE", "CI_lower", "CI_upper")
+  out
+}
+
+att_diff <- function(data, Y, treat) {
+  safe_vec({
+    fml <- as.formula(paste(Y, "~", treat))
+    extract_lm_treat(lm_robust(fml, data = data, se_type = "stata"), treat)
+  })
+}
+
+att_reg <- function(data, Y, treat, covar) {
+  safe_vec({
+    fml <- as.formula(paste(Y, "~", treat, "+", paste(covar, collapse = " + ")))
+    extract_lm_treat(lm_robust(fml, data = data, se_type = "stata"), treat)
+  })
+}
+
+att_om_reg <- function(data, Y, treat, covar) {
+  safe_vec({
+    tr <- which(data[[treat]] == 1)
+    co <- which(data[[treat]] == 0)
+
+    fml <- as.formula(paste(Y, "~", paste(covar, collapse = " + ")))
+    fit_co <- lm(fml, data = data[co, ])
+
+    y0hat_tr <- predict(fit_co, newdata = data[tr, covar, drop = FALSE])
+
+    stacked <- data.frame(
+      y = c(data[[Y]][tr], y0hat_tr),
+      w = rep(c(1, 0), each = length(tr))
+    )
+
+    extract_lm_treat(lm_robust(y ~ w, data = stacked, se_type = "stata"), "w")
+  })
+}
+
+att_om_grf <- function(data, Y, treat, covar) {
+  safe_vec({
+    tr <- which(data[[treat]] == 1)
+    co <- which(data[[treat]] == 0)
+
+    fit_co <- grf::regression_forest(
+      X = data[co, covar, drop = FALSE],
+      Y = as.vector(data[[Y]][co]),
+      seed = 1234
+    )
+
+    y0hat_tr <- as.vector(
+      predict(fit_co, newdata = data[tr, covar, drop = FALSE])$predictions
+    )
+
+    stacked <- data.frame(
+      y = c(data[[Y]][tr], y0hat_tr),
+      w = rep(c(1, 0), each = length(tr))
+    )
+
+    extract_lm_treat(lm_robust(y ~ w, data = stacked, se_type = "stata"), "w")
+  })
+}
+
+att_matching <- function(data, Y, treat, covar) {
+  safe_vec({
+    m <- Matching::Match(
+      Y = data[[Y]],
+      Tr = data[[treat]],
+      X = as.matrix(data[, covar, drop = FALSE]),
+      Z = as.matrix(data[, covar, drop = FALSE]),
+      estimand = "ATT",
+      M = 5,
+      replace = TRUE,
+      ties = TRUE,
+      BiasAdjust = TRUE
+    )
+
+    c(
+      m$est[1],
+      m$se[1],
+      m$est[1] - 1.96 * m$se[1],
+      m$est[1] + 1.96 * m$se[1]
+    )
+  })
+}
+
+att_ipw <- function(data, Y, treat, covar) {
+  safe_vec({
+    ps <- grf::probability_forest(
+      X = data[, covar, drop = FALSE],
+      Y = as.factor(data[[treat]]),
+      seed = 1234
+    )$predictions[, 2]
+
+    ps <- pmin(pmax(ps, 1e-8), 1 - 1e-8)
+
+    weights <- rep(1, nrow(data))
+    co <- which(data[[treat]] == 0)
+    weights[co] <- ps[co] / (1 - ps[co])
+
+    fml <- as.formula(paste(Y, "~", treat))
+    extract_lm_treat(
+      lm_robust(fml, data = data, weights = weights, se_type = "stata"),
+      treat
+    )
+  })
+}
+
+att_cbps <- function(data, Y, treat, covar) {
+  safe_vec({
+    fml_ps <- as.formula(paste(treat, "~", paste(covar, collapse = " + ")))
+    ps <- quiet(CBPS::CBPS(fml_ps, data = data, standardize = TRUE)$fitted.values)
+    ps <- pmin(pmax(ps, 1e-8), 1 - 1e-8)
+
+    weights <- rep(1, nrow(data))
+    co <- which(data[[treat]] == 0)
+    weights[co] <- ps[co] / (1 - ps[co])
+
+    fml_y <- as.formula(paste(Y, "~", treat))
+    extract_lm_treat(
+      lm_robust(fml_y, data = data, weights = weights, se_type = "stata"),
+      treat
+    )
+  })
+}
+
+att_ebal <- function(data, Y, treat, covar) {
+  safe_vec({
+    efit <- quiet(hbal::hbal(
+      Y = Y,
+      Treat = treat,
+      X = covar,
+      data = data,
+      expand.degree = 1
+    ))
+
+    out <- hbal::att(efit, dr = FALSE)[1, c(1, 2, 5, 6)]
+    as.numeric(out)
+  })
+}
+
+att_dml <- function(data, Y, treat, covar) {
+  safe_vec({
+    dat <- data[, c(Y, treat, covar), drop = FALSE]
+    dat <- na.omit(dat)
+
+    n_obs <- nrow(dat)
+    n_vars <- length(covar)
+
+    learner <- mlr3::lrn("regr.glmnet", lambda = sqrt(log(n_vars) / n_obs))
+
+    dml_dat <- DoubleML::DoubleMLData$new(
+      dat,
+      y_col = Y,
+      d_cols = treat,
+      use_other_treat_as_covariate = FALSE,
+      x_cols = covar
+    )
+
+    dml_dat$set_data_model(treat)
+
+    set.seed(1234)
+    dml_mod <- DoubleML::DoubleMLPLR$new(
+      dml_dat,
+      ml_l = learner$clone(),
+      ml_m = learner$clone()
+    )
+
+    quiet(dml_mod$fit())
+    ci <- dml_mod$confint()[treat, ]
+
+    c(
+      dml_mod$coef[treat],
+      dml_mod$se[treat],
+      ci[1],
+      ci[2]
+    )
+  })
+}
+
+att_aipw_grf <- function(data, Y, treat, covar) {
+  safe_vec({
+    for (v in c(Y, treat, covar)) data[[v]] <- as.vector(data[[v]])
+
+    cf <- grf::causal_forest(
+      X = data[, covar, drop = FALSE],
+      Y = data[[Y]],
+      W = data[[treat]],
+      seed = 1234
+    )
+
+    att <- grf::average_treatment_effect(
+      cf,
+      target.sample = "treated",
+      method = "AIPW"
+    )
+
+    c(att[1], att[2], att[1] - 1.96 * att[2], att[1] + 1.96 * att[2])
+  })
+}
+
+estimate_all_att <- function(data, Y, treat, covar) {
+  methods <- list(
+    diff = function() att_diff(data, Y, treat),
+    reg = function() att_reg(data, Y, treat, covar),
+    om.reg = function() att_om_reg(data, Y, treat, covar),
+    om.grf = function() att_om_grf(data, Y, treat, covar),
+    matching = function() att_matching(data, Y, treat, covar),
+    ipw = function() att_ipw(data, Y, treat, covar),
+    cbps = function() att_cbps(data, Y, treat, covar),
+    ebal = function() att_ebal(data, Y, treat, covar),
+    dml = function() att_dml(data, Y, treat, covar),
+    aipw_grf = function() att_aipw_grf(data, Y, treat, covar)
+  )
+
+  out <- lapply(methods, function(f) f())
+  out <- as.data.frame(do.call(rbind, out))
+  rownames(out) <- names(methods)
+  names(out) <- c("Estimate", "SE", "CI_lower", "CI_upper")
+  out
+}
+
+clean_att_out <- function(out) {
+  out <- as.data.frame(out)
+  for (v in c("Estimate", "SE", "CI_lower", "CI_upper")) {
+    out[[v]] <- as.numeric(unlist(out[[v]]))
+  }
+  out
+}
+
+fmt_cell <- function(x) {
+  x <- as.data.frame(x)
+  est <- as.numeric(x[["Estimate"]][1])
+  se <- as.numeric(x[["SE"]][1])
+
+  if (is.na(est) || is.na(se)) return(NA_character_)
+
+  paste0(
+    formatC(est, format = "f", digits = 0, big.mark = ","),
+    " (",
+    formatC(se, format = "f", digits = 0, big.mark = ","),
+    ")"
+  )
+}
+
+make_att_col <- function(out) {
+  out <- clean_att_out(out)
+  vapply(seq_len(nrow(out)), function(i) {
+    fmt_cell(out[i, , drop = FALSE])
+  }, character(1))
+}
+```
+
+```{r sec7-rebuild-placebo-trimmed-samples}
+library(grf)
+library(Matching)
+
+load(file.path(repo_root, "data/lalonde.RData"))
+
+covar_placebo <- c(
+  "age", "education", "black", "hispanic", "married",
+  "nodegree", "re74", "u74"
+)
+
+add_grf_ps <- function(data, covar, treat = "treat", ps_name = "ps") {
+  pf <- grf::probability_forest(
+    X = data[, covar, drop = FALSE],
+    Y = as.factor(data[[treat]]),
+    seed = 1234,
+    num.trees = 4000
+  )
+
+  data[[ps_name]] <- pmin(pmax(pf$predictions[, 2], 1e-7), 1 - 1e-7)
+  data
+}
+
+make_placebo_trimmed_samples <- function(obs_data, exp_controls,
+                                         control_sample, threshold) {
+  exp_controls2 <- exp_controls
+  exp_controls2$treat <- 1
+
+  plus <- rbind.data.frame(obs_data, exp_controls2)
+  plus <- add_grf_ps(plus, covar_placebo, treat = "treat", ps_name = "ps")
+
+  exp_trim <- subset(plus, sample %in% c(1, 2) & ps <= threshold)
+  exp_trim$treat[exp_trim$sample == 2] <- 0
+  exp_trim$ps <- NULL
+
+  match_data <- subset(plus, sample %in% c(1, control_sample) & ps <= threshold)
+  match_data <- add_grf_ps(match_data, covar_placebo, treat = "treat", ps_name = "ps")
+
+  set.seed(1234)
+  mout <- Matching::Match(
+    Y = match_data$re75,
+    Tr = match_data$treat,
+    X = matrix(match_data$ps, ncol = 1),
+    estimand = "ATT",
+    M = 1,
+    replace = FALSE,
+    ties = FALSE,
+    BiasAdjust = FALSE
+  )
+
+  obs_trim <- match_data[c(mout$index.treated, mout$index.control), ]
+
+  obs_trim <- add_grf_ps(
+    obs_trim,
+    covar_placebo,
+    treat = "treat",
+    ps_name = "ps_new"
+  )
+
+  list(exp_trim = exp_trim, obs_trim = obs_trim)
+}
+
+cps_pl <- make_placebo_trimmed_samples(
+  obs_data = ldw_cps,
+  exp_controls = ldw_co,
+  control_sample = 3,
+  threshold = 0.9
+)
+
+psid_pl <- make_placebo_trimmed_samples(
+  obs_data = ldw_psid,
+  exp_controls = ldw_co,
+  control_sample = 4,
+  threshold = 0.8
+)
+
+ldw_trim_cps_pl <- cps_pl$exp_trim
+ldw_cps_trim_pl <- cps_pl$obs_trim
+
+ldw_trim_psid_pl <- psid_pl$exp_trim
+ldw_psid_trim_pl <- psid_pl$obs_trim
+```
+
+```{r sec7-estimate-placebo}
+Y_placebo <- "re75"
+treat <- "treat"
+
+set.seed(1234)
+
+pl_out1 <- estimate_all_att(ldw, Y_placebo, treat, covar_placebo)
+pl_out2 <- estimate_all_att(ldw_trim_cps_pl, Y_placebo, treat, covar_placebo)
+pl_out3 <- estimate_all_att(ldw_trim_psid_pl, Y_placebo, treat, covar_placebo)
+
+pl_out4 <- estimate_all_att(ldw_cps, Y_placebo, treat, covar_placebo)
+pl_out5 <- estimate_all_att(ldw_psid, Y_placebo, treat, covar_placebo)
+pl_out6 <- estimate_all_att(ldw_cps_trim_pl, Y_placebo, treat, covar_placebo)
+pl_out7 <- estimate_all_att(ldw_psid_trim_pl, Y_placebo, treat, covar_placebo)
+
+pl_out1 <- clean_att_out(pl_out1)
+pl_out2 <- clean_att_out(pl_out2)
+pl_out3 <- clean_att_out(pl_out3)
+pl_out4 <- clean_att_out(pl_out4)
+pl_out5 <- clean_att_out(pl_out5)
+pl_out6 <- clean_att_out(pl_out6)
+pl_out7 <- clean_att_out(pl_out7)
+
+```
+
+```{r tab-placebo-benchmarks}
+tab_placebo_benchmarks <- tibble::tibble(
+  sample = c(
+    "Full LDW experimental",
+    "Experimental benchmark after CPS-based placebo trimming",
+    "Experimental benchmark after PSID-based placebo trimming"
+  ),
+  estimate_se = c(
+    fmt_cell(pl_out1["diff", , drop = FALSE]),
+    fmt_cell(pl_out2["diff", , drop = FALSE]),
+    fmt_cell(pl_out3["diff", , drop = FALSE])
+  ),
+  treated = c(
+    sum(ldw$treat == 1),
+    sum(ldw_trim_cps_pl$treat == 1),
+    sum(ldw_trim_psid_pl$treat == 1)
+  ),
+  controls = c(
+    sum(ldw$treat == 0),
+    sum(ldw_trim_cps_pl$treat == 0),
+    sum(ldw_trim_psid_pl$treat == 0)
+  )
+)
+
+knitr::kable(
+  tab_placebo_benchmarks,
+  caption = "Experimental placebo benchmarks using 1975 earnings.\\label{tab:placebo_benchmarks}"
+)
+```
+
+```{r tab-placebo-ldw}
+method_labels <- c(
+  diff = "Difference-in-means",
+  reg = "Regression",
+  om.reg = "Regression with interactions",
+  om.grf = "Outcome model: GRF",
+  matching = "Nearest-neighbor matching",
+  ipw = "IPW",
+  cbps = "CBPS",
+  ebal = "Entropy balancing",
+  dml = "DML-ElasticNet",
+  aipw_grf = "AIPW-GRF"
+)
+
+tab_placebo_ldw <- tibble::tibble(
+  Method = c("Experimental benchmark", unname(method_labels)),
+  `LDW-CPS placebo` = c(
+    fmt_cell(pl_out1["diff", , drop = FALSE]),
+    make_att_col(pl_out4)
+  ),
+  `LDW-PSID placebo` = c(
+    fmt_cell(pl_out1["diff", , drop = FALSE]),
+    make_att_col(pl_out5)
+  ),
+  `Trimmed LDW-CPS placebo` = c(
+    fmt_cell(pl_out2["diff", , drop = FALSE]),
+    make_att_col(pl_out6)
+  ),
+  `Trimmed LDW-PSID placebo` = c(
+    fmt_cell(pl_out3["diff", , drop = FALSE]),
+    make_att_col(pl_out7)
+  )
+)
+
+knitr::kable(
+  tab_placebo_ldw,
+  caption = "Placebo estimates across methods using 1975 earnings.\\label{tab:placebo_ldw}"
+)
+```
+
+```{r fig-placebo-ldw, fig.width=12, fig.height=8, fig.cap="Placebo estimates for LDW-CPS and LDW-PSID before and after trimming.\\label{fig:placebo_ldw}"}
+plot_placebo_panel <- function(full_out, trim_out, full_bench, trim_bench,
+                               main, show_labels = TRUE,
+                               xlim = c(-6000, 6000)) {
+  plot_methods <- c(
+    "reg", "om.reg", "om.grf", "matching", "ipw",
+    "cbps", "ebal", "dml", "aipw_grf"
+  )
+
+  labels <- c(
+    "Experimental\nbenchmark",
+    "Regression",
+    "Regression w/\ninteractions",
+    "Outcome model:\nGRF",
+    "Nearest-neighbor\nmatching",
+    "IPW",
+    "CBPS",
+    "Entropy\nbalancing",
+    "DML-\nElasticNet",
+    "AIPW-GRF"
+  )
+
+  full <- rbind(
+    full_bench["diff", , drop = FALSE],
+    full_out[plot_methods, , drop = FALSE]
+  )
+
+  trim <- rbind(
+    trim_bench["diff", , drop = FALSE],
+    trim_out[plot_methods, , drop = FALSE]
+  )
+
+  rownames(full)[1] <- "exp"
+  rownames(trim)[1] <- "exp"
+
+  full <- clean_att_out(full)
+  trim <- clean_att_out(trim)
+
+  y_pos <- rev(seq_len(nrow(full)))
+
+  par(mar = if (show_labels) c(4, 12, 3, 2) else c(4, 2, 3, 2))
+
+  plot(
+    full$Estimate,
+    y_pos,
+    xlim = xlim,
+    ylim = c(0.5, length(y_pos) + 0.5),
+    type = "n",
+    axes = FALSE,
+    xlab = "",
+    ylab = ""
+  )
+
+  axis(1)
+
+  if (show_labels) {
+    axis(2, at = y_pos, labels = labels, las = 1, cex.axis = 0.85)
+  }
+
+  abline(v = 0, lwd = 1.5)
+  abline(h = y_pos[-1] + 0.5, lty = "dotted")
+  abline(v = axTicks(1), lty = "dotted")
+
+  segments(full$CI_lower, y_pos + 0.10, full$CI_upper, y_pos + 0.10, lwd = 2)
+  points(full$Estimate, y_pos + 0.10, pch = 16, cex = 1.2)
+
+  segments(trim$CI_lower, y_pos - 0.10, trim$CI_upper, y_pos - 0.10,
+           lwd = 2, lty = 2)
+  points(trim$Estimate, y_pos - 0.10, pch = 17, cex = 1.2)
+
+  title(main = main)
+  legend(
+    "topleft",
+    legend = c("Full", "Trimmed"),
+    pch = c(16, 17),
+    lty = c(1, 2),
+    lwd = 2,
+    bty = "n"
+  )
+  box()
+}
+
+par(mfrow = c(1, 2))
+
+plot_placebo_panel(
+  full_out = pl_out4,
+  trim_out = pl_out6,
+  full_bench = pl_out1,
+  trim_bench = pl_out2,
+  main = "LDW-CPS placebo",
+  show_labels = TRUE
+)
+
+plot_placebo_panel(
+  full_out = pl_out5,
+  trim_out = pl_out7,
+  full_bench = pl_out1,
+  trim_bench = pl_out3,
+  main = "LDW-PSID placebo",
+  show_labels = FALSE
+)
+```
+
+# Robustness checklist — what selection-on-observables papers should report
+
+**Argument:** A selection-on-observables paper should not present modern estimators as a substitute for design evidence; the robustness package must show overlap, estimator stability, heterogeneity recovery, placebo validity, and sensitivity to hidden confounding.
+
+---
+
+**Evidence 8.1: Assignment mechanism and covariate timing**
+
+* **Claim:** The threat is invalid adjustment: controls may include post-treatment variables, omit important pretreatment predictors, or fail to reflect the assignment process.
+* **Table/Figure:** Table \ref{tab:summary_stats}; Section 2 estimand definitions.
+* **Method:** Define \(W_i\), \(Y_i\), pretreatment covariates \(X_i\), and placebo outcomes before estimation.
+* **Result:** The paper uses demographics and pretreatment earnings/employment histories as \(X_i\), with 1978 earnings as the main outcome and 1975 earnings as the placebo outcome.
+* **Interpretation:** The design starts from the assignment mechanism, not from estimator choice. The covariate set is defensible because it is pretreatment and outcome-relevant.
+
+---
+
+**Evidence 8.2: Descriptive imbalance**
+
+* **Claim:** The threat is obvious noncomparability between treated units and external controls before any adjustment.
+* **Table/Figure:** Table \ref{tab:summary_stats}.
+* **Method:** Compare covariate means across NSW treated units, randomized controls, CPS controls, and PSID controls.
+* **Result:** CPS and PSID controls are older, more educated, more likely to be married, less likely to be Black or Hispanic, and much higher earning before treatment.
+* **Interpretation:** Descriptive imbalance does not by itself reject selection on observables, but it explains why raw comparisons are not credible and why overlap diagnostics must come next.
+
+---
+
+**Evidence 8.3: Propensity-score overlap**
+
+* **Claim:** The threat is extrapolation: treated units may lack comparable controls.
+* **Table/Figure:** Figure \ref{fig:overlap_diagnostics}; Table \ref{tab:overlap_sample_sizes}.
+* **Method:** Estimate \(\hat e(X_i)=\widehat{\Pr}(W_i=1\mid X_i)\), plot log-odds distributions, and report treated/control sample sizes before and after trimming.
+* **Result:** Full LDW-CPS and LDW-PSID have poor support; trimming and matching substantially improve overlap.
+* **Interpretation:** Overlap is the first required robustness check. Without it, estimator comparisons mostly compare extrapolation rules.
+
+---
+
+**Evidence 8.4: Target-population changes after trimming**
+
+* **Claim:** The threat is comparing estimates for different estimands as if they target the same ATT.
+* **Table/Figure:** Table \ref{tab:att_benchmarks}; Table \ref{tab:overlap_sample_sizes}.
+* **Method:** Report experimental benchmarks separately for the full LDW sample and for each trimmed treated sample.
+* **Result:** Trimming changes both sample size and the experimental benchmark, especially in the PSID-trimmed sample.
+* **Interpretation:** A trimmed estimate should be compared to the corresponding trimmed experimental benchmark, not mechanically to the full-sample benchmark.
+
+---
+
+**Evidence 8.5: Estimator sensitivity**
+
+* **Claim:** The threat is model dependence: estimates may be driven by a particular functional form or weighting scheme.
+* **Table/Figure:** Table \ref{tab:att_ldw}; Figure \ref{fig:att_ldw}.
+* **Method:** Compare regression, outcome modeling, matching, IPW, CBPS, entropy balancing, DML, and AIPW-GRF on the same sample.
+* **Result:** Estimates become more similar after trimming, especially in LDW-CPS.
+* **Interpretation:** Estimator agreement supports stable estimation of the adjusted statistical estimand. It does not establish that the estimand is causal.
+
+---
+
+**Evidence 8.6: Heterogeneity robustness**
+
+* **Claim:** The threat is average-effect masking: the ATT may look credible even if conditional effects are wrong.
+* **Table/Figure:** Figure \ref{fig:catt_ldw_cps}; Table \ref{tab:catt_summary}; optional Figure \ref{fig:catt_ldw_psid}.
+* **Method:** Compare experimental and nonexperimental CATT estimates across treated units using causal forests.
+* **Result:** Full LDW-CPS CATT estimates diverge sharply from the experimental CATTs; trimming improves alignment. LDW-PSID remains weaker.
+* **Interpretation:** Recovering the ATT is easier than recovering heterogeneity. A strong replication note should not stop at the average effect.
+
+---
+
+**Evidence 8.7: Distributional robustness**
+
+* **Claim:** The threat is distributional mismatch: the nonexperimental design may recover the mean but not the treated outcome distribution.
+* **Table/Figure:** Optional Figure \ref{fig:qte_ldw_trimmed}.
+* **Method:** Estimate QTET curves for experimental, unadjusted nonexperimental, and adjusted nonexperimental samples.
+* **Result:** QTE results are treated as an extension because they are computationally heavier and more demanding than ATT/CATT comparisons.
+* **Interpretation:** Distributional checks are useful when policy questions concern who gains or loses, but they do not replace placebo validation.
+
+---
+
+**Evidence 8.8: Placebo validation**
+
+* **Claim:** The threat is unobserved confounding: the adjusted comparison may be stable but noncausal.
+* **Table/Figure:** Table \ref{tab:placebo_ldw}; Figure \ref{fig:placebo_ldw}.
+* **Method:** Re-estimate the treatment effect using 1975 earnings as a placebo outcome, excluding 1975 earnings and 1975 employment from the conditioning and trimming variables.
+* **Result:** Experimental placebo estimates are near zero, but LDW-CPS and LDW-PSID nonexperimental estimates remain large and negative even after trimming.
+* **Interpretation:** This is the decisive robustness failure. The paper’s main warning is that estimator agreement does not rescue causal interpretation when placebo tests fail.
+
+---
+
+**Evidence 8.9: Sensitivity to hidden confounding**
+
+* **Claim:** The threat is that unobserved variables, not included in \(X_i\), jointly predict treatment/sample status and untreated earnings.
+* **Table/Figure:** Optional Figure \ref{fig:sensitivity_ldw}.
+* **Method:** Use a sensitivity analysis such as `sensemakr`, benchmarking omitted-confounder strength against a strong observed covariate such as 1975 earnings.
+* **Result:** The uploaded script implements sensitivity plots for LDW experimental, LDW-CPS, and LDW-PSID samples.
+* **Interpretation:** Sensitivity analysis should be reported as a complement to placebo tests. In this note, it is an optional extension unless the replication package is expected to cover the online appendix.
+
+---
+
+**Evidence 8.10: Alternative comparison groups**
+
+* **Claim:** The threat is comparison-group dependence: a result may hold only for one external control source.
+* **Table/Figure:** Table \ref{tab:att_ldw}; Table \ref{tab:placebo_ldw}; optional female and IRS extension tables.
+* **Method:** Repeat the design across CPS, PSID, reconstructed female samples, and the IRS lottery contrast case.
+* **Result:** LDW-CPS is more favorable than LDW-PSID; female and IRS extensions show that placebo performance varies across settings.
+* **Interpretation:** The robustness question is not “does a modern estimator work?” but “does this design, with this comparison group, pass the diagnostics needed for causal interpretation?”
+
+```{r fig-sensitivity-ldw, fig.width=7, fig.height=7, fig.cap="Sensitivity analysis for hidden confounding in LDW-CPS.\\label{fig:sensitivity_ldw}", eval=FALSE}
+library(sensemakr)
+library(grf)
+
+load(file.path(repo_root, "data/lalonde.RData"))
+
+Y <- "re78"
+treat <- "treat"
+
+covar <- c(
+  "age", "education", "black", "hispanic", "married",
+  "nodegree", "re74", "re75", "u74", "u75"
+)
+
+pf <- grf::probability_forest(
+  X = ldw_cps[, covar, drop = FALSE],
+  Y = as.factor(ldw_cps$treat),
+  seed = 1234,
+  num.trees = 4000
+)
+
+ldw_cps$ps <- pf$predictions[, 2]
+ldw_cps_sens <- subset(ldw_cps, ps > 0.1 & ps < 0.9)
+
+fml <- as.formula(
+  paste(Y, "~", treat, "+", paste(covar, collapse = " + "))
+)
+
+mod_ldw_cps <- lm(fml, data = ldw_cps_sens)
+
+sens_ldw_cps <- sensemakr(
+  model = mod_ldw_cps,
+  treatment = treat,
+  benchmark_covariates = "re75",
+  kd = 1:3,
+  sensitivity.of = "t-value"
+)
+
+plot(sens_ldw_cps)
+```

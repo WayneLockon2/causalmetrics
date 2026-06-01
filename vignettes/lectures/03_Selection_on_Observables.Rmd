@@ -1,0 +1,877 @@
+---
+title: "causalmetrics lecture note, Section 3"
+subtitle: "Selection on Observables"
+author: "Weiheng Zhang"
+date: "`r Sys.Date()`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    toc_depth: 4
+    keep_tex: false
+    latex_engine: xelatex
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+vignette: >
+  %\VignetteIndexEntry{Selection on Observables}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+link-citations: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  out.width = "80%",
+  dpi       = 150,
+  message   = FALSE,
+  warning   = FALSE
+)
+
+library(patchwork)
+library(causalmetrics)
+
+# Visualization helpers (live in inst/vignette_helpers/)
+source(system.file("vignette_helpers", 
+                   "03_Selection_on_Observables", 
+                   "causal_estimators_ggplot_template.R", 
+                   package = "causalmetrics"))
+
+# Source the other helper
+source(system.file("vignette_helpers", 
+                   "03_Selection_on_Observables", 
+                   "vignette_helpers_soo.R", 
+                   package = "causalmetrics"))
+```
+
+# The problem
+
+## The selection problem in one picture
+
+Let $D \in \{0, 1\}$ be a binary treatment and $Y$ the observed outcome.
+A naive comparison,
+
+$$
+\widehat{\Delta}_{\text{naive}} \;=\; \bar Y_{D=1} - \bar Y_{D=0},
+$$
+
+is almost never causal in an observational setting. Treated and control
+units typically differ on pre-treatment characteristics, and the naive
+gap mixes the treatment effect with these covariate differences.
+
+We will work with a single simulated data set throughout Part II so
+every figure tells a piece of the same story. The data have an
+imbalanced pre-treatment covariate `x`, a true ATE of 1.5, and a mildly
+nonlinear outcome surface.
+
+```{r simulate-data}
+df <- simulate_causal_data(
+  n_control = 80,
+  n_treated = 60,
+  true_ate  = 1.5,
+  seed      = 123
+)
+
+glimpse(df)
+```
+
+The naive comparison overstates the true effect because the treated
+units sit at higher `x`:
+
+```{r naive-comparison}
+naive_diff <- with(df, mean(y[treat == 1]) - mean(y[treat == 0]))
+cat("True ATE:           1.50\n",
+    "Naive Y difference: ", round(naive_diff, 2), sep = "")
+```
+
+```{r fig-opening, fig.cap="Treated units cluster at higher X, so the raw Y-gap reflects both the treatment effect and the covariate imbalance."}
+plot_opening_scatter(df)
+```
+
+The selection-on-observables design asks whether the pre-treatment
+covariates we *do* observe are enough to make the comparison credible.
+If yes, the rest of the toolkit (regression, matching, weighting,
+AIPW) just makes that comparison in different ways.
+
+## Just enough framework
+
+**Potential outcomes.** Each unit has two potential outcomes, $Y(1)$
+and $Y(0)$. We observe one of them:
+
+$$
+Y \;=\; D\, Y(1) + (1-D)\, Y(0).
+$$
+
+The equality of observed $Y$ with the realized potential outcome is
+**consistency** — usually quiet, occasionally subtle (it can fail under
+interference or vague treatment definitions).
+
+**Three estimands as design choices.** Pick one *before* opening the
+data:
+
+| Estimand | Formula | Natural when |
+|---|---|---|
+| ATE | $\tau_{\text{ATE}} = \mathbb{E}[Y(1) - Y(0)]$ | Policy applies to everyone |
+| ATT | $\tau_{\text{ATT}} = \mathbb{E}[Y(1) - Y(0) \mid D = 1]$ | Question is about participants (job-training, opt-in users) |
+| CATE | $\tau(x) = \mathbb{E}[Y(1) - Y(0) \mid X = x]$ | Question is about heterogeneity |
+
+The ATE is *not* automatically the right target. If your overlap region
+is small, the ATT may be both more credibly identified and more
+managerially meaningful. CATEs and policy learning are the topic of the
+companion vignette `08_hte_and_policy_learning`.
+
+## Three identifying assumptions, visually
+
+The whole selection-on-observables design rests on three assumptions.
+Make the case for each *before* showing any estimate.
+
+### Conditional ignorability
+
+For the ATE,
+
+$$
+\bigl(Y(1), Y(0)\bigr) \perp\!\!\!\perp D \mid X.
+$$
+
+For the ATT, the weaker one-sided version $Y(0) \perp\!\!\!\perp D \mid X$
+suffices.
+
+Plain English: *once we condition on $X$, treatment assignment is as
+good as random with respect to the relevant potential outcomes.*
+
+This is a **design** assumption, not a model-fit result. A high
+predictive $R^2$, a flexible learner, or a balanced weighted sample
+cannot prove ignorability. They can only make some failures visible.
+
+### Overlap
+
+For the ATE we need $0 < e(X) < 1$ where $e(X) = \mathbb{P}(D = 1 \mid X)$.
+For the ATT we only need that every treated covariate profile has
+comparable controls.
+
+Overlap is about *support*. Balance is about *similarity* after the
+design has been applied. A weighted sample can be balanced only where
+support exists; without overlap, regression becomes extrapolation and
+IPW becomes unstable. In our simulated data:
+
+```{r fig-overlap, fig.cap="Overlap holds across the bulk of the distribution but thins out at the extremes."}
+plot_ps_overlap(df)
+```
+
+### Choosing a valid adjustment set
+
+A safe starting point: adjust for **pre-treatment** common causes of
+treatment and outcome, justified by institutional knowledge or a DAG.
+Bad controls can make adjustment worse, not better:
+
+- Post-treatment variables block part of the effect or open mediation paths.
+- Conditioning on colliders opens noncausal paths.
+- Treatment-only predictors can amplify residual confounding.
+- Some pre-treatment variables create M-bias.
+
+The rule is not "control for everything." The rule is *"control for
+variables that make the causal comparison valid without conditioning on
+consequences of treatment or colliders."*
+
+---
+
+# Five views of the same problem
+
+Every estimator below either (a) **imputes** the missing potential
+outcome from a model, (b) finds a **comparable unit** through matching
+or stratification, (c) **rebalances** the sample by weighting, or
+(d) **combines** these. The geometry differs; the identifying assumptions
+do not. Each section follows the same template:
+
+> *Intuition* → *Picture* → *Estimator (math)* → *How to compute it in R* → *When it works, when it breaks*
+
+## Outcome regression — the imputation view
+
+### Intuition
+
+If we knew $\mu_0(x) = \mathbb{E}[Y \mid D = 0, X = x]$, we could
+*impute* the missing $Y(0)$ for every treated unit and compute the ATT
+directly. Replace the unknown $\mu_0$ with a fitted $\hat\mu_0$, and
+this becomes a working estimator.
+
+### Picture
+
+```{r fig-lm, fig.cap="Outcome regression fits separate lines on treated and control. The fitted lines are extrapolated (dashed) into regions where their own group has no data."}
+plot_causal_template(df, build_lm_spec(df))
+```
+
+The dashed extensions are the source of model dependence: any estimate
+that averages over the full $X$ distribution depends on the fitted
+function in regions where one group is unsupported.
+
+### Estimator
+
+For the ATT:
+
+$$
+\hat\tau_{\text{ATT}}^{\,\text{RA}}
+\;=\; \frac{1}{n_1} \sum_{i:\, D_i = 1}
+\bigl\{ Y_i - \hat\mu_0(X_i) \bigr\}.
+$$
+
+For the ATE, fit *both* arms and average the contrast:
+
+$$
+\hat\tau_{\text{ATE}}^{\,\text{RA}}
+\;=\; \frac{1}{n} \sum_{i=1}^{n}
+\bigl\{ \hat\mu_1(X_i) - \hat\mu_0(X_i) \bigr\}.
+$$
+
+A derivation under one-sided ignorability is in Appendix A.
+
+### How to compute it in R
+
+The simplest version is a single regression with treatment as a covariate,
+using robust standard errors:
+
+```{r lm-simple}
+fit_lm <- estimatr::lm_robust(y ~ treat + x, data = df, se_type = "HC2")
+summary(fit_lm)$coefficients["treat", c("Estimate", "Std. Error")]
+```
+
+The "imputation" form is more explicit and lets you target ATT or ATE
+without forcing a constant treatment effect:
+
+```{r lm-imputation}
+# Fit each arm separately, then average the contrast.
+fit_c <- lm(y ~ poly(x, 2), data = filter(df, treat == 0))
+fit_t <- lm(y ~ poly(x, 2), data = filter(df, treat == 1))
+
+mu0 <- predict(fit_c, newdata = df)
+mu1 <- predict(fit_t, newdata = df)
+
+ate_ra <- mean(mu1 - mu0)
+att_ra <- mean((mu1 - mu0)[df$treat == 1])
+
+cat("Regression-adjustment estimates:\n",
+    "  ATE: ", round(ate_ra, 3), "\n",
+    "  ATT: ", round(att_ra, 3), sep = "")
+```
+
+### When it works, when it breaks
+
+- **Works** when the outcome model is approximately correct on the
+  support of $X$, and the support overlaps the target population.
+- **Breaks** under extrapolation: a smooth, well-fitting model can give
+  apparently precise estimates that depend entirely on a polynomial's
+  behavior outside the data cloud.
+- **Symptom of trouble**: results that shift dramatically when you
+  change polynomial degree, interactions, or learner family.
+
+## Matching and subclassification — the find-a-twin view
+
+### Intuition
+
+Instead of modeling the outcome surface, find untreated units that look
+like the treated ones and compare directly. Two variants are common:
+**propensity-score matching (PSM)** matches on the scalar $\hat e(X)$;
+**coarsened exact matching (CEM)** discretizes $X$ into bins and
+compares within bins.
+
+### Picture: PSM
+
+```{r fig-psm, fig.cap="PSM links each treated unit to its nearest control on the propensity score. Unmatched controls (faded) drop out of the comparison."}
+plot_causal_template(df, build_psm_spec(df))
+```
+
+### Picture: CEM
+
+```{r fig-cem, fig.cap="CEM partitions X into bins. Bins with both treated and control units (blue) contribute to the estimate; the rest (grey, dashed) are dropped."}
+plot_causal_template(df, build_cem_spec(df, estimand = "ATT"))
+```
+
+### Estimator
+
+For PSM (one-to-one, ATT, with replacement):
+
+$$
+\hat\tau_{\text{ATT}}^{\,\text{PSM}}
+\;=\; \frac{1}{n_1} \sum_{i:\, D_i = 1}
+\bigl( Y_i - Y_{j(i)} \bigr),
+$$
+
+where $j(i)$ is the control closest to $i$ on $\hat e(X)$.
+
+For CEM, the estimator is a weighted average of within-bin
+treated-control mean differences; bins where one arm is empty are
+discarded. This is exactly what `MatchIt::matchit(method = "cem")`
+returns when you call `match.data()` and run a weighted regression.
+
+### How to compute it in R
+
+`MatchIt` is the modern workhorse. The workflow is *match → check
+balance → estimate on the matched sample*:
+
+```{r matchit-psm}
+m_psm <- MatchIt::matchit(
+  treat ~ x,
+  data = df,
+  method = "nearest",
+  distance = "glm",
+  estimand = "ATT",
+  replace = TRUE
+)
+
+# Inspect what changed:
+summary(m_psm)$nn   # sample sizes before and after
+
+# Estimate on the matched sample with robust SEs.
+md_psm <- MatchIt::match.data(m_psm)
+fit_psm <- estimatr::lm_robust(
+  y ~ treat,
+  data    = md_psm,
+  weights = weights,
+  se_type = "HC2"
+)
+summary(fit_psm)$coefficients["treat", c("Estimate", "Std. Error")]
+```
+
+CEM follows the same pattern with `method = "cem"`:
+
+```{r matchit-cem}
+m_cem <- MatchIt::matchit(
+  treat ~ x,
+  data = df,
+  method = "cem",
+  estimand = "ATT"
+)
+
+md_cem <- MatchIt::match.data(m_cem)
+fit_cem <- estimatr::lm_robust(
+  y ~ treat,
+  data    = md_cem,
+  weights = weights,
+  se_type = "HC2"
+)
+summary(fit_cem)$coefficients["treat", c("Estimate", "Std. Error")]
+```
+
+### When it works, when it breaks
+
+- **Works** when reasonable matches exist, the estimand is the ATT,
+  and transparency to a non-technical audience matters (you can show
+  "these treated units, these control units").
+- **Breaks** as covariate dimension grows: exact matching becomes
+  infeasible; PSM forces all the information into a single dimension
+  and can throw out a lot of variation; CEM bins get sparse.
+- **Watch for**: changes in target population. If matching drops many
+  treated units (because no controls look like them), the ATT now
+  refers to a subset.
+
+## Propensity-score weighting — the rebalancing view
+
+### Intuition
+
+If treatment is "as good as random" within $X$ levels, we can
+*re-weight* the sample so that treated and control distributions look
+identical. The standard weight is the inverse probability of receiving
+one's own treatment:
+
+$$
+w_i \;=\; \frac{D_i}{e(X_i)} \;+\; \frac{1 - D_i}{1 - e(X_i)}.
+$$
+
+A weighted mean of $Y$ in each arm gives the ATE.
+
+### Picture
+
+```{r fig-ipw, fig.cap="IPW. Point size = inverse-propensity weight. Treated units in low-PS regions and controls in high-PS regions are up-weighted; the weighted regression lines (not the unweighted ones) capture the rebalanced comparison."}
+plot_causal_template(df, build_ipw_spec(df))
+```
+
+### The weight problem
+
+IPW is fragile under weak overlap. When $\hat e(X)$ is close to 0 or 1
+for some units, the corresponding weights explode and the estimate is
+driven by a handful of observations:
+
+```{r fig-ipw-weights, fig.cap="Most weights are modest, but the right tail can contain a few influential units."}
+plot_ipw_weights(df)
+```
+
+### Estimator
+
+The **Horvitz–Thompson (HT)** form is the textbook expression:
+
+$$
+\hat\tau_{\text{IPW}}^{\,\text{HT}}
+\;=\; \frac{1}{n} \sum_{i=1}^{n}
+\left\{
+\frac{D_i Y_i}{\hat e(X_i)}
+\;-\;
+\frac{(1 - D_i) Y_i}{1 - \hat e(X_i)}
+\right\}.
+$$
+
+The **Hájek** form normalizes weights to sum to one in each arm and is
+almost always more stable in finite samples:
+
+$$
+\hat\tau_{\text{IPW}}^{\,\text{H}}
+\;=\;
+\frac{\sum_i D_i Y_i / \hat e(X_i)}{\sum_i D_i / \hat e(X_i)}
+\;-\;
+\frac{\sum_i (1 - D_i) Y_i / (1 - \hat e(X_i))}{\sum_i (1 - D_i) / (1 - \hat e(X_i))}.
+$$
+
+### How to compute it in R
+
+```{r ipw-manual}
+# 1. Fit the propensity model.
+ps_model <- glm(treat ~ x, data = df, family = binomial())
+
+# 2. Compute weights, with light trimming to bound extreme values.
+df_ipw <- df %>%
+  mutate(
+    ps  = pmin(pmax(predict(ps_model, type = "response"), 0.02), 0.98),
+    ipw = if_else(treat == 1, 1 / ps, 1 / (1 - ps))
+  )
+
+# 3. Hájek-style ATE.
+mu1_hat <- with(df_ipw, sum(treat * ipw * y) / sum(treat * ipw))
+mu0_hat <- with(df_ipw, sum((1 - treat) * ipw * y) / sum((1 - treat) * ipw))
+ate_ipw_hajek <- mu1_hat - mu0_hat
+
+# 4. Or as a weighted regression with robust SEs (equivalent point
+#    estimate, plus inference):
+fit_ipw <- estimatr::lm_robust(
+  y ~ treat,
+  data    = df_ipw,
+  weights = ipw,
+  se_type = "HC2"
+)
+
+cat("Hájek IPW ATE:        ", round(ate_ipw_hajek, 3), "\n",
+    "lm_robust(weights):   ",
+    round(summary(fit_ipw)$coefficients["treat", "Estimate"], 3),
+    sep = "")
+```
+
+### When it works, when it breaks
+
+- **Works** when you trust the propensity model more than the outcome
+  model, and overlap is reasonable. The right tool when treatment
+  assignment is well-understood (e.g., randomization within strata,
+  known eligibility rules).
+- **Breaks** when propensities approach 0 or 1: a few units carry the
+  estimate, the variance is enormous, and the effective sample size is
+  much smaller than the nominal one.
+- **Watch for**: estimates that change a lot when you trim extreme
+  weights (e.g., at the 1st/99th percentile). That is the variance
+  speaking.
+
+## AIPW — combining imputation and rebalancing
+
+Regression adjustment is model-dependent. IPW is variance-fragile.
+**Augmented inverse propensity weighting (AIPW)** combines them so that
+*either* a correct outcome model *or* a correct propensity model is
+enough for consistency. That is the **double robustness** property.
+
+We tell this story two ways. **Series R** (Robinson's view) is more
+geometrically intuitive — it's what the partially-linear DML estimator
+in vignette `04_double_ml` actually computes. **Series A** is the
+literal AIPW score, which is what `causalmetrics::est_aipw()` runs.
+
+### Series R: residualize, then regress
+
+The idea: if $X$ confounds the $D$–$Y$ relationship, partial $X$ out of
+*both* $D$ and $Y$, then regress what is left.
+
+```{r fig-robinson-1, fig.height=4}
+plot_robinson_step1(df)
+```
+
+```{r fig-robinson-2, fig.height=4}
+plot_robinson_step2(df)
+```
+
+```{r fig-robinson-3, fig.height=4}
+plot_robinson_step3(df)
+```
+
+```{r fig-robinson-4, fig.height=4}
+plot_robinson_step4(df)
+```
+
+In equations, Robinson's transformation assumes the partially-linear
+model $Y = \tau D + g(X) + \varepsilon$, defines residuals
+$\tilde Y = Y - \mathbb{E}[Y \mid X]$ and $\tilde D = D - e(X)$, and
+estimates $\tau$ by
+
+$$
+\hat\tau_{\text{R}} \;=\; \frac{\sum_i \tilde D_i \, \tilde Y_i}{\sum_i \tilde D_i^{\,2}}.
+$$
+
+This is just an OLS slope of $\tilde Y$ on $\tilde D$, computed on the
+*residualized* data. The flexibility lives in how you estimate
+$\mathbb{E}[Y \mid X]$ and $e(X)$.
+
+### Series A: the classical AIPW correction
+
+The AIPW score is
+
+$$
+\psi_i \;=\;
+\underbrace{\hat\mu_1(X_i) - \hat\mu_0(X_i)}_{\text{regression imputation}}
+\;+\;
+\underbrace{\frac{D_i\{Y_i - \hat\mu_1(X_i)\}}{\hat e(X_i)}
+\;-\;
+\frac{(1 - D_i)\{Y_i - \hat\mu_0(X_i)\}}{1 - \hat e(X_i)}}_{\text{propensity-weighted residual correction}},
+$$
+
+and the AIPW estimator is $\hat\tau_{\text{AIPW}} = \frac{1}{n} \sum_i \psi_i$.
+
+```{r fig-aipw-1, fig.height=4}
+plot_aipw_step1(df)
+```
+
+```{r fig-aipw-2, fig.height=4}
+plot_aipw_step2(df)
+```
+
+```{r fig-aipw-3, fig.height=4}
+plot_aipw_step3(df)
+```
+
+```{r fig-aipw-4, fig.height=4}
+plot_aipw_step4(df)
+```
+
+**Double robustness, plainly.** If the outcome model is right,
+$Y - \hat\mu_d(X)$ has mean zero given $X$, so the correction term
+contributes nothing in expectation. If the propensity model is right,
+the weights reweight residuals to debias an incorrect outcome model.
+Either alone suffices. The Appendix walks through the algebra.
+
+This is robustness *to nuisance-model misspecification*. It is not
+robustness to hidden confounding, bad controls, missing support, or
+target-population changes after trimming.
+
+### How to compute it in R
+
+`causalmetrics::est_aipw()` evaluates the ATE score directly. It takes
+a data frame plus column names for the outcome, treatment, and three
+nuisance predictions $(\hat e, \hat\mu_0, \hat\mu_1)$ — which you can
+supply from any source: a `glm`, an `mlr3` learner, a Python pipeline,
+whatever.
+
+```{r aipw-est}
+# Fit nuisance functions (simple polynomials here; in practice
+# use cross-fitted ML — see vignette 04_double_ml).
+ps_model <- glm(treat ~ poly(x, 2), data = df, family = binomial())
+fit_c    <- lm(y ~ poly(x, 2), data = filter(df, treat == 0))
+fit_t    <- lm(y ~ poly(x, 2), data = filter(df, treat == 1))
+
+df_nuis <- df %>%
+  mutate(
+    p_hat   = pmin(pmax(predict(ps_model, newdata = ., type = "response"),
+                        0.02), 0.98),
+    mu0_hat = predict(fit_c, newdata = .),
+    mu1_hat = predict(fit_t, newdata = .)
+  )
+
+fit_aipw <- causalmetrics::est_aipw(
+  df_nuis,
+  y       = "y",
+  d       = "treat",
+  p_hat   = "p_hat",
+  mu0_hat = "mu0_hat",
+  mu1_hat = "mu1_hat"
+)
+fit_aipw
+```
+
+**Cross-fitting.** When nuisance functions are estimated with flexible
+ML, the same data points should not be used both to fit a nuisance
+function and to evaluate the score — that re-introduces overfitting bias.
+Cross-fitting splits the sample into folds and uses out-of-fold
+predictions in the score. The full DML workflow lives in
+vignette `04_double_ml`; a brief recipe is in Appendix C of this note.
+
+### When it works, when it breaks
+
+- **Works** when you want insurance against misspecifying either
+  nuisance model, and you have enough data to estimate both reasonably
+  well.
+- **Breaks** under weak overlap: AIPW inherits IPW's instability through
+  the correction term. It also breaks when *both* nuisance models are
+  badly wrong — double robustness is not omni-robustness.
+- **Watch for**: large gaps between the regression term and the AIPW
+  estimate. That gap is the correction; if it is huge, the outcome
+  model is probably misspecified somewhere it matters.
+
+### A side-by-side recap
+
+```{r fig-recap, fig.height=8, fig.width=9, fig.cap="The same data, five estimators. Different geometry, similar destination — when overlap is good and identification holds."}
+plots <- plot_all_estimators(df, cem_estimand = "ATT")
+(plots$lm | plots$psm) /
+  (plots$ipw | plots$cem) /
+  (plots$aipw | patchwork::plot_spacer())
+```
+
+When all five estimators land near the same number, you have
+*estimator-family agreement* — useful but not proof of identification.
+When they disagree sharply, treat that as a diagnostic: usually overlap
+is weak, the adjustment set is misspecified, or extrapolation is doing
+real work.
+
+> **What about meta-learners (S-, T-, X-, R-learner)?** They are the
+> CATE counterparts of the estimators in this section, resting on the
+> same identifying assumptions but targeting $\tau(x)$ rather than a
+> single number. They get a full treatment, with derivations, in
+> vignette `08_hte_and_policy_learning`.
+
+---
+
+# Practice
+
+## Choosing among them
+
+There is no universally best estimator. The mapping below is a
+starting point, not a substitute for thinking about your data:
+
+| Situation | Reach for |
+|---|---|
+| Strong overlap, smooth outcome surface, low-dimensional X | Outcome regression with robust SEs |
+| Audience wants transparent comparison; ATT is the target | PSM or CEM via `MatchIt` |
+| Assignment process is well-understood; outcome is hard to model | IPW (Hájek form), trim extreme weights |
+| Want insurance against misspecification; enough sample size | AIPW, ideally with cross-fitted ML nuisances |
+| Many high-dimensional controls | AIPW + DML (see vignette 04) |
+| Want τ(x), not just τ̄ | Meta-learners (see vignette 08) |
+
+A useful sanity-check workflow:
+
+1. Pick the estimand (ATE vs ATT) first; let it constrain everything else.
+2. Run **two or three** estimators from different families on the same data.
+3. If they agree, report your preferred one and note the agreement.
+4. If they disagree, do **not** pick the convenient one. Diagnose
+   overlap, balance, and the adjustment set before continuing.
+
+## Diagnostics in practice
+
+A credible selection-on-observables analysis reports diagnostics
+*before* interpreting an effect.
+
+### Overlap
+
+Already shown: a propensity-score histogram by treatment group
+(Figure in §3.2). Look for mass in both groups across the propensity
+range. Trim, restrict to common support, or change the estimand if
+overlap is weak.
+
+### Balance after design
+
+Standardized mean differences (SMDs) on each covariate, before vs.
+after matching/weighting:
+
+```{r fig-balance, fig.height=3.5, fig.cap="Standardized mean differences before any adjustment, after PSM, and after weighting by IPW."}
+# Prepare three samples to compare.
+samples <- list(
+  "Raw"        = df %>% select(treat, x),
+  "After PSM"  = md_psm %>% select(treat, x),
+  "After IPW"  = df_ipw %>% select(treat, x)   # SMD computed unweighted here for simplicity
+)
+plot_balance(samples, vars = "x")
+```
+
+Common rules of thumb: $|\text{SMD}| < 0.1$ is good, $0.1$–$0.25$ is
+borderline, $> 0.25$ is poor. These are guidelines, not laws.
+
+### Weight stability
+
+The IPW weight histogram (§6) is the most direct diagnostic. Report the
+maximum weight, the share of total weight carried by the top 1% of
+observations, and any trimming rule.
+
+### Estimator-family comparison
+
+Run the same estimand through at least two families. The recap figure
+at the end of §7 is exactly this diagnostic at one glance.
+
+### Placebo and sensitivity
+
+- **Placebo outcomes**: outcomes the treatment *cannot* plausibly affect
+  should yield null effects. A nonzero placebo estimate is evidence
+  against ignorability.
+- **Sensitivity analysis** (e.g., Rosenbaum bounds, E-values): asks how
+  strong an unobserved confounder would have to be to overturn the
+  result. Useful precisely because unconfoundedness is untestable.
+
+## Failure modes
+
+The recurring ones, in rough order of how often they bite:
+
+- **No overlap.** Treated units have no comparable controls or vice versa.
+- **Hidden confounding.** Observed $X$ does not span the assignment
+  process. No estimator in this family can fix it.
+- **Bad controls.** A post-treatment or collider variable in the
+  adjustment set blocks part of the effect or opens noncausal paths.
+- **Model dependence.** Estimates shift with functional form, polynomial
+  degree, or learner choice. Often signals weak overlap.
+- **Unstable weights.** A handful of observations dominate IPW or AIPW.
+- **Target drift.** Trimming and matching change the population the
+  estimate refers to. Report it.
+- **A precise estimate of the wrong object.** Modern estimators can
+  agree on the statistical estimand while leaving the *causal* estimand
+  unidentified.
+
+  ## Replication anchors and checklist
+
+The companion replications use two empirical anchors. **Imbens and Xu
+(2025)** revisit LaLonde's job-training benchmark: modern methods can
+reduce model dependence once overlap is improved, but placebo tests
+show that observational adjustment may still fail as causal evidence.
+**Li and Derdenger (2026)** treat the introduction of NIL rights in
+college football as a selection-on-observables design and use AIPW/IPW
+to compare pre- vs. post-NIL recruits.
+
+A minimal replication checklist:
+
+1. State the causal question and estimand (ATE vs ATT vs CATE).
+2. Define $Y(1), Y(0), D, X$ and the observed-outcome relation.
+3. Defend the adjustment set as pre-treatment and causally valid.
+4. State consistency, ignorability, and overlap explicitly.
+5. Check overlap before trusting any adjusted estimate.
+6. Estimate nuisance functions flexibly when you have the sample size.
+7. Report balance after matching/weighting.
+8. Compare estimators from at least two families.
+9. Run a placebo and/or formal sensitivity analysis.
+10. State how trimming or matching changed the target population.
+
+---
+
+# Appendices
+
+## Appendix A: Identification derivations
+
+### A.1 Regression adjustment for the ATT
+
+Starting from the definition,
+
+$$
+\tau_{\text{ATT}}
+\;=\; \mathbb{E}[Y(1) - Y(0) \mid D = 1]
+\;=\; \mathbb{E}[Y \mid D = 1] - \mathbb{E}[Y(0) \mid D = 1].
+$$
+
+Apply iterated expectations to the unobserved term:
+
+$$
+\mathbb{E}[Y(0) \mid D = 1]
+\;=\; \mathbb{E}\bigl\{ \mathbb{E}[Y(0) \mid D = 1, X] \;\big|\; D = 1 \bigr\}.
+$$
+
+Under one-sided ignorability $Y(0) \perp\!\!\!\perp D \mid X$ and
+consistency,
+
+$$
+\mathbb{E}[Y(0) \mid D = 1, X]
+\;=\; \mathbb{E}[Y(0) \mid D = 0, X]
+\;=\; \mathbb{E}[Y \mid D = 0, X]
+\;=\; \mu_0(X).
+$$
+
+Therefore,
+
+$$
+\tau_{\text{ATT}}
+\;=\; \mathbb{E}[Y \mid D = 1] - \mathbb{E}[\mu_0(X) \mid D = 1],
+$$
+
+with sample analogue
+
+$$
+\hat\tau_{\text{ATT}}^{\,\text{RA}}
+\;=\; \frac{1}{n_1} \sum_{i:\, D_i = 1}
+\bigl\{ Y_i - \hat\mu_0(X_i) \bigr\}.
+$$
+
+### A.2 The AIPW score
+
+Define the score
+
+$$
+\psi(\eta)
+\;=\; \mu_1(X) - \mu_0(X)
+\;+\; \frac{D\{Y - \mu_1(X)\}}{e(X)}
+\;-\; \frac{(1 - D)\{Y - \mu_0(X)\}}{1 - e(X)},
+\qquad \eta = (\mu_0, \mu_1, e).
+$$
+
+At the true nuisance values $\eta_0$,
+
+$$
+\mathbb{E}[\psi(\eta_0)] \;=\; \tau_{\text{ATE}}.
+$$
+
+To see double robustness, write the bias of the score under
+misspecified $\eta = (\tilde\mu_0, \tilde\mu_1, \tilde e)$:
+
+$$
+\mathbb{E}[\psi(\eta)] - \tau_{\text{ATE}}
+\;=\; \mathbb{E}\!\left[
+\left(1 - \frac{e_0(X)}{\tilde e(X)}\right) \{\mu_1^0(X) - \tilde\mu_1(X)\}
+\;-\;
+\left(1 - \frac{1 - e_0(X)}{1 - \tilde e(X)}\right) \{\mu_0^0(X) - \tilde\mu_0(X)\}
+\right],
+$$
+
+where superscripts indicate truth. The bias vanishes whenever
+$\tilde\mu_d = \mu_d^0$ *or* $\tilde e = e_0$. That is the doubly robust
+property in algebra.
+
+## Appendix B: AIPW influence-function standard error
+
+With $\hat\psi_i = \psi_i(\hat\eta)$ and $\hat\tau = n^{-1} \sum_i \hat\psi_i$,
+
+$$
+\widehat{\text{SE}}(\hat\tau)
+\;=\; \sqrt{\frac{1}{n(n-1)} \sum_{i=1}^{n} (\hat\psi_i - \hat\tau)^2}.
+$$
+
+When nuisance functions come from flexible learners, use cross-fitting
+or another orthogonalized workflow for valid inference; otherwise the
+influence-function SE under-states uncertainty.
+
+## Appendix C: Cross-fitting workflow
+
+A minimal design pattern for AIPW with flexible nuisance models:
+
+1. Split the sample into $K$ folds, stratified by treatment.
+2. For each fold $k$: train $\hat e$, $\hat\mu_0$, $\hat\mu_1$ on the
+   *other* $K - 1$ folds; predict on fold $k$.
+3. Assemble out-of-fold predictions $(\hat e_i, \hat\mu_{0,i}, \hat\mu_{1,i})$
+   for every $i$.
+4. Plug into the AIPW score and average.
+
+Cross-fitting reduces sensitivity to first-stage overfitting; it does
+*not* create overlap, validate the adjustment set, or remove
+unobserved confounding. The full DML pipeline lives in vignette
+`04_double_ml`.
+
+---
+
+## References
+
+- Abadie, Alberto, and Guido W. Imbens. 2006. "Large Sample Properties of Matching Estimators for Average Treatment Effects." *Econometrica*.
+- Athey, Susan, Julie Tibshirani, and Stefan Wager. 2019. "Generalized Random Forests." *Annals of Statistics*.
+- Bang, Heejung, and James M. Robins. 2005. "Doubly Robust Estimation in Missing Data and Causal Inference Models." *Biometrics*.
+- Chernozhukov, Victor, et al. 2018. "Double/Debiased Machine Learning for Treatment and Structural Parameters." *The Econometrics Journal*.
+- Ho, Daniel E., Kosuke Imai, Gary King, and Elizabeth A. Stuart. 2011. "MatchIt: Nonparametric Preprocessing for Parametric Causal Inference." *Journal of Statistical Software*.
+- Imbens, Guido W., and Yiqing Xu. 2025. "Comparing Experimental and Nonexperimental Methods: What Lessons Have We Learned Four Decades after LaLonde (1986)?" *Journal of Economic Perspectives*.
+- Li, Ivan, and Tim Derdenger. 2026. "Does Personalized Pricing Increase Competition? Evidence from NIL in College Football." *Management Science*.
+- Robinson, Peter M. 1988. "Root-N-Consistent Semiparametric Regression." *Econometrica*.
+- Robins, James M., Andrea Rotnitzky, and Lue Ping Zhao. 1994. "Estimation of Regression Coefficients When Some Regressors Are Not Always Observed." *Journal of the American Statistical Association*.
+- Rosenbaum, Paul R., and Donald B. Rubin. 1983. "The Central Role of the Propensity Score in Observational Studies for Causal Effects." *Biometrika*.

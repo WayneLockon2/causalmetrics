@@ -1,0 +1,382 @@
+---
+title: "Using est_aipw() with external (Python) nuisance predictions"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using est_aipw() with external Python nuisance predictions}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(causalmetrics)
+
+# ---- locate Python and the bundled predictor script ----------------------
+# python_bin <- Sys.which("python3")
+python_bin <- "/opt/anaconda3/bin/python"
+if (!nzchar(python_bin)) python_bin <- Sys.which("python")
+
+py_script <- system.file(
+  "vignette_helpers", "03_Selection_on_Observables", "nuisance_predictor.py",
+  package = "causalmetrics"
+)
+
+# Decide whether to run the Python chunks. We require:
+#   (a) a python interpreter on PATH,
+#   (b) the bundled script to exist,
+#   (c) the script's runtime deps (pandas, numpy, sklearn) to import.
+.python_ok <- function() {
+  if (!nzchar(python_bin) || !nzchar(py_script)) return(FALSE)
+  status <- suppressWarnings(system2(
+    python_bin,
+    args   = c("-c", shQuote("import pandas, numpy, sklearn")),
+    stdout = FALSE, stderr = FALSE
+  ))
+  identical(as.integer(status), 0L)
+}
+run_python <- .python_ok()
+```
+
+```{r status-note, echo=FALSE, results="asis"}
+if (run_python) {
+  cat(
+    "> **Status:** Python detected at `", python_bin,
+    "`; the external-predictor chunks will run for real.\n",
+    sep = ""
+  )
+} else {
+  cat(
+    "> **Status:** No working Python found (need Python 3 with `pandas`, ",
+    "`numpy`, and `scikit-learn`). The external-predictor chunks below are ",
+    "shown for reference but not executed. The R-only cross-check still runs.\n",
+    sep = ""
+  )
+}
+```
+
+## What this vignette does
+
+`causalmetrics::est_aipw()` separates *what the estimator does* (compute the
+AIPW score, its standard error, and overlap diagnostics) from *how the
+nuisance functions* — propensity $e(X)$ and outcome regressions $\mu_0(X),
+\mu_1(X)$ — are produced. As long as something hands the estimator a data
+frame with out-of-fold predictions in the expected columns, the estimator
+does not care whether those predictions came from base R, `mlr3`, `tidymodels`,
+PyTorch, or a corporate ML platform.
+
+This vignette walks through the canonical external-predictor workflow using
+the Python script bundled with the package. The same pattern applies to any
+producer that respects the contract laid out below.
+
+When you might want this:
+
+- the most appropriate learner for your problem lives in Python (recent
+  `sklearn` estimators, `xgboost` with custom objectives, a fine-tuned
+  PyTorch model);
+- your team already has a Python ML pipeline you want to reuse instead of
+  rewriting in R;
+- the nuisance fitting is heavy enough to deserve a separate, possibly
+  remote, compute environment;
+- you want reproducibility from a CI pipeline that already produces a CSV.
+
+## The contract
+
+The R-side estimator consumes a single data frame. Whatever produces the
+nuisance predictions must emit rows in the same order as the input data with
+at least the following columns:
+
+| Column      | Type        | Required | Meaning                                                                 |
+|-------------|-------------|----------|-------------------------------------------------------------------------|
+| `y`         | numeric     | yes      | observed outcome                                                        |
+| `d`         | $\{0, 1\}$  | yes      | observed binary treatment                                               |
+| `p_hat`     | $(0, 1)$    | yes      | out-of-fold propensity: $\hat e(X_i) = \hat{\mathbb{P}}(D_i = 1 \mid X_i)$ |
+| `mu0_hat`   | numeric     | yes      | out-of-fold control-arm outcome regression $\hat\mu_0(X_i)$             |
+| `mu1_hat`   | numeric     | yes      | out-of-fold treated-arm outcome regression $\hat\mu_1(X_i)$             |
+| `fold_id`   | integer     | optional | which fold $i$ was held out in; recorded in diagnostics if supplied     |
+
+Two requirements that are *not* visible in the column list but matter:
+
+1. **Out-of-fold.** Predictions for row $i$ must come from a model that did
+   not see row $i$ during training. Reusing in-fold predictions reintroduces
+   the overfitting bias that AIPW + cross-fitting is designed to avoid.
+   When `cross_fit = FALSE`, `est_aipw()` trusts the caller on this point —
+   it has no way to check.
+2. **Arm-specific outcome fits.** `mu0_hat` should come from a model trained
+   only on controls in the training folds; `mu1_hat` should come from a
+   model trained only on treated units in the training folds. (This is the
+   T-learner convention. S-learner-style joint models also work but require
+   slightly different handling, beyond the scope of this vignette.)
+
+Things the predictor is *not* responsible for: propensity clipping (handled
+by `est_aipw(p_clip = ...)`), identification, choice of estimand, or
+inference.
+
+## A simulated example
+
+We use a small linear-treatment, mildly nonlinear-confounding DGP so we can
+verify the answer is close to the true ATE of 2:
+
+```{r simulate-data}
+set.seed(1)
+n   <- 1000
+x1  <- rnorm(n)
+x2  <- rbinom(n, 1, 0.5)
+p   <- plogis(-0.2 + 0.6 * x1 - 0.4 * x2)
+d   <- rbinom(n, 1, p)
+mu0 <- 1 + x1 + x2
+tau <- 2
+y   <- mu0 + tau * d + rnorm(n)
+
+dat <- data.frame(y = y, d = d, x1 = x1, x2 = x2)
+str(dat)
+```
+
+## Calling the bundled Python predictor
+
+The script lives under `inst/vignette_helpers/03_Selection_on_Observables/`
+inside the installed package and is discoverable via `system.file()`. The
+calling pattern is: write a CSV, invoke the script via `system2()`, read
+the augmented CSV back in.
+
+```{r locate-script}
+py_script   # path to nuisance_predictor.py
+python_bin  # path to python interpreter
+```
+
+```{r call-python, eval=run_python}
+tmp_in  <- tempfile(fileext = ".csv")
+tmp_out <- tempfile(fileext = ".csv")
+on.exit(unlink(c(tmp_in, tmp_out)), add = TRUE)
+
+data.table::fwrite(dat, tmp_in)
+
+status <- system2(
+  command = python_bin,
+  args = c(
+    shQuote(py_script),
+    "--input",  shQuote(tmp_in),
+    "--output", shQuote(tmp_out),
+    "--y",      "y",
+    "--d",      "d",
+    "--x",      "x1,x2",
+    "--folds",  "5",
+    "--seed",   "1"
+  )
+)
+if (!identical(as.integer(status), 0L)) {
+  stop("Python predictor failed with exit status ", status, ".")
+}
+
+augmented <- data.table::fread(tmp_out)
+head(augmented)
+```
+
+```{r call-python-fallback, eval=!run_python, echo=FALSE}
+message(
+  "Skipping Python call. The next 'sanity checks' and 'run AIPW with ",
+  "Python nuisances' sections will also be skipped. The R-only ",
+  "cross-check at the end demonstrates the same workflow without Python."
+)
+```
+
+## Sanity-checking what Python returned
+
+Before running the estimator, look at the columns Python produced. Three
+quick checks catch the majority of broken-pipeline failures:
+
+```{r sanity-1, eval=run_python}
+# 1. No missing nuisance predictions, no malformed propensity scores.
+augmented[, .(
+  n_rows      = .N,
+  na_p_hat    = sum(is.na(p_hat)),
+  na_mu0      = sum(is.na(mu0_hat)),
+  na_mu1      = sum(is.na(mu1_hat)),
+  p_min       = round(min(p_hat), 3),
+  p_max       = round(max(p_hat), 3)
+)]
+```
+
+```{r sanity-2, eval=run_python}
+# 2. Fold sizes look balanced and stratified by treatment.
+augmented[, .(n = .N, n_treated = sum(d), n_control = sum(1 - d)),
+          by = fold_id][order(fold_id)]
+```
+
+```{r sanity-3, eval=run_python, fig.height=3, fig.cap="Propensity-score overlap on the Python-produced p_hat. Mass in both groups across the support means overlap is reasonable."}
+ggplot(augmented, aes(x = p_hat, fill = factor(d), color = factor(d))) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 25, alpha = 0.55, position = "identity") +
+  scale_fill_manual(values = c("0" = "#F5C4B3", "1" = "#B5D4F4"),
+                    labels = c("Control", "Treated"), name = NULL) +
+  scale_color_manual(values = c("0" = "#993C1D", "1" = "#185FA5"),
+                     labels = c("Control", "Treated"), name = NULL) +
+  labs(x = "p_hat (out-of-fold propensity)", y = "Density") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+If any of these fail — NAs in nuisance columns, propensities pinned at 0/1,
+fold sizes wildly unequal — go back to the predictor before running AIPW.
+The estimator can't tell good nuisances from bad ones.
+
+## Running `est_aipw()` with the Python nuisances
+
+Since Python already did the cross-fitting, set `cross_fit = FALSE` and pass
+`fold_id` so the diagnostics record which fold each unit was held out on.
+
+```{r run-aipw, eval=run_python}
+fit_py <- est_aipw(
+  data      = augmented,
+  y         = "y",
+  d         = "d",
+  p_hat     = "p_hat",
+  mu0_hat   = "mu0_hat",
+  mu1_hat   = "mu1_hat",
+  fold_id   = "fold_id",
+  cross_fit = FALSE,
+  p_clip    = c(0.01, 0.99)
+)
+
+fit_py
+```
+
+The returned object carries the point estimate, an influence-function SE,
+overlap diagnostics, and (if supplied) a per-fold breakdown:
+
+```{r aipw-diag, eval=run_python}
+str(fit_py$diagnostics, max.level = 2)
+```
+
+Use the per-fold summary to spot a fold that drives the estimate — a sign
+the nuisance model is unstable on that subsample.
+
+## An R-only cross-check on the same data
+
+The pattern above is not Python-specific. Below we produce nuisance
+predictions in base R using logistic regression for the propensity and
+ordinary least squares for the outcome regressions, with manual stratified
+$K$-fold cross-fitting. This both demonstrates the contract is genuinely
+language-agnostic and gives a reference point for the Python estimate.
+
+```{r r-only-crossfit}
+k <- 5
+set.seed(1)
+
+# Stratified folds by treatment so each fold has both arms.
+fold_id <- integer(nrow(dat))
+fold_id[dat$d == 1] <- sample(rep(seq_len(k), length.out = sum(dat$d == 1)))
+fold_id[dat$d == 0] <- sample(rep(seq_len(k), length.out = sum(dat$d == 0)))
+
+p_hat   <- numeric(nrow(dat))
+mu0_hat <- numeric(nrow(dat))
+mu1_hat <- numeric(nrow(dat))
+
+for (j in seq_len(k)) {
+  train <- dat[fold_id != j, ]
+  test  <- dat[fold_id == j, ]
+
+  ps_fit  <- glm(d ~ x1 + x2, data = train, family = binomial())
+  mu0_fit <- lm (y ~ x1 + x2, data = subset(train, d == 0))
+  mu1_fit <- lm (y ~ x1 + x2, data = subset(train, d == 1))
+
+  p_hat  [fold_id == j] <- predict(ps_fit,  newdata = test, type = "response")
+  mu0_hat[fold_id == j] <- predict(mu0_fit, newdata = test)
+  mu1_hat[fold_id == j] <- predict(mu1_fit, newdata = test)
+}
+
+dat_r <- cbind(dat,
+               p_hat = p_hat, mu0_hat = mu0_hat,
+               mu1_hat = mu1_hat, fold_id = fold_id)
+
+fit_r <- est_aipw(
+  data      = dat_r,
+  y         = "y",
+  d         = "d",
+  p_hat     = "p_hat",
+  mu0_hat   = "mu0_hat",
+  mu1_hat   = "mu1_hat",
+  fold_id   = "fold_id",
+  cross_fit = FALSE,
+  p_clip    = c(0.01, 0.99)
+)
+fit_r
+```
+
+```{r compare-estimates, eval=run_python}
+# Side-by-side comparison.
+data.frame(
+  source   = c("Python (sklearn)", "R (glm + lm)", "Truth"),
+  estimate = c(fit_py$estimate, fit_r$estimate, tau),
+  se       = c(fit_py$se,       fit_r$se,       NA_real_)
+)
+```
+
+Both producers respect the same contract, so both estimates target the same
+estimand. Differences between them reflect the choice of learner, not the
+estimator: the sklearn pipeline uses `HistGradientBoostingRegressor` for the
+outcome surface, which captures any mild nonlinearity better than OLS at
+the cost of a bit of variance; the R baseline uses linear models, which are
+correctly specified for this DGP and therefore unbiased. On a real dataset
+the two will rarely agree to three decimals — that is a feature, not a bug.
+
+## When to use this pattern
+
+- You want to plug an existing Python ML stack into the estimator without
+  rewriting it in R.
+- The right learner for your data only lives in the Python ecosystem
+  (recent `sklearn` releases, PyTorch-based deep models, `lightgbm` with
+  custom configurations).
+- Nuisance training is heavy and lives on a separate machine, GPU node, or
+  CI job that already emits a CSV.
+- You want the predictor versioned and tested *separately* from the
+  estimator. With this contract you can swap in a new predictor, rerun the
+  estimator, and compare estimates without touching the R-side code.
+
+## Caveats and extensions
+
+**File I/O has overhead.** A `tempfile()` round-trip is fine for one-shot
+analysis; for repeated calls inside an optimization loop or a Shiny app
+use `reticulate` to call the predictor in-process. The contract is
+identical — only the transport changes.
+
+**The Python script is a reference, not a mandate.** Anything that emits a
+CSV with the contract's columns plugs in. Swap `HistGradientBoostingRegressor`
+for `xgboost`, a fine-tuned PyTorch model, or a calibrated random forest;
+the R side does not change. The bundled script's source is available at
+`r ifelse(nzchar(py_script), py_script, "(installed-package path)")`.
+
+**Cross-fitting is the caller's responsibility when `cross_fit = FALSE`.**
+If you produce predictions outside R, you also produce the folds. The
+`fold_id` column exists so `est_aipw()` can report per-fold diagnostics, not
+because it does any sample-splitting itself in this mode.
+
+**Sample-size strata for binary covariates.** If a covariate level appears
+in only one treatment arm in a training fold, the arm-specific outcome
+regression will refuse to fit (or fit and refuse to predict on unseen
+levels). Either drop the level, pool it, or use a learner that handles
+unseen categories — the bundled script raises a clear error rather than
+producing silent garbage.
+
+**Same workflow for other languages.** Julia, Spark, an internal REST API —
+any producer that emits a CSV with the right columns plugs in unchanged.
+The contract is the integration point.
+
+## Related material
+
+- The method itself, with derivations and visualizations, lives in
+  `vignettes/lectures/03_selection_on_observables/`.
+- The cross-fitting workflow with R-native ML learners (`mlr3`, `grf`,
+  `glmnet`) is covered in `vignettes/lectures/04_double_ml/`.
+- The bundled Python script's source is at
+  `inst/vignette_helpers/03_Selection_on_Observables/nuisance_predictor.py`.
