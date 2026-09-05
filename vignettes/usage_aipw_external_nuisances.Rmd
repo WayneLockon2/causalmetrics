@@ -5,7 +5,7 @@ output:
     toc: true
     toc_depth: 2
 vignette: >
-  %\VignetteIndexEntry{Using est_aipw() with external Python nuisance predictions}
+  %\VignetteIndexEntry{Using est_aipw() with external (Python) nuisance predictions}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---
@@ -23,29 +23,30 @@ knitr::opts_chunk$set(
 library(causalmetrics)
 
 # ---- locate Python and the bundled predictor script ----------------------
-# python_bin <- Sys.which("python3")
-python_bin <- "/opt/anaconda3/bin/python"
-if (!nzchar(python_bin)) python_bin <- Sys.which("python")
+py_script <- system.file("python", "nuisance_predictor.py", package = "causalmetrics")
 
-py_script <- system.file(
-  "vignette_helpers", "03_Selection_on_Observables", "nuisance_predictor.py",
-  package = "causalmetrics"
-)
-
-# Decide whether to run the Python chunks. We require:
-#   (a) a python interpreter on PATH,
-#   (b) the bundled script to exist,
-#   (c) the script's runtime deps (pandas, numpy, sklearn) to import.
-.python_ok <- function() {
-  if (!nzchar(python_bin) || !nzchar(py_script)) return(FALSE)
+# Decide whether to run the Python chunks. We need an interpreter whose
+# runtime deps (pandas, numpy, scikit-learn) import cleanly. Candidates are
+# tried in order; set CAUSALMETRICS_PYTHON to point at a specific one.
+.python_has_deps <- function(bin) {
+  if (!nzchar(bin) || !file.exists(bin)) return(FALSE)
   status <- suppressWarnings(system2(
-    python_bin,
+    bin,
     args   = c("-c", shQuote("import pandas, numpy, sklearn")),
     stdout = FALSE, stderr = FALSE
   ))
   identical(as.integer(status), 0L)
 }
-run_python <- .python_ok()
+python_candidates <- unique(c(
+  Sys.getenv("CAUSALMETRICS_PYTHON", unset = ""),
+  unname(Sys.which("python3")),
+  unname(Sys.which("python")),
+  "/opt/anaconda3/bin/python"
+))
+python_candidates <- python_candidates[nzchar(python_candidates)]
+python_ok  <- vapply(python_candidates, .python_has_deps, logical(1))
+python_bin <- if (any(python_ok)) python_candidates[python_ok][[1]] else ""
+run_python <- nzchar(python_bin) && nzchar(py_script)
 ```
 
 ```{r status-note, echo=FALSE, results="asis"}
@@ -144,8 +145,10 @@ str(dat)
 
 ## Calling the bundled Python predictor
 
-The script lives under `inst/vignette_helpers/03_Selection_on_Observables/`
-inside the installed package and is discoverable via `system.file()`. The
+The script lives under `inst/python/` inside the installed package and is
+discoverable via `system.file()`. Its default `--model irm` writes the columns
+used here; `--model plr` writes `l_hat` and `m_hat` for the partially linear
+model of `est_dml()` (see `vignette("usage_dml_external_nuisances")`). The
 calling pattern is: write a CSV, invoke the script via `system2()`, read
 the augmented CSV back in.
 
@@ -154,10 +157,9 @@ py_script   # path to nuisance_predictor.py
 python_bin  # path to python interpreter
 ```
 
-```{r call-python, eval=run_python}
+```{r call-python, eval=run_python, purl=FALSE}
 tmp_in  <- tempfile(fileext = ".csv")
 tmp_out <- tempfile(fileext = ".csv")
-on.exit(unlink(c(tmp_in, tmp_out)), add = TRUE)
 
 data.table::fwrite(dat, tmp_in)
 
@@ -195,7 +197,7 @@ message(
 Before running the estimator, look at the columns Python produced. Three
 quick checks catch the majority of broken-pipeline failures:
 
-```{r sanity-1, eval=run_python}
+```{r sanity-1, eval=run_python, purl=FALSE}
 # 1. No missing nuisance predictions, no malformed propensity scores.
 augmented[, .(
   n_rows      = .N,
@@ -207,13 +209,13 @@ augmented[, .(
 )]
 ```
 
-```{r sanity-2, eval=run_python}
+```{r sanity-2, eval=run_python, purl=FALSE}
 # 2. Fold sizes look balanced and stratified by treatment.
 augmented[, .(n = .N, n_treated = sum(d), n_control = sum(1 - d)),
           by = fold_id][order(fold_id)]
 ```
 
-```{r sanity-3, eval=run_python, fig.height=3, fig.cap="Propensity-score overlap on the Python-produced p_hat. Mass in both groups across the support means overlap is reasonable."}
+```{r sanity-3, eval=run_python, purl=FALSE, fig.height=3, fig.cap="Propensity-score overlap on the Python-produced p_hat. Mass in both groups across the support means overlap is reasonable."}
 ggplot(augmented, aes(x = p_hat, fill = factor(d), color = factor(d))) +
   geom_histogram(aes(y = after_stat(density)),
                  bins = 25, alpha = 0.55, position = "identity") +
@@ -235,7 +237,7 @@ The estimator can't tell good nuisances from bad ones.
 Since Python already did the cross-fitting, set `cross_fit = FALSE` and pass
 `fold_id` so the diagnostics record which fold each unit was held out on.
 
-```{r run-aipw, eval=run_python}
+```{r run-aipw, eval=run_python, purl=FALSE}
 fit_py <- est_aipw(
   data      = augmented,
   y         = "y",
@@ -254,7 +256,7 @@ fit_py
 The returned object carries the point estimate, an influence-function SE,
 overlap diagnostics, and (if supplied) a per-fold breakdown:
 
-```{r aipw-diag, eval=run_python}
+```{r aipw-diag, eval=run_python, purl=FALSE}
 str(fit_py$diagnostics, max.level = 2)
 ```
 
@@ -313,12 +315,12 @@ fit_r <- est_aipw(
 fit_r
 ```
 
-```{r compare-estimates, eval=run_python}
+```{r compare-estimates, eval=run_python, purl=FALSE}
 # Side-by-side comparison.
 data.frame(
   source   = c("Python (sklearn)", "R (glm + lm)", "Truth"),
   estimate = c(fit_py$estimate, fit_r$estimate, tau),
-  se       = c(fit_py$se,       fit_r$se,       NA_real_)
+  se       = c(fit_py$std.error, fit_r$std.error, NA_real_)
 )
 ```
 
@@ -374,9 +376,10 @@ The contract is the integration point.
 
 ## Related material
 
-- The method itself, with derivations and visualizations, lives in
-  `vignettes/lectures/03_selection_on_observables/`.
-- The cross-fitting workflow with R-native ML learners (`mlr3`, `grf`,
-  `glmnet`) is covered in `vignettes/lectures/04_double_ml/`.
-- The bundled Python script's source is at
-  `inst/vignette_helpers/03_Selection_on_Observables/nuisance_predictor.py`.
+- The method itself, with derivations and visualizations, lives in the
+  lecture vignette `vignette("lecture_03_selection_on_observables")`.
+- The cross-fitting workflow with R-native ML learners is covered in
+  `vignette("usage_dml_external_nuisances")` and in the Section 04 lecture.
+- The bundled Python script's source is at `inst/python/nuisance_predictor.py`.
+- `vignette("usage_dml_external_nuisances")` covers the same contract for
+  `est_dml()`, including the partially linear model and repeated cross-fitting.

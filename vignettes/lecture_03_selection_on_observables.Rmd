@@ -16,7 +16,7 @@ output:
     number_sections: true
     fig_caption: true
 vignette: >
-  %\VignetteIndexEntry{Selection on Observables}
+  %\VignetteIndexEntry{causalmetrics: Selection on Observables}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 link-citations: true
@@ -667,7 +667,7 @@ A credible selection-on-observables analysis reports diagnostics
 ### Overlap
 
 Already shown: a propensity-score histogram by treatment group
-(Figure in §3.2). Look for mass in both groups across the propensity
+(Figure \@ref(fig:fig-overlap)). Look for mass in both groups across the propensity
 range. Trim, restrict to common support, or change the estimand if
 overlap is weak.
 
@@ -691,14 +691,13 @@ borderline, $> 0.25$ is poor. These are guidelines, not laws.
 
 ### Weight stability
 
-The IPW weight histogram (§6) is the most direct diagnostic. Report the
+The IPW weight histogram (Figure \@ref(fig:fig-ipw-weights)) is the most direct diagnostic. Report the
 maximum weight, the share of total weight carried by the top 1% of
 observations, and any trimming rule.
 
 ### Estimator-family comparison
 
-Run the same estimand through at least two families. The recap figure
-at the end of §7 is exactly this diagnostic at one glance.
+Run the same estimand through at least two families. Figure \@ref(fig:fig-recap) is exactly this diagnostic at one glance.
 
 ### Placebo and sensitivity
 
@@ -727,15 +726,17 @@ The recurring ones, in rough order of how often they bite:
   agree on the statistical estimand while leaving the *causal* estimand
   unidentified.
 
-  ## Replication anchors and checklist
+## Replication anchors and checklist
 
-The companion replications use two empirical anchors. **Imbens and Xu
-(2025)** revisit LaLonde's job-training benchmark: modern methods can
-reduce model dependence once overlap is improved, but placebo tests
-show that observational adjustment may still fail as causal evidence.
-**Li and Derdenger (2026)** treat the introduction of NIL rights in
-college football as a selection-on-observables design and use AIPW/IPW
-to compare pre- vs. post-NIL recruits.
+The companion replication in `inst/replications/03_Selection_on_Observables/`
+uses **Imbens and Xu (2025)**, who revisit LaLonde's job-training
+benchmark: modern methods can reduce model dependence once overlap is
+improved, but placebo tests show that observational adjustment may still
+fail as causal evidence. A second anchor, **Li and Derdenger (2026)**,
+treats the introduction of NIL rights in college football as a
+selection-on-observables design and uses AIPW/IPW to compare pre- vs.
+post-NIL recruits; that replication is planned but not yet part of the
+package.
 
 A minimal replication checklist:
 

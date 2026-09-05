@@ -345,7 +345,7 @@ This section defines the timing, variables, and subgroup cells needed to interpr
 
 The unit of observation is an individual loyalty-program customer who completed a June 2014 post-stay satisfaction survey. The treatment assignment is review solicitation, randomized after survey completion. The endogenous treatment is actual review posting, which occurs only after solicitation or non-solicitation status is realized.
 
-![](Figures/karaman-2025-the-asymmetric-effects-of-posting-an-online-review-on-future-spending-and-the-dark-side-of-solicitations.jpeg)
+![](Figures/karaman_timeline.jpeg)
 
 * Pre-period: spending history before the June 2014 stay and survey.
 * Assignment point: customer completes the June 2014 survey and is randomly solicited or not solicited to post a review.
