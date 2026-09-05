@@ -169,10 +169,10 @@ wrap_latex_table <- function(tbl,
 
 #' Strip an outer table environment if present
 #'
-#' Removes \begin{table}[...] ... \end{table} wrapping from a LaTeX string
-#' if the string is wrapped in one. Also strips any inner \centering and
-#' \caption{}/\label{} since wrap_latex_table rebuilds those from
-#' user-supplied arguments.
+#' Removes an outer `\\begin{table}` ... `\\end{table}` wrapper (with any
+#' placement option) from a LaTeX string if the string is wrapped in one. Also
+#' strips an inner `\\centering` and any `\\caption{}`/`\\label{}`, since
+#' `wrap_latex_table()` rebuilds those from user-supplied arguments.
 #'
 #' @param tex Character. LaTeX source.
 #' @return Character. Same string with outer table env removed if present.

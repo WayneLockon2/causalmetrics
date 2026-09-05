@@ -2,7 +2,7 @@
 % Please edit documentation in R/est-aipw.R
 \name{est_aipw}
 \alias{est_aipw}
-\title{Augmented inverse propensity weighting for binary-treatment ATEs}
+\title{Augmented inverse propensity weighting for binary-treatment ATE and ATT}
 \usage{
 est_aipw(
   data,
@@ -37,10 +37,12 @@ logical, or character/factor values coercible to 0/1.}
 
 \item{x}{Character vector of pre-treatment covariate column names used when
 nuisance predictions are estimated internally. May be \code{NULL} when all of
-\code{p_hat}, \code{mu0_hat}, and \code{mu1_hat} are supplied.}
+the required nuisance predictions are supplied.}
 
-\item{estimand}{Character scalar. Currently only \code{"ATE"} is implemented.
-ATT and overlap-weighted targets are planned extensions.}
+\item{estimand}{Character scalar: \code{"ATE"} (default) or \code{"ATT"}. The ATT
+score uses only the propensity score and the untreated outcome regression,
+so \code{mu1_hat} is neither required nor estimated for it. Overlap-weighted
+targets are a planned extension.}
 
 \item{p_hat}{Optional propensity-score predictions. Either a numeric vector
 of length \code{nrow(data)} or a character scalar naming a column in \code{data}.}
@@ -51,7 +53,7 @@ vector of length \code{nrow(data)} or a character scalar naming a column in
 
 \item{mu1_hat}{Optional predictions for \verb{E[Y | D = 1, X]}. Either a numeric
 vector of length \code{nrow(data)} or a character scalar naming a column in
-\code{data}.}
+\code{data}. Ignored when \code{estimand = "ATT"}.}
 
 \item{learner_p}{Optional \code{mlr3} learner for the propensity score. If omitted
 and \code{p_hat} is not supplied, \code{mlr3::lrn("classif.log_reg")} is used when
@@ -80,7 +82,7 @@ not recommended.}
 
 \item{trim}{Optional numeric length-two vector. If supplied, observations with
 raw propensity scores outside \verb{[trim[1], trim[2]]} are dropped before the
-AIPW score is computed. Trimming changes the target population.}
+score is computed. Trimming changes the target population.}
 
 \item{outcome_type}{One of \code{"auto"}, \code{"continuous"}, or \code{"binary"}. The
 value matters only when a classification learner is used for outcome
@@ -95,15 +97,17 @@ required variables or supplied nuisance predictions are dropped.}
 }
 \value{
 A list with class \code{cm_aipw} containing \code{estimate}, \code{std.error},
-confidence limits, nuisance predictions, AIPW scores, residual weights,
-fold ids, diagnostics, and the matched call.
+confidence limits, nuisance predictions, the score, residual weights,
+fold ids, diagnostics, and the matched call. \code{\link[generics:tidy]{tidy()}} and \code{\link[generics:glance]{glance()}}
+methods are available, so the object works with \code{modelsummary}.
 }
 \description{
-\code{est_aipw()} estimates the average treatment effect (ATE) for a binary
-treatment under selection on observables. The estimator combines outcome
-regression predictions, propensity-score predictions, and inverse-propensity
-residual corrections. It can use user-supplied nuisance predictions or fit
-nuisance functions with \code{mlr3} learners, including cross-fitting.
+\code{est_aipw()} estimates the average treatment effect (ATE) or the average
+treatment effect on the treated (ATT) of a binary treatment under selection
+on observables. The estimator combines outcome regression predictions,
+propensity-score predictions, and inverse-propensity residual corrections.
+It can use user-supplied nuisance predictions or fit nuisance functions with
+\code{mlr3} learners, including cross-fitting.
 }
 \details{
 This function deliberately owns only the causal-estimation layer. Machine
@@ -111,16 +115,25 @@ learning is used only to produce nuisance predictions. To use Python or any
 external prediction engine, generate out-of-fold predictions externally and
 pass them through \code{p_hat}, \code{mu0_hat}, and \code{mu1_hat}.
 
-For observations \verb{i = 1, ..., n}, the AIPW score is
+\code{est_aipw()} is the interactive-regression-model special case of
+\code{\link[=est_dml]{est_dml()}}: \code{est_dml(model = "irm")} with the same nuisances and folds
+returns the same estimate and standard error.
 
-\code{mu1_hat(X_i) - mu0_hat(X_i) + D_i * (Y_i - mu1_hat(X_i)) / p_hat(X_i) - (1 - D_i) * (Y_i - mu0_hat(X_i)) / (1 - p_hat(X_i))}.
+For observations \verb{i = 1, ..., n}, the ATE score is
 
-The estimate is the sample mean of this score. The reported standard error is
-the influence-function standard error, \code{sd(score) / sqrt(n)}. Double
-robustness is about nuisance-model misspecification: consistency can survive
-if either the propensity score or the outcome regressions are correctly
-specified. It is not robustness to unobserved confounding, bad adjustment
-sets, or lack of overlap.
+\code{mu1_hat(X_i) - mu0_hat(X_i) + D_i * (Y_i - mu1_hat(X_i)) / p_hat(X_i) - (1 - D_i) * (Y_i - mu0_hat(X_i)) / (1 - p_hat(X_i))},
+
+and the ATT score is
+
+\code{(D_i - (1 - D_i) * p_hat(X_i) / (1 - p_hat(X_i))) * (Y_i - mu0_hat(X_i)) / mean(D)}.
+
+In both cases the estimate is the sample mean of the score. The reported
+standard error is the influence-function standard error with an \code{n - 1}
+denominator; for the ATE it equals \code{sd(score) / sqrt(n)}. Double robustness
+is about nuisance-model misspecification: consistency can survive if either
+the propensity score or the outcome regressions are correctly specified. It
+is not robustness to unobserved confounding, bad adjustment sets, or lack of
+overlap.
 }
 \examples{
 set.seed(1)
@@ -138,19 +151,27 @@ dat <- data.frame(y = y, d = d, x1 = x1, x2 = x2,
 est_aipw(dat, y = "y", d = "d", p_hat = "p",
          mu0_hat = "mu0", mu1_hat = "mu1")
 
-\dontrun{
-library(mlr3)
-library(mlr3learners)
-est_aipw(
-  dat,
-  y = "y",
-  d = "d",
-  x = c("x1", "x2"),
-  learner_p = lrn("classif.log_reg", predict_type = "prob"),
-  learner_mu0 = lrn("regr.lm"),
-  learner_mu1 = lrn("regr.lm"),
-  folds = 5,
-  seed = 1
-)
+# The ATT needs only the propensity score and the untreated regression.
+est_aipw(dat, y = "y", d = "d", estimand = "ATT",
+         p_hat = "p", mu0_hat = "mu0")
+
+# Internal nuisance estimation with cross-fitted mlr3 learners.
+if (requireNamespace("mlr3", quietly = TRUE) &&
+    requireNamespace("mlr3learners", quietly = TRUE)) {
+  est_aipw(
+    dat,
+    y = "y",
+    d = "d",
+    x = c("x1", "x2"),
+    learner_p = mlr3::lrn("classif.log_reg", predict_type = "prob"),
+    learner_mu0 = mlr3::lrn("regr.lm"),
+    learner_mu1 = mlr3::lrn("regr.lm"),
+    folds = 5,
+    seed = 1
+  )
 }
+}
+\seealso{
+\code{\link[=est_dml]{est_dml()}} for the partially linear model and the general
+double machine learning interface.
 }

@@ -6,6 +6,15 @@
 \usage{
 .cm_detect_conflicts(pkgs)
 }
+\arguments{
+\item{pkgs}{Character vector of package names. Only packages currently on
+the search path are compared.}
+}
+\value{
+Character vector of conflict descriptions such as
+\code{"filter(): dplyr masks stats"}, or \code{character(0)} when fewer than two of
+the packages are attached or no names overlap.
+}
 \description{
 Detect function name conflicts between attached packages
 }

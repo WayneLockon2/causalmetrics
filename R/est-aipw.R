@@ -1,15 +1,20 @@
-#' Augmented inverse propensity weighting for binary-treatment ATEs
+#' Augmented inverse propensity weighting for binary-treatment ATE and ATT
 #'
-#' `est_aipw()` estimates the average treatment effect (ATE) for a binary
-#' treatment under selection on observables. The estimator combines outcome
-#' regression predictions, propensity-score predictions, and inverse-propensity
-#' residual corrections. It can use user-supplied nuisance predictions or fit
-#' nuisance functions with `mlr3` learners, including cross-fitting.
+#' `est_aipw()` estimates the average treatment effect (ATE) or the average
+#' treatment effect on the treated (ATT) of a binary treatment under selection
+#' on observables. The estimator combines outcome regression predictions,
+#' propensity-score predictions, and inverse-propensity residual corrections.
+#' It can use user-supplied nuisance predictions or fit nuisance functions with
+#' `mlr3` learners, including cross-fitting.
 #'
 #' This function deliberately owns only the causal-estimation layer. Machine
 #' learning is used only to produce nuisance predictions. To use Python or any
 #' external prediction engine, generate out-of-fold predictions externally and
 #' pass them through `p_hat`, `mu0_hat`, and `mu1_hat`.
+#'
+#' `est_aipw()` is the interactive-regression-model special case of
+#' [est_dml()]: `est_dml(model = "irm")` with the same nuisances and folds
+#' returns the same estimate and standard error.
 #'
 #' @param data A data frame or `data.table`.
 #' @param y Character scalar. Outcome column name.
@@ -17,9 +22,11 @@
 #'   logical, or character/factor values coercible to 0/1.
 #' @param x Character vector of pre-treatment covariate column names used when
 #'   nuisance predictions are estimated internally. May be `NULL` when all of
-#'   `p_hat`, `mu0_hat`, and `mu1_hat` are supplied.
-#' @param estimand Character scalar. Currently only `"ATE"` is implemented.
-#'   ATT and overlap-weighted targets are planned extensions.
+#'   the required nuisance predictions are supplied.
+#' @param estimand Character scalar: `"ATE"` (default) or `"ATT"`. The ATT
+#'   score uses only the propensity score and the untreated outcome regression,
+#'   so `mu1_hat` is neither required nor estimated for it. Overlap-weighted
+#'   targets are a planned extension.
 #' @param p_hat Optional propensity-score predictions. Either a numeric vector
 #'   of length `nrow(data)` or a character scalar naming a column in `data`.
 #' @param mu0_hat Optional predictions for `E[Y | D = 0, X]`. Either a numeric
@@ -27,7 +34,7 @@
 #'   `data`.
 #' @param mu1_hat Optional predictions for `E[Y | D = 1, X]`. Either a numeric
 #'   vector of length `nrow(data)` or a character scalar naming a column in
-#'   `data`.
+#'   `data`. Ignored when `estimand = "ATT"`.
 #' @param learner_p Optional `mlr3` learner for the propensity score. If omitted
 #'   and `p_hat` is not supplied, `mlr3::lrn("classif.log_reg")` is used when
 #'   `mlr3` and `mlr3learners` are installed.
@@ -48,7 +55,7 @@
 #'   not recommended.
 #' @param trim Optional numeric length-two vector. If supplied, observations with
 #'   raw propensity scores outside `[trim[1], trim[2]]` are dropped before the
-#'   AIPW score is computed. Trimming changes the target population.
+#'   score is computed. Trimming changes the target population.
 #' @param outcome_type One of `"auto"`, `"continuous"`, or `"binary"`. The
 #'   value matters only when a classification learner is used for outcome
 #'   nuisance estimation.
@@ -58,21 +65,28 @@
 #'   required variables or supplied nuisance predictions are dropped.
 #'
 #' @return A list with class `cm_aipw` containing `estimate`, `std.error`,
-#'   confidence limits, nuisance predictions, AIPW scores, residual weights,
-#'   fold ids, diagnostics, and the matched call.
+#'   confidence limits, nuisance predictions, the score, residual weights,
+#'   fold ids, diagnostics, and the matched call. [tidy()] and [glance()]
+#'   methods are available, so the object works with `modelsummary`.
 #'
 #' @details
-#' For observations `i = 1, ..., n`, the AIPW score is
+#' For observations `i = 1, ..., n`, the ATE score is
 #'
 #' `mu1_hat(X_i) - mu0_hat(X_i) + D_i * (Y_i - mu1_hat(X_i)) / p_hat(X_i) -
-#' (1 - D_i) * (Y_i - mu0_hat(X_i)) / (1 - p_hat(X_i))`.
+#' (1 - D_i) * (Y_i - mu0_hat(X_i)) / (1 - p_hat(X_i))`,
 #'
-#' The estimate is the sample mean of this score. The reported standard error is
-#' the influence-function standard error, `sd(score) / sqrt(n)`. Double
-#' robustness is about nuisance-model misspecification: consistency can survive
-#' if either the propensity score or the outcome regressions are correctly
-#' specified. It is not robustness to unobserved confounding, bad adjustment
-#' sets, or lack of overlap.
+#' and the ATT score is
+#'
+#' `(D_i - (1 - D_i) * p_hat(X_i) / (1 - p_hat(X_i))) * (Y_i - mu0_hat(X_i)) /
+#' mean(D)`.
+#'
+#' In both cases the estimate is the sample mean of the score. The reported
+#' standard error is the influence-function standard error with an `n - 1`
+#' denominator; for the ATE it equals `sd(score) / sqrt(n)`. Double robustness
+#' is about nuisance-model misspecification: consistency can survive if either
+#' the propensity score or the outcome regressions are correctly specified. It
+#' is not robustness to unobserved confounding, bad adjustment sets, or lack of
+#' overlap.
 #'
 #' @examples
 #' set.seed(1)
@@ -90,21 +104,27 @@
 #' est_aipw(dat, y = "y", d = "d", p_hat = "p",
 #'          mu0_hat = "mu0", mu1_hat = "mu1")
 #'
-#' \dontrun{
-#' library(mlr3)
-#' library(mlr3learners)
-#' est_aipw(
-#'   dat,
-#'   y = "y",
-#'   d = "d",
-#'   x = c("x1", "x2"),
-#'   learner_p = lrn("classif.log_reg", predict_type = "prob"),
-#'   learner_mu0 = lrn("regr.lm"),
-#'   learner_mu1 = lrn("regr.lm"),
-#'   folds = 5,
-#'   seed = 1
-#' )
+#' # The ATT needs only the propensity score and the untreated regression.
+#' est_aipw(dat, y = "y", d = "d", estimand = "ATT",
+#'          p_hat = "p", mu0_hat = "mu0")
+#'
+#' # Internal nuisance estimation with cross-fitted mlr3 learners.
+#' if (requireNamespace("mlr3", quietly = TRUE) &&
+#'     requireNamespace("mlr3learners", quietly = TRUE)) {
+#'   est_aipw(
+#'     dat,
+#'     y = "y",
+#'     d = "d",
+#'     x = c("x1", "x2"),
+#'     learner_p = mlr3::lrn("classif.log_reg", predict_type = "prob"),
+#'     learner_mu0 = mlr3::lrn("regr.lm"),
+#'     learner_mu1 = mlr3::lrn("regr.lm"),
+#'     folds = 5,
+#'     seed = 1
+#'   )
 #' }
+#' @seealso [est_dml()] for the partially linear model and the general
+#'   double machine learning interface.
 #' @export
 est_aipw <- function(data,
                      y,
@@ -136,9 +156,12 @@ est_aipw <- function(data,
   if (!.cm_is_string(y) || !.cm_is_string(d)) {
     stop("`y` and `d` must be character scalars naming columns in `data`.", call. = FALSE)
   }
+  if (!.cm_is_string(estimand)) {
+    stop("`estimand` must be \"ATE\" or \"ATT\".", call. = FALSE)
+  }
   estimand <- toupper(estimand)
-  if (!identical(estimand, "ATE")) {
-    stop("Only estimand = 'ATE' is implemented. ATT and overlap-weighted targets are planned extensions.", call. = FALSE)
+  if (!estimand %in% c("ATE", "ATT")) {
+    stop("`estimand` must be \"ATE\" or \"ATT\". Overlap-weighted targets are a planned extension.", call. = FALSE)
   }
   if (!is.logical(cross_fit) || length(cross_fit) != 1L || is.na(cross_fit)) {
     stop("`cross_fit` must be TRUE or FALSE.", call. = FALSE)
@@ -148,7 +171,7 @@ est_aipw <- function(data,
     stop("`conf_level` must be a number between 0 and 1.", call. = FALSE)
   }
 
-  dt0 <- data.table::copy(data.table::as.data.table(data))
+  dt0 <- as.data.frame(data)
   n0 <- nrow(dt0)
   if (n0 < 2L) {
     stop("`data` must contain at least two rows.", call. = FALSE)
@@ -187,12 +210,12 @@ est_aipw <- function(data,
 
   p_supplied <- .cm_get_optional_numeric(p_hat, dt0, n0, "p_hat")
   mu0_supplied <- .cm_get_optional_numeric(mu0_hat, dt0, n0, "mu0_hat")
-  mu1_supplied <- .cm_get_optional_numeric(mu1_hat, dt0, n0, "mu1_hat")
+  mu1_supplied <- if (estimand == "ATE") .cm_get_optional_numeric(mu1_hat, dt0, n0, "mu1_hat") else NULL
   fid_supplied <- .cm_get_optional_vector(fold_id, dt0, n0, "fold_id")
 
   need_p <- is.null(p_supplied)
   need_mu0 <- is.null(mu0_supplied)
-  need_mu1 <- is.null(mu1_supplied)
+  need_mu1 <- estimand == "ATE" && is.null(mu1_supplied)
   need_learners <- need_p || need_mu0 || need_mu1
 
   if (need_learners && length(x) == 0L) {
@@ -218,7 +241,7 @@ est_aipw <- function(data,
     warning(n_missing, " row(s) omitted because of missing or non-finite required values.", call. = FALSE)
   }
 
-  dt <- dt0[keep]
+  dt <- dt0[keep, , drop = FALSE]
   y_vec <- as.numeric(y_vec[keep])
   d_vec <- d_vec[keep]
   if (!is.null(p_supplied)) p_supplied <- p_supplied[keep]
@@ -238,11 +261,14 @@ est_aipw <- function(data,
     stop("Both treated and control observations are required.", call. = FALSE)
   }
 
-  work <- data.table::data.table(.cm_y = y_vec, .cm_d = d_vec, .cm_row_id = seq_along(y_vec))
-  if (length(x) > 0L) {
-    for (xj in x) {
-      work[, (xj) := dt[[xj]]]
-    }
+  work <- data.frame(
+    .cm_y = y_vec,
+    .cm_d = d_vec,
+    .cm_row_id = seq_along(y_vec),
+    check.names = FALSE
+  )
+  for (xj in x) {
+    work[[xj]] <- dt[[xj]]
   }
 
   if (!is.null(fid_supplied)) {
@@ -266,7 +292,7 @@ est_aipw <- function(data,
   nuisance_source <- list(
     p_hat = if (need_p) NA_character_ else "supplied",
     mu0_hat = if (need_mu0) NA_character_ else "supplied",
-    mu1_hat = if (need_mu1) NA_character_ else "supplied"
+    mu1_hat = if (estimand == "ATT") "not needed for ATT" else if (need_mu1) NA_character_ else "supplied"
   )
 
   if (need_learners) {
@@ -300,11 +326,11 @@ est_aipw <- function(data,
 
   p_raw <- as.numeric(p_supplied)
   mu0 <- as.numeric(mu0_supplied)
-  mu1 <- as.numeric(mu1_supplied)
+  mu1 <- if (estimand == "ATE") as.numeric(mu1_supplied) else NULL
 
   .cm_check_finite(p_raw, "p_hat")
   .cm_check_finite(mu0, "mu0_hat")
-  .cm_check_finite(mu1, "mu1_hat")
+  if (estimand == "ATE") .cm_check_finite(mu1, "mu1_hat")
   if (any(p_raw < 0 | p_raw > 1)) {
     stop("`p_hat` must be between 0 and 1 before clipping.", call. = FALSE)
   }
@@ -322,7 +348,7 @@ est_aipw <- function(data,
     d_vec <- d_vec[trim_keep]
     p_raw <- p_raw[trim_keep]
     mu0 <- mu0[trim_keep]
-    mu1 <- mu1[trim_keep]
+    if (!is.null(mu1)) mu1 <- mu1[trim_keep]
     fold_vec <- fold_vec[trim_keep]
   }
   if (length(y_vec) < 2L || sum(d_vec == 1L) == 0L || sum(d_vec == 0L) == 0L) {
@@ -341,17 +367,22 @@ est_aipw <- function(data,
     stop("Propensity scores must be strictly between 0 and 1 after clipping. Use nonzero clipping bounds.", call. = FALSE)
   }
 
-  score <- (mu1 - mu0) +
-    d_vec * (y_vec - mu1) / p -
-    (1 - d_vec) * (y_vec - mu0) / (1 - p)
-  estimate <- mean(score)
-  std_error <- stats::sd(score) / sqrt(length(score))
+  psi <- .cm_score_irm(y_vec, d_vec, p, mu0, mu1, estimand)
+  solution <- .cm_solve_linear_score(psi$a, psi$b, fold_vec, solve = "pooled")
+  score <- psi$b
+  estimate <- solution$estimate
+  std_error <- solution$std.error
   z <- stats::qnorm(1 - (1 - conf_level) / 2)
   conf_low <- estimate - z * std_error
   conf_high <- estimate + z * std_error
 
-  w_treated <- d_vec / p
-  w_control <- (1 - d_vec) / (1 - p)
+  if (estimand == "ATE") {
+    w_treated <- d_vec / p
+    w_control <- (1 - d_vec) / (1 - p)
+  } else {
+    w_treated <- d_vec
+    w_control <- (1 - d_vec) * p / (1 - p)
+  }
   weights <- data.table::data.table(
     treated = w_treated,
     control = w_control,
@@ -394,9 +425,10 @@ est_aipw <- function(data,
       prediction_mode = if (need_learners && cross_fit) "out_of_fold" else if (need_learners) "full_sample" else "supplied",
       outcome_type = outcome_type,
       mu0_summary = .cm_summary(mu0),
-      mu1_summary = .cm_summary(mu1),
+      mu1_summary = if (!is.null(mu1)) .cm_summary(mu1) else NULL,
       fold_summary = fold_summary
-    )
+    ),
+    fold_estimates = solution$fold_estimates
   )
 
   out <- list(
@@ -406,6 +438,8 @@ est_aipw <- function(data,
     conf.high = unname(conf_high),
     conf.level = conf_level,
     estimand = estimand,
+    outcome = y,
+    treatment = d,
     n = length(y_vec),
     n_treated = sum(d_vec == 1L),
     n_control = sum(d_vec == 0L),
@@ -422,6 +456,12 @@ est_aipw <- function(data,
   out
 }
 
+#' Print method for `cm_aipw` objects
+#'
+#' @param x A `cm_aipw` object returned by [est_aipw()].
+#' @param ... Unused.
+#' @return `x`, invisibly.
+#' @keywords internal
 #' @export
 print.cm_aipw <- function(x, ...) {
   cat("AIPW estimate (", x$estimand, ")\n", sep = "")
@@ -436,126 +476,7 @@ print.cm_aipw <- function(x, ...) {
   invisible(x)
 }
 
-.cm_is_string <- function(x) {
-  is.character(x) && length(x) == 1L && !is.na(x) && nzchar(x)
-}
-
-.cm_check_column <- function(column, data) {
-  if (!column %in% names(data)) {
-    stop("Column `", column, "` not found in `data`.", call. = FALSE)
-  }
-  invisible(TRUE)
-}
-
-.cm_as_binary <- function(x, nm) {
-  if (is.logical(x)) {
-    out <- as.integer(x)
-  } else if (is.factor(x)) {
-    out <- suppressWarnings(as.integer(as.character(x)))
-  } else if (is.character(x)) {
-    out <- suppressWarnings(as.integer(x))
-  } else if (is.numeric(x) || is.integer(x)) {
-    if (any(!is.na(x) & !(x %in% c(0, 1)))) {
-      stop("`", nm, "` must be binary with values 0 and 1.", call. = FALSE)
-    }
-    out <- as.integer(x)
-  } else {
-    stop("`", nm, "` must be binary with values 0 and 1.", call. = FALSE)
-  }
-  if (any(is.na(out) & !is.na(x)) || !all(out[!is.na(out)] %in% c(0L, 1L))) {
-    stop("`", nm, "` must be binary with values 0 and 1.", call. = FALSE)
-  }
-  out
-}
-
-.cm_get_optional_vector <- function(arg, data, n, nm) {
-  if (is.null(arg)) return(NULL)
-  if (.cm_is_string(arg)) {
-    .cm_check_column(arg, data)
-    return(data[[arg]])
-  }
-  if (length(arg) != n) {
-    stop("`", nm, "` must be length nrow(data) or a column name.", call. = FALSE)
-  }
-  arg
-}
-
-.cm_get_optional_numeric <- function(arg, data, n, nm) {
-  vec <- .cm_get_optional_vector(arg, data, n, nm)
-  if (is.null(vec)) return(NULL)
-  if (!is.numeric(vec) && !is.integer(vec)) {
-    stop("`", nm, "` must be numeric or a numeric column name.", call. = FALSE)
-  }
-  as.numeric(vec)
-}
-
-.cm_check_finite <- function(x, nm) {
-  if (length(x) == 0L || any(!is.finite(x))) {
-    stop("`", nm, "` contains missing or non-finite values.", call. = FALSE)
-  }
-  invisible(TRUE)
-}
-
-.cm_check_bounds <- function(x, nm, strict) {
-  if (!is.numeric(x) || length(x) != 2L || any(!is.finite(x))) {
-    stop("`", nm, "` must be a numeric vector of length two.", call. = FALSE)
-  }
-  if (x[1L] >= x[2L] || x[1L] < 0 || x[2L] > 1) {
-    stop("`", nm, "` must satisfy 0 <= lower < upper <= 1.", call. = FALSE)
-  }
-  if (strict && (x[1L] <= 0 || x[2L] >= 1)) {
-    stop("`", nm, "` must use bounds strictly inside (0, 1).", call. = FALSE)
-  }
-  x
-}
-
-.cm_make_folds <- function(d, folds, seed) {
-  if (!is.numeric(folds) || length(folds) != 1L || !is.finite(folds)) {
-    stop("`folds` must be a positive integer.", call. = FALSE)
-  }
-  folds <- as.integer(folds)
-  if (folds < 2L) {
-    stop("`folds` must be at least 2 when cross_fit = TRUE.", call. = FALSE)
-  }
-  if (folds > length(d)) {
-    stop("`folds` cannot exceed the number of complete observations.", call. = FALSE)
-  }
-  if (sum(d == 1L) < 2L || sum(d == 0L) < 2L) {
-    stop("At least two treated and two control observations are required for cross-fitting.", call. = FALSE)
-  }
-  if (!is.null(seed)) {
-    old_seed <- if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) .Random.seed else NULL
-    on.exit({
-      if (is.null(old_seed)) {
-        if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
-          rm(".Random.seed", envir = .GlobalEnv)
-        }
-      } else {
-        assign(".Random.seed", old_seed, envir = .GlobalEnv)
-      }
-    }, add = TRUE)
-    set.seed(seed)
-  }
-  out <- integer(length(d))
-  for (val in c(0L, 1L)) {
-    ids <- which(d == val)
-    out[ids] <- sample(rep(seq_len(folds), length.out = length(ids)))
-  }
-  out
-}
-
-.cm_default_learner <- function(which) {
-  if (!requireNamespace("mlr3", quietly = TRUE) ||
-      !requireNamespace("mlr3learners", quietly = TRUE)) {
-    stop("Internal nuisance estimation requires packages `mlr3` and `mlr3learners`, or supply p_hat, mu0_hat, and mu1_hat directly.", call. = FALSE)
-  }
-  if (identical(which, "p")) {
-    mlr3::lrn("classif.log_reg", predict_type = "prob")
-  } else {
-    mlr3::lrn("regr.lm")
-  }
-}
-
+# Cross-fitted (or full-sample) nuisance predictions for est_aipw().
 .cm_learn_nuisances <- function(work,
                                 features,
                                 fold_id,
@@ -567,94 +488,44 @@ print.cm_aipw <- function(x, ...) {
                                 learner_mu0,
                                 learner_mu1,
                                 outcome_type) {
-  if (!requireNamespace("mlr3", quietly = TRUE)) {
-    stop("Internal nuisance estimation requires package `mlr3`.", call. = FALSE)
-  }
-  if (need_p && is.null(learner_p)) learner_p <- .cm_default_learner("p")
-  if (need_mu0 && is.null(learner_mu0)) learner_mu0 <- .cm_default_learner("mu")
-  if (need_mu1 && is.null(learner_mu1)) learner_mu1 <- .cm_default_learner("mu")
+  .cm_require_mlr3()
+  if (need_p && is.null(learner_p)) learner_p <- .cm_default_learner("classif")
+  if (need_mu0 && is.null(learner_mu0)) learner_mu0 <- .cm_default_learner("regr")
+  if (need_mu1 && is.null(learner_mu1)) learner_mu1 <- .cm_default_learner("regr")
+  positive_y <- if (outcome_type == "binary") "1" else NULL
+  mode <- if (cross_fit) "mlr3_out_of_fold" else "mlr3_full_sample"
 
-  n <- nrow(work)
-  p_hat <- rep(NA_real_, n)
-  mu0_hat <- rep(NA_real_, n)
-  mu1_hat <- rep(NA_real_, n)
-  rows <- list()
+  p_hat <- NULL
+  mu0_hat <- NULL
+  mu1_hat <- NULL
+  fold_summary <- NULL
 
-  if (cross_fit) {
-    folds <- sort(unique(fold_id))
-    for (k in folds) {
-      test_idx <- which(fold_id == k)
-      train_idx <- which(fold_id != k)
-      train <- work[train_idx]
-      test <- work[test_idx]
-      if (need_p) {
-        .cm_check_two_groups(train$.cm_d, "propensity learner training fold")
-        p_hat[test_idx] <- .cm_predict_mlr3(
-          learner = learner_p,
-          train = train,
-          test = test,
-          target = ".cm_d",
-          features = features,
-          positive = "1",
-          task_hint = "propensity"
-        )
-      }
-      if (need_mu0) {
-        train0 <- train[.cm_d == 0L]
-        if (nrow(train0) == 0L) stop("A training fold has no controls for mu0 estimation.", call. = FALSE)
-        mu0_hat[test_idx] <- .cm_predict_mlr3(
-          learner = learner_mu0,
-          train = train0,
-          test = test,
-          target = ".cm_y",
-          features = features,
-          positive = if (outcome_type == "binary") "1" else NULL,
-          task_hint = "outcome"
-        )
-      }
-      if (need_mu1) {
-        train1 <- train[.cm_d == 1L]
-        if (nrow(train1) == 0L) stop("A training fold has no treated observations for mu1 estimation.", call. = FALSE)
-        mu1_hat[test_idx] <- .cm_predict_mlr3(
-          learner = learner_mu1,
-          train = train1,
-          test = test,
-          target = ".cm_y",
-          features = features,
-          positive = if (outcome_type == "binary") "1" else NULL,
-          task_hint = "outcome"
-        )
-      }
-      rows[[length(rows) + 1L]] <- data.frame(
-        fold = as.integer(k),
-        train_n = length(train_idx),
-        test_n = length(test_idx),
-        training_excludes_test = TRUE
-      )
-    }
-  } else {
-    train <- work
-    test <- work
-    if (need_p) {
-      .cm_check_two_groups(train$.cm_d, "propensity learner training sample")
-      p_hat <- .cm_predict_mlr3(learner_p, train, test, ".cm_d", features, "1", "propensity")
-    }
-    if (need_mu0) {
-      train0 <- train[.cm_d == 0L]
-      mu0_hat <- .cm_predict_mlr3(learner_mu0, train0, test, ".cm_y", features,
-                                  if (outcome_type == "binary") "1" else NULL, "outcome")
-    }
-    if (need_mu1) {
-      train1 <- train[.cm_d == 1L]
-      mu1_hat <- .cm_predict_mlr3(learner_mu1, train1, test, ".cm_y", features,
-                                  if (outcome_type == "binary") "1" else NULL, "outcome")
-    }
-    rows[[1L]] <- data.frame(
-      fold = 1L,
-      train_n = n,
-      test_n = n,
-      training_excludes_test = FALSE
+  if (need_p) {
+    fit <- .cm_crossfit_predict(
+      work, ".cm_d", features, learner_p, fold_id, cross_fit,
+      positive = "1", task_hint = "propensity",
+      what = "the propensity score"
     )
+    p_hat <- fit$pred
+    fold_summary <- fit$fold_summary
+  }
+  if (need_mu0) {
+    fit <- .cm_crossfit_predict(
+      work, ".cm_y", features, learner_mu0, fold_id, cross_fit,
+      subset = work$.cm_d == 0L, positive = positive_y, task_hint = "outcome",
+      what = "mu0 estimation (no controls in a training fold)"
+    )
+    mu0_hat <- fit$pred
+    if (is.null(fold_summary)) fold_summary <- fit$fold_summary
+  }
+  if (need_mu1) {
+    fit <- .cm_crossfit_predict(
+      work, ".cm_y", features, learner_mu1, fold_id, cross_fit,
+      subset = work$.cm_d == 1L, positive = positive_y, task_hint = "outcome",
+      what = "mu1 estimation (no treated observations in a training fold)"
+    )
+    mu1_hat <- fit$pred
+    if (is.null(fold_summary)) fold_summary <- fit$fold_summary
   }
 
   list(
@@ -662,110 +533,10 @@ print.cm_aipw <- function(x, ...) {
     mu0_hat = mu0_hat,
     mu1_hat = mu1_hat,
     source = list(
-      p_hat = if (need_p) if (cross_fit) "mlr3_out_of_fold" else "mlr3_full_sample" else "supplied",
-      mu0_hat = if (need_mu0) if (cross_fit) "mlr3_out_of_fold" else "mlr3_full_sample" else "supplied",
-      mu1_hat = if (need_mu1) if (cross_fit) "mlr3_out_of_fold" else "mlr3_full_sample" else "supplied"
+      p_hat = if (need_p) mode else "supplied",
+      mu0_hat = if (need_mu0) mode else "supplied",
+      mu1_hat = if (need_mu1) mode else "supplied"
     ),
-    fold_summary = do.call(rbind, rows)
-  )
-}
-
-.cm_check_two_groups <- function(d, where) {
-  if (sum(d == 1L) == 0L || sum(d == 0L) == 0L) {
-    stop("The ", where, " must contain both treatment groups.", call. = FALSE)
-  }
-  invisible(TRUE)
-}
-
-.cm_predict_mlr3 <- function(learner,
-                             train,
-                             test,
-                             target,
-                             features,
-                             positive = NULL,
-                             task_hint = c("propensity", "outcome")) {
-  task_hint <- match.arg(task_hint)
-  if (is.null(learner) || is.null(learner$task_type)) {
-    stop("Learners must be valid `mlr3` learner objects.", call. = FALSE)
-  }
-  learner_i <- learner$clone(deep = TRUE)
-  cols <- c(target, features)
-  train_df <- as.data.frame(train[, cols, with = FALSE])
-  test_df <- as.data.frame(test[, features, with = FALSE])
-
-  if (identical(learner_i$task_type, "classif")) {
-    if (is.null(positive)) {
-      stop("Classification outcome learners require binary `outcome_type`.", call. = FALSE)
-    }
-    train_df[[target]] <- factor(as.character(train_df[[target]]), levels = c("0", "1"))
-    if (length(unique(stats::na.omit(train_df[[target]]))) < 2L) {
-      stop("Classification learner training data must contain both outcome classes.", call. = FALSE)
-    }
-    if (!("prob" %in% learner_i$predict_types)) {
-      stop("Classification learners must support predict_type = 'prob'.", call. = FALSE)
-    }
-    learner_i$predict_type <- "prob"
-    task <- mlr3::TaskClassif$new(
-      id = paste0("cm_", task_hint),
-      backend = train_df,
-      target = target,
-      positive = positive
-    )
-    learner_i$train(task)
-    pred <- learner_i$predict_newdata(test_df)
-    probs <- pred$prob
-    if (is.null(probs) || !(positive %in% colnames(probs))) {
-      stop("Could not extract positive-class probabilities from learner predictions.", call. = FALSE)
-    }
-    return(as.numeric(probs[, positive]))
-  }
-
-  if (identical(learner_i$task_type, "regr")) {
-    train_df[[target]] <- as.numeric(train_df[[target]])
-    task <- mlr3::TaskRegr$new(
-      id = paste0("cm_", task_hint),
-      backend = train_df,
-      target = target
-    )
-    learner_i$train(task)
-    pred <- learner_i$predict_newdata(test_df)
-    return(as.numeric(pred$response))
-  }
-
-  stop("Learner task_type must be 'classif' or 'regr'.", call. = FALSE)
-}
-
-.cm_summary <- function(x) {
-  x <- as.numeric(x)
-  c(
-    min = min(x),
-    q01 = stats::quantile(x, 0.01, names = FALSE, type = 7),
-    q05 = stats::quantile(x, 0.05, names = FALSE, type = 7),
-    median = stats::median(x),
-    mean = mean(x),
-    q95 = stats::quantile(x, 0.95, names = FALSE, type = 7),
-    q99 = stats::quantile(x, 0.99, names = FALSE, type = 7),
-    max = max(x)
-  )
-}
-
-.cm_ess <- function(w) {
-  w <- as.numeric(w)
-  if (length(w) == 0L || sum(w^2) == 0) return(NA_real_)
-  sum(w)^2 / sum(w^2)
-}
-
-.cm_common_support <- function(p, d) {
-  p1 <- p[d == 1L]
-  p0 <- p[d == 0L]
-  low <- max(min(p1), min(p0))
-  high <- min(max(p1), max(p0))
-  outside <- p < low | p > high
-  list(
-    low = low,
-    high = high,
-    share_outside = mean(outside),
-    treated_share_outside = mean(outside[d == 1L]),
-    control_share_outside = mean(outside[d == 0L])
+    fold_summary = fold_summary
   )
 }

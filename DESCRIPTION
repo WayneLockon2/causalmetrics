@@ -2,12 +2,16 @@ Package: causalmetrics
 Title: Utility Functions and New Methods for Empirical Causal Inference
 Version: 0.0.1
 Authors@R:
-    person("Your", "Name", email = "you@email.com", role = c("aut", "cre"))
+    person("Weiheng", "Zhang", email = "weiheng.zhang626@gmail.com",
+           role = c("aut", "cre"))
 Description: Data cleaning utilities, descriptive table functions, diagnostics,
-    and from-scratch estimation methods (Double ML, synthetic DiD) for applied
-    empirical research. Attaching the package also attaches the standard
-    empirical analysis toolkit (data.table, fixest, estimatr, broom,
-    modelsummary, ggplot2).
+    and from-scratch causal estimators for applied empirical research in
+    economics and marketing. The current estimator is augmented inverse
+    propensity weighting ('est_aipw()') and double/debiased machine learning
+    ('est_dml()'); synthetic difference-in-differences is planned. Lecture-note vignettes and paper
+    replications document each identification strategy. Attaching the package
+    also attaches the standard empirical analysis toolkit (tidyverse,
+    data.table, fixest, estimatr, broom, modelsummary, kableExtra).
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
@@ -19,22 +23,33 @@ Depends:
     estimatr,
     broom,
     modelsummary,
-    kableExtra,
+    kableExtra
 Imports:
     checkmate,
-    rlang,
     generics,
-    knitr
+    ggplot2,
+    knitr,
+    rlang,
+    stats,
+    utils
 Suggests:
-    testthat (>= 3.0.0),
-    ranger,
-    xgboost,
+    bookdown,
+    car,
+    dplyr,
+    ggthemes,
     glmnet,
     grf,
-    kableExtra,
-    huxtable,
-    DBI,
-    rmarkdown
+    MatchIt,
+    mlr3,
+    mlr3learners,
+    patchwork,
+    randomizr,
+    ranger,
+    ri2,
+    rmarkdown,
+    sandwich,
+    testthat (>= 3.0.0),
+    tibble
 Config/testthat/edition: 3
 VignetteBuilder: knitr
 Config/roxygen2/version: 8.0.0

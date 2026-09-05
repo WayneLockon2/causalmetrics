@@ -1,0 +1,1805 @@
+---
+title: "causalmetrics lecture note, Section 4"
+subtitle: "Doubly Robust Estimation and Double Machine Learning"
+author: "Weiheng Zhang"
+date: "`r Sys.Date()`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    toc_depth: 4
+    keep_tex: false
+    latex_engine: xelatex
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+vignette: >
+  %\VignetteIndexEntry{causalmetrics: Doubly Robust Estimation and Double Machine Learning}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+link-citations: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  out.width = "80%",
+  dpi       = 150,
+  message   = FALSE,
+  warning   = FALSE
+)
+
+library(causalmetrics)
+library(mlr3)
+library(mlr3learners)
+
+# Simulation helpers for this lecture (live in inst/vignette_helpers/)
+helper_path <- system.file("vignette_helpers",
+                           "04_Doubly_Robust_and_Double_ML",
+                           "dml_simulation_helpers.R",
+                           package = "causalmetrics")
+source(helper_path)
+
+# Monte Carlo size for the opening experiment. 100 replications take about
+# two minutes with random forests; the chunk is cached.
+n_sims <- 100
+n_sims_lasso <- 60
+fmt <- function(x, digits = 2) formatC(x, digits = digits, format = "f")
+```
+
+# The problem {#sec-problem}
+
+## Same identification, a harder estimation problem
+
+Section 03 ended with five estimators for one estimand. All five assumed
+the same thing: conditional ignorability, $(Y(1), Y(0)) \perp\!\!\!\perp D
+\mid X$, plus overlap. They differed only in *how* they used two objects.
+This lecture calls them the **nuisance functions**,
+
+$$
+m(X) = \mathbb{E}[D \mid X], \qquad g(d, X) = \mathbb{E}[Y \mid D = d, X],
+$$
+
+together with their residual-based cousin $\ell(X) = \mathbb{E}[Y \mid X]$.
+Regression adjustment imputes with $g$. Weighting rebalances with $m$. AIPW
+uses both. In Section 03 these functions were quadratic polynomials in one
+covariate. That was enough to teach the geometry. It is not enough for the
+data this course is about.
+
+Two features of modern applied work break the Section 03 toolkit at the
+estimation stage, not at the identification stage.
+
+- **Many covariates.** A customer record carries purchase histories at
+  many horizons, engagement counts, geography, device, and tenure. A
+  firm-level panel has dozens of balance-sheet ratios. Text and image
+  embeddings add hundreds of coordinates. With $p$ comparable to $n$, least
+  squares on everything is noisy or impossible. Choosing controls by hand
+  brings back the discretion that a pre-specified adjustment set was meant
+  to remove.
+- **Unknown functional form.** Even with few covariates, nothing says the
+  outcome or the assignment rule is linear in them. Targeting systems,
+  eligibility rules, and habit formation produce thresholds, curvature, and
+  interactions. A misspecified linear adjustment is biased. No standard
+  error reports that bias.
+
+The instinct of anyone who has fitted a random forest is obvious: *let the
+machine learn $g$ and $m$.* Prediction is what these methods are good at.
+Both nuisance functions are conditional expectations, so they are
+prediction targets. This lecture follows that instinct. It shows why the
+obvious way of doing it fails, and what the repair looks like. The repair
+is called **double/debiased machine learning**, DML for short.
+
+One sentence to hold on to: **prediction is the means, not the goal.** The
+target is a single number $\theta$, a causal effect, together with a
+confidence interval that has its nominal coverage. Every choice below is
+judged by that standard, not by out-of-sample fit.
+
+### Notation
+
+We observe $W = (Y, D, X)$. Two working models carry the lecture.
+
+- The **partially linear model** (PLM):
+  $$
+  Y = \theta D + g(X) + \varepsilon, \quad \mathbb{E}[\varepsilon \mid D, X] = 0;
+  \qquad
+  D = m(X) + v, \quad \mathbb{E}[v \mid X] = 0.
+  $$
+  The effect is a constant $\theta$; $D$ may be binary or continuous; $g$
+  and $m$ are unrestricted.
+- The **interactive regression model** (IRM): $Y = g(D, X) + \varepsilon$
+  with binary $D$ and no restriction on how $D$ and $X$ interact. The
+  target is the ATE, $\theta = \mathbb{E}[g(1, X) - g(0, X)]$, or the ATT.
+
+In both models $\theta$ is a **low-dimensional target** and the functions
+$(g, m)$ or $(\ell, m)$ are **infinite-dimensional nuisances**. Under
+conditional ignorability the PLM coefficient and the IRM contrast are
+causal effects; without it they are still well-defined predictive
+quantities, and DML estimates them either way. The identification argument
+is the one from Section 03 and is not repeated here.
+
+## The natural approach: plug a learner into last lecture's formula
+
+Take the imputation view of Section 03 and replace the linear model with a
+forest. Fit one random forest of $Y$ on $(D, X)$, predict every unit twice,
+once with $D$ set to 1 and once with $D$ set to 0, and average the
+difference:
+
+$$
+\hat\theta_{\text{plug-in}}
+\;=\; \frac{1}{n} \sum_{i=1}^{n}
+\bigl\{ \hat g(1, X_i) - \hat g(0, X_i) \bigr\}.
+$$
+
+This is regression adjustment with a flexible learner (an "S-learner" in
+the heterogeneous-effects literature). It is tempting for three reasons.
+
+- Forests are consistent for $g$ under mild conditions.
+- No functional form is assumed.
+- No propensity model is needed.
+
+A naive analyst reports the standard deviation of the imputed differences
+divided by $\sqrt{n}$, as for any sample mean.
+
+```{r naive-one-sample}
+dat <- simulate_dml_dgp(n = 500, p = 10, theta = 1, seed = 1)
+x_names <- paste0("x", 1:10)
+
+set.seed(1)
+naive_plugin_forest(dat, x_names, num.trees = 100)
+```
+
+The truth is 1. The estimate is far below it, and the reported standard
+error would not have warned you. Whether this is bad luck or a systematic
+failure is a question for a simulation.
+
+## One experiment, six estimators
+
+### The design
+
+Ten standard normal covariates; three of them matter. The propensity score
+and the outcome surface are nonlinear in the *same* covariates. So the
+confounding is real, and a linear adjustment is misspecified:
+
+$$
+m_0(X) = \Lambda\bigl(0.8 X_1 - 0.4 (X_2^2 - 1)\bigr),
+\qquad
+g_0(X) = 2\,\Lambda(2 X_1) + 0.5 X_2^2 + 0.25 X_3,
+$$
+
+$$
+D \sim \text{Bernoulli}\bigl(m_0(X)\bigr),
+\qquad
+Y = \theta D + g_0(X) + \varepsilon,
+\qquad
+\varepsilon \sim N(0, 1),
+\qquad
+\theta = 1,
+$$
+
+where $\Lambda$ is the logistic function. The effect is constant, so the
+ATE, the ATT, and the partially linear coefficient coincide and every
+estimator below targets the same number. Each replication draws $n = 500$
+units; there are `r n_sims` replications.
+
+### The estimators
+
+| Estimator | Nuisances | Fitted on | What it stands for |
+|---|---|---|---|
+| OLS with linear controls | none | full sample | Section 03's regression adjustment |
+| Naive plug-in forest | $\hat g(D, X)$ | full sample | "replace the linear model by a forest" |
+| Naive plug-in forest, cross-fitted | $\hat g(D, X)$ | held-out folds | the wrong score with the right sample splitting |
+| Orthogonal score, full-sample forests | $\hat\ell(X), \hat m(X)$ | full sample | the right score with the wrong sample use |
+| Orthogonal score, cross-fitted | $\hat\ell(X), \hat m(X)$ | held-out folds | DML with the partially linear score |
+| AIPW, cross-fitted | $\hat m(X), \hat g(0, X), \hat g(1, X)$ | held-out folds | Section 03's AIPW with forests: DML in the interactive model |
+
+The last three are `est_dml()` calls.
+The cross-fitted plug-in is there to separate two ideas that are easy to
+conflate: sample splitting and the choice of score. "Orthogonal score" means the
+residual-on-residual regression of Section 03's Series R: predict $Y$ and
+$D$ from $X$, then regress $Y - \hat\ell(X)$ on $D - \hat m(X)$. Why that
+combination deserves the name is the subject of Section
+\@ref(sec-framework). "Cross-fitted" means each unit's nuisance
+predictions come from forests that never saw that unit. That is the recipe
+of Section 03's Appendix C and the subject of Section
+\@ref(sec-crossfit). All forests use 100 trees and default tuning. The
+point is not to tune well. It is to see what tuning cannot fix.
+
+```{r dml-experiment, cache = TRUE, cache.extra = tools::md5sum(helper_path)}
+results <- run_dml_experiment(
+  n_sims = n_sims, n = 500, p = 10, theta = 1,
+  num.trees = 100, folds = 5, seed = 1
+)
+tab <- summarise_dml_experiment(results)
+pick <- function(estimator, column) tab[[column]][tab$estimator == estimator]
+```
+
+```{r tab-experiment, echo = FALSE}
+knitr::kable(
+  tab,
+  digits = 3,
+  col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean reported SE", "95% coverage"),
+  caption = "Monte Carlo comparison, true effect 1, n = 500. Coverage is the share of replications whose nominal 95 percent interval contains the truth."
+)
+```
+
+```{r fig-experiment, fig.height = 8, fig.cap = "Sampling distributions of the estimators, centred at the truth. The curve in each panel is the normal approximation implied by the estimator's own average reported standard error: a histogram that is shifted relative to its curve is biased, one that is wider than its curve under-reports uncertainty."}
+plot_dml_experiment(results)
+```
+
+### Reading the results
+
+- **Linear adjustment fails as expected.** OLS with all ten covariates
+  has a bias of `r fmt(pick("OLS with linear controls", "bias"))` and
+  coverage of `r fmt(pick("OLS with linear controls", "coverage"))`. The
+  functional form is wrong, and more covariates would not help. This is
+  the problem the forest was supposed to solve.
+- **The plug-in forest is worse, not better.** Its bias,
+  `r fmt(pick("Naive plug-in forest", "bias"))`, is of the same size as
+  OLS's, and its reported standard error,
+  `r fmt(pick("Naive plug-in forest", "mean_se"), 3)`, is a fraction of
+  the actual dispersion, `r fmt(pick("Naive plug-in forest", "sd"), 3)`,
+  so the interval almost never covers the truth. The forest shrinks the
+  treatment contrast. At every split $D$ competes against ten covariates.
+  Splits on $X_1$ and $X_2$ predict $Y$ almost as well, so they absorb
+  most of the effect of $D$. A learner tuned for prediction has no reason
+  to protect the coefficient we care about.
+- **Sample splitting alone does not help.** The cross-fitted plug-in
+  keeps a bias of `r fmt(pick("Naive plug-in forest, cross-fitted", "bias"))`,
+  and its reported standard error is just as misleading. The moment it
+  solves is the wrong one. Cross-fitting cures a different disease.
+- **The right score with the wrong sample splitting is still biased.**
+  Fitting the orthogonal score's forests on the full sample gives a bias
+  of `r fmt(pick("Orthogonal score, full-sample forests", "bias"))` and
+  coverage of
+  `r fmt(pick("Orthogonal score, full-sample forests", "coverage"))`. The
+  residuals $Y - \hat\ell$ and $D - \hat m$ are too small and are
+  correlated with the noise they were fitted to.
+- **Cross-fitted DML recovers the target.** Both cross-fitted estimators
+  are centred close to the truth (bias
+  `r fmt(pick("Orthogonal score, cross-fitted", "bias"))` and
+  `r fmt(pick("AIPW, cross-fitted", "bias"))`), their reported standard
+  errors match the actual dispersion, and their coverage is close to
+  nominal. The AIPW row is the estimator of Section 03 with forest
+  nuisances: cross-fitted AIPW *is* DML for the ATE.
+- **A small gap remains.** The cross-fitted rows are not exactly centred.
+  That residual is nuisance estimation error leaking into $\hat\theta$ at
+  second order. Section \@ref(sec-rates) shows why it shrinks with the
+  accuracy of the learners, not with the size of the sample alone.
+
+## What went wrong: two biases
+
+The plug-in estimator fails for two separate reasons, and it is worth
+keeping them apart because they have separate fixes.
+
+### Regularization bias
+
+Machine learning estimators of a conditional expectation are biased by
+construction. Shrinkage, pruning, minimum leaf sizes, early stopping, and
+penalties all trade bias for variance. The resulting error
+$\hat g - g_0$ vanishes more slowly than $n^{-1/2}$. That is harmless for
+prediction. It is fatal for the plug-in, because the plug-in moment
+condition,
+
+$$
+M(\theta, g) = \mathbb{E}[g(1, X) - g(0, X)] - \theta,
+$$
+
+moves one-for-one with the nuisance. Perturb $g_0$ in a direction
+$\Delta$. The moment moves by $\mathbb{E}[\Delta(1, X) - \Delta(0, X)]$,
+which is not zero in general. The naive partially linear moment
+$\mathbb{E}[(Y - \theta D - g(X))\, D] = 0$ has the same flaw; its
+derivative in the direction $\Delta$ is $-\mathbb{E}[\Delta(X) D]$. So the
+learner's bias in $\hat g$ passes undiminished to $\hat\theta$. That bias
+shrinks slower than the standard error, so the confidence interval never
+catches up. The repair is a moment whose derivative with respect to every
+nuisance is zero at the truth. That property is **Neyman orthogonality**,
+the subject of Section \@ref(sec-framework). The residual-on-residual
+score and the AIPW score both have it.
+
+### Overfitting bias
+
+Orthogonality removes the *first-order* effect of nuisance error. It does
+not help when the nuisance estimate is correlated with the observations on
+which the score is evaluated. A forest fitted on the full sample
+reproduces part of each unit's noise $\varepsilon_i$ in its own prediction
+$\hat g(X_i)$. The residual $Y_i - \hat g(X_i)$ then contains too little
+of $\varepsilon_i$. The residual $D_i - \hat m(X_i)$ contains too little
+of $v_i$. The score averages their product, which is biased. The more
+flexible the learner, the worse this "own-observation" bias.
+**Cross-fitting** breaks the dependence: the nuisances are fitted on folds
+that exclude the unit being scored. Section \@ref(sec-crossfit) shows why
+this is enough for the estimator to behave as if the true nuisances had
+been plugged in.
+
+### The remaining gap
+
+With an orthogonal score and cross-fitting, nuisance error enters
+$\hat\theta$ only at second order. The remainders are products such as
+$\|\hat\ell - \ell_0\| \cdot \|\hat m - m_0\|$ and, for the partialling-out
+score, $\|\hat m - m_0\|^2$. They vanish at the $\sqrt{n}$ rate only if
+each nuisance converges faster than $n^{-1/4}$. In the experiment the
+forest's propensity error is close to that threshold at $n = 500$. That is
+why the cross-fitted rows still show a small negative bias. Better
+learners, more data, or a score that is robust to the harder nuisance all
+shrink it. Section \@ref(sec-rates) quantifies this, and Section
+\@ref(sec-recipe) turns it into a workflow for choosing learners.
+
+## When this is the right tool
+
+DML is an estimation layer. It sits on top of an identification strategy
+and changes nothing about it. Reach for it when all four conditions hold.
+
+- **The design is credible without it.** Conditional ignorability with a
+  pre-treatment adjustment set (this lecture). Or another design whose
+  estimator contains nuisance functions: instrumental variables (Section
+  05), difference-in-differences (Section 07), policy learning (Section 08).
+- **The nuisance functions are hard.** Many covariates, unknown
+  functional forms, interactions, or engineered features such as
+  embeddings. With three covariates and a plausible linear model, Section
+  03's tools are simpler and equally valid.
+- **The target is low-dimensional.** An ATE, an ATT, a partially linear
+  coefficient, a group-average effect, or a small vector of such numbers.
+  DML delivers $\sqrt{n}$ inference for these. It does not deliver a
+  nonparametric function with the same guarantees.
+- **There is enough data to learn the nuisances.** The rate condition is a
+  real constraint. A few hundred observations and a forest on fifty
+  covariates will not satisfy it. The residual bias above will then be
+  large.
+
+Do not expect it to do four other things. It does not choose the
+adjustment set; a bad control stays bad. It does not repair a lack of
+overlap; extreme propensities remain extreme, and trimming still changes
+the estimand. It does not fix unobserved confounding. It does not estimate
+heterogeneous effects for individual units. The typical applications in
+this course fit the four conditions: targeted promotions with rich
+customer histories (Ellickson, Kar, and Reeder 2023), retirement-plan
+eligibility with income and demographics (Chernozhukov et al. 2018), and
+price elasticities with high-dimensional product features.
+
+## Doubly robust, double machine learning
+
+The two names in this lecture's title are related but not synonyms.
+
+- **Doubly robust** is a property of a *score*. The AIPW score of Section
+  03 is consistent for the ATE if either the outcome model or the
+  propensity model is correct. Its bias is the product of the two errors.
+- **Double machine learning** is a *recipe* with three ingredients: a
+  Neyman-orthogonal score, cross-fitted nuisance estimation, and learners
+  that converge fast enough. The AIPW score is one orthogonal score.
+  Cross-fitted AIPW with machine-learned nuisances is DML for the ATE. The
+  residual-on-residual score of the partially linear model is another
+  orthogonal score. It is *not* doubly robust: its bias is second order
+  in the propensity error alone.
+
+The rest of the lecture develops the recipe.
+
+- Section \@ref(sec-framework): orthogonality, the proof skeleton, and the
+  rate condition.
+- Section \@ref(sec-views): three views of the score. The partially linear
+  model as a generalized Frisch-Waugh-Lovell theorem, the interactive
+  model with the doubly robust score, and double lasso, where the story
+  started.
+- Section \@ref(sec-crossfit): cross-fitting.
+- Section \@ref(sec-recipe): the recipe as a workflow. Folds, pooled
+  versus fold-averaged solutions, repeated splits, learner selection.
+- Section \@ref(sec-diagnostics): diagnostics and failure modes.
+- Section \@ref(sec-practice): the replications and a checklist.
+- Section \@ref(sec-extensions): where the recipe goes next.
+
+# Just enough framework {#sec-framework}
+
+## Targets, nuisances, moments
+
+Everything in this lecture has the same shape.
+
+- A **target** $\theta_0$, a number or a short vector.
+- A **nuisance** $\eta_0$, a function or a tuple of functions.
+- A **score** $\psi(W; \theta, \eta)$ with moment
+  $$
+  M(\theta, \eta) := \mathbb{E}\bigl[\psi(W; \theta, \eta)\bigr],
+  \qquad M(\theta_0, \eta_0) = 0,
+  $$
+  and $\theta_0$ is the unique root at the true nuisance.
+
+The estimator replaces $\eta_0$ by a learned $\hat\eta$ and $\mathbb{E}$ by
+the sample mean $\mathbb{E}_n$, then solves
+$\mathbb{E}_n[\psi(W; \hat\theta, \hat\eta)] = 0$. The whole question is
+how the error $\hat\eta - \eta_0$ enters $\hat\theta$.
+
+Three scores from Sections 1 and 03, with $H(D, X) = D/m(X) - (1 - D)/(1 - m(X))$:
+
+| Score | Nuisance $\eta$ | $\psi(W; \theta, \eta)$ |
+|---|---|---|
+| Plug-in (regression imputation) | $g$ | $g(1, X) - g(0, X) - \theta$ |
+| Partialling out (PLM) | $(\ell, m)$ | $\bigl(Y - \ell(X) - \theta\,(D - m(X))\bigr)\,(D - m(X))$ |
+| AIPW (IRM) | $(g, m)$ | $g(1, X) - g(0, X) + H(D, X)\,\bigl(Y - g(D, X)\bigr) - \theta$ |
+
+## Neyman orthogonality {#sec-orthogonality}
+
+Fix a direction $\Delta = \eta - \eta_0$. The **directional (Gateaux)
+derivative** of the moment at the truth is
+$$
+\partial_\eta M(\theta_0, \eta_0)[\Delta]
+\;:=\; \frac{d}{dt}\, M(\theta_0, \eta_0 + t\Delta)\Big|_{t = 0}.
+$$
+
+> **Definition (Neyman orthogonality).** The score is Neyman orthogonal if
+> $\partial_\eta M(\theta_0, \eta_0)[\Delta] = 0$ for every admissible
+> direction $\Delta$.
+
+In words: a small error in the nuisance has no first-order effect on the
+moment. Only second-order terms survive. Check the three scores; one line
+each, full derivations in Appendix \@ref(app-orthogonality).
+
+- **Plug-in.** $\partial_\eta M[\Delta] = \mathbb{E}[\Delta(1, X) - \Delta(0, X)]$.
+  Not zero. Not orthogonal.
+- **Partialling out.** Direction $\Delta_\ell$ in $\ell$:
+  $-\mathbb{E}[\Delta_\ell(X)\,(D - m_0(X))] = -\mathbb{E}\bigl[\Delta_\ell(X)\,\mathbb{E}[D - m_0(X) \mid X]\bigr] = 0$.
+  Direction $\Delta_m$ in $m$: the derivative is
+  $-\mathbb{E}[\Delta_m(X)\, U] + \theta_0\,\mathbb{E}[\Delta_m(X)(D - m_0(X))]$
+  with $U = Y - \ell_0(X) - \theta_0 (D - m_0(X))$; both terms vanish
+  because $\mathbb{E}[U \mid D, X] = 0$ and $\mathbb{E}[D - m_0 \mid X] = 0$.
+  Orthogonal.
+- **AIPW.** Direction $\Delta_g$ in $g$:
+  $\mathbb{E}[\Delta_g(1, X) - \Delta_g(0, X)] - \mathbb{E}[H_0(D, X)\,\Delta_g(D, X)] = 0$,
+  because $\mathbb{E}[H_0\,\Delta_g(D, X)] = \mathbb{E}[\Delta_g(1, X)] - \mathbb{E}[\Delta_g(0, X)]$
+  (the inverse-propensity identity). Direction $\Delta_m$ in $m$: the
+  derivative multiplies $Y - g_0(D, X)$, whose conditional mean is zero.
+  Orthogonal.
+
+The first bullet is Section 1's regularization bias in one line. The other
+two are the reason the orthogonal estimators recovered the target.
+
+## Why orthogonality is enough: skeleton of the proof {#sec-skeleton}
+
+Take a score that is linear in $\theta$, $\psi = \psi^b(W; \eta) - \psi^a(W; \eta)\,\theta$.
+All three scores above have this form. Then
+$$
+\hat\theta = \frac{\mathbb{E}_n[\psi^b(W; \hat\eta)]}{\mathbb{E}_n[\psi^a(W; \hat\eta)]},
+\qquad
+\sqrt{n}\,(\hat\theta - \theta_0)
+= \frac{\sqrt{n}\;\mathbb{E}_n[\psi(W; \theta_0, \hat\eta)]}{\mathbb{E}_n[\psi^a(W; \hat\eta)]}.
+$$
+The denominator converges to $J_0 = \mathbb{E}[\psi^a(W; \eta_0)]$ once
+$\hat\eta$ is consistent. Everything happens in the numerator. Add and
+subtract the oracle score $\psi(W; \theta_0, \eta_0)$:
+$$
+\sqrt{n}\,\mathbb{E}_n[\psi(\theta_0, \hat\eta)]
+= \underbrace{\sqrt{n}\,\mathbb{E}_n[\psi(\theta_0, \eta_0)]}_{(a)\ \text{oracle}}
++ \underbrace{\sqrt{n}\,(\mathbb{E}_n - \mathbb{E})\bigl[\psi(\theta_0, \hat\eta) - \psi(\theta_0, \eta_0)\bigr]}_{(b)\ \text{empirical process}}
++ \underbrace{\sqrt{n}\,\mathbb{E}\bigl[\psi(\theta_0, \hat\eta) - \psi(\theta_0, \eta_0)\bigr]}_{(c)\ \text{bias}},
+$$
+where $\mathbb{E}$ in $(b)$ and $(c)$ treats $\hat\eta$ as fixed.
+
+**Step 1: the oracle term $(a)$.** An average of i.i.d. mean-zero terms.
+By the central limit theorem,
+$(a) \to N\bigl(0, \mathbb{E}[\psi(W; \theta_0, \eta_0)^2]\bigr)$. This is
+what an estimator with known nuisances would deliver.
+
+**Step 2: the bias term $(c)$.** Expand $M(\theta_0, \cdot)$ around
+$\eta_0$:
+$$
+(c) = \sqrt{n}\Bigl(
+\underbrace{\partial_\eta M(\theta_0, \eta_0)[\hat\eta - \eta_0]}_{=\,0\ \text{by orthogonality}}
++ \tfrac12\, \partial^2_\eta M(\theta_0, \bar\eta)[\hat\eta - \eta_0, \hat\eta - \eta_0]
+\Bigr).
+$$
+Orthogonality removes the first-order term. The second-order term is
+bounded by $C\,\|\hat\eta - \eta_0\|^2$, or by a product of the component
+errors. So $(c) = o_p(1)$ if $\|\hat\eta - \eta_0\| = o_p(n^{-1/4})$. That
+is the **rate condition**.
+
+**Step 3: the empirical process term $(b)$.** This is a centred average
+of a function that depends on $\hat\eta$, which was fitted on the same
+data. Without sample splitting it vanishes only if the learner lives in a
+"not too complex" (Donsker) class. Adaptive learners such as forests and
+boosting do not. **Cross-fitting** makes $\hat\eta$ independent of the fold
+on which it is evaluated. Conditional on the training folds, $(b)$ has
+mean zero and variance $\mathbb{E}[(\psi(\hat\eta) - \psi(\eta_0))^2]$,
+which vanishes as soon as $\hat\eta$ is consistent. Section
+\@ref(sec-crossfit) gives the argument.
+
+**Conclusion.**
+$$
+\sqrt{n}\,(\hat\theta - \theta_0) \;\to\; N(0, V),
+\qquad
+V = \frac{\mathbb{E}[\psi(W; \theta_0, \eta_0)^2]}{J_0^2},
+$$
+and $V$ is estimated by plugging $\hat\eta$ and $\hat\theta$ into the same
+formula. Appendix \@ref(app-proof) states the conditions and fills in the
+steps.
+
+> **The three ingredients, mapped to the proof.**
+> An orthogonal score kills the first-order part of $(c)$.
+> The rate condition kills the second-order part of $(c)$.
+> Cross-fitting kills $(b)$.
+> Drop any one and the corresponding term reappears.
+
+Two consequences matter in practice.
+
+- **Oracle equivalence.** $\hat\theta$ behaves as if the true nuisances
+  had been plugged in. Standard errors are computed from the score with
+  $\hat\eta$ inside, and no correction for the first stage is needed.
+- **Learner agnosticism.** Nothing in the argument names the learner.
+  Any method with the rate works, and different nuisances may use different
+  methods.
+
+## The rate condition and double robustness {#sec-rates}
+
+The second-order remainder of Step 2 has a concrete form for each score
+(Appendix \@ref(app-orthogonality)).
+
+- **Partialling out.**
+  $$
+  \mathbb{E}[\psi(\theta_0, \hat\eta)]
+  = \mathbb{E}\bigl[(\hat\ell - \ell_0)(\hat m - m_0)\bigr]
+  - \theta_0\, \mathbb{E}\bigl[(\hat m - m_0)^2\bigr].
+  $$
+  The bias of $\hat\theta$ is this quantity divided by $J_0 = \mathbb{E}[(D - m_0)^2]$.
+  The rate condition is $\|\hat\ell - \ell_0\|\,\|\hat m - m_0\| + \|\hat m - m_0\|^2 = o(n^{-1/2})$.
+  The propensity error enters *squared* and on its own. Nothing protects
+  against a poor $\hat m$.
+- **AIPW.**
+  $$
+  \mathbb{E}[\psi(\theta_0, \hat\eta)]
+  = \mathbb{E}\Bigl[\tfrac{\hat m - m_0}{\hat m}\,\bigl(\hat g(1, X) - g_0(1, X)\bigr)\Bigr]
+  + \mathbb{E}\Bigl[\tfrac{\hat m - m_0}{1 - \hat m}\,\bigl(\hat g(0, X) - g_0(0, X)\bigr)\Bigr].
+  $$
+  Every term is a *product* of a propensity error and an outcome error.
+  The rate condition is $\|\hat m - m_0\|\,\|\hat g - g_0\| = o(n^{-1/2})$.
+  If either factor is zero the remainder is zero: that is **double
+  robustness**, now seen as a special structure of the remainder rather
+  than a separate property.
+
+Section 1's residual bias is this remainder at work. Two cross-fitted
+fits on the design of Section 1, at $n = 500$ and $n = 2000$, show the
+propensity error against the $n^{-1/4}$ threshold and the bias it implies
+through the partialling-out formula.
+
+```{r rate-check}
+rate_check <- function(n, seed) {
+  dat <- simulate_dml_dgp(n = n, p = 10, theta = 1, seed = seed)
+  set.seed(seed)
+  fit <- est_dml(
+    dat, y = "y", d = "d", x = x_names,
+    learner_l = lrn("regr.ranger", num.trees = 100),
+    learner_m = lrn("classif.ranger", predict_type = "prob", num.trees = 100),
+    folds = 5, seed = seed
+  )
+  rmse_m <- sqrt(mean((fit$nuisance$m_hat - dat$m_true)^2))
+  j0 <- fit$diagnostics$identification$mean_sq_treatment_residual
+  c(n = n, rmse_m = rmse_m, threshold = n^(-1/4),
+    implied_bias = -1 * rmse_m^2 / j0, estimate = fit$estimate)
+}
+round(rbind(rate_check(500, 1), rate_check(2000, 1)), 3)
+```
+
+At $n = 500$ the forest's propensity error is of the same order as
+$n^{-1/4}$, and the implied bias matches the Monte Carlo bias of
+`r fmt(pick("Orthogonal score, cross-fitted", "bias"))` in Table
+\@ref(tab:tab-experiment) in sign and size. At $n = 2000$ the error is
+smaller, but it shrinks slowly, because a forest's rate is well below
+$n^{-1/2}$. Two lessons follow. The learner for $m$ deserves as much care
+as the learner for $\ell$. And when one nuisance is much harder than the
+other, a doubly robust score, which only needs the product to be small,
+is the safer choice.
+
+# Three views of the score {#sec-views}
+
+The orthogonal score appears in three settings. Each gives a different
+picture of the same idea. Each subsection follows the same order:
+*model, theorem or score, estimator, R, when it breaks.*
+
+## Partially linear model: generalized Frisch-Waugh-Lovell {#sec-plm}
+
+**Model.**
+$$
+Y = \theta D + g(X) + \varepsilon, \quad \mathbb{E}[\varepsilon \mid D, X] = 0;
+\qquad
+D = m(X) + v, \quad \mathbb{E}[v \mid X] = 0.
+$$
+$D$ may be binary or continuous. Only $\theta$ is restricted to be a
+constant. Define $\ell(X) = \mathbb{E}[Y \mid X] = \theta\, m(X) + g(X)$
+and the residuals $\tilde Y = Y - \ell(X)$, $\tilde D = D - m(X)$.
+Subtracting $\ell(X)$ from both sides of the model gives
+$$
+\tilde Y = \theta\, \tilde D + \varepsilon .
+$$
+This is Section 03's Series R, now as a statement about the population.
+
+> **Theorem (partialling out in the PLM).** If $\mathbb{E}[\tilde D^2] > 0$,
+> $$
+> \theta = \frac{\mathbb{E}[\tilde D \tilde Y]}{\mathbb{E}[\tilde D^2]} .
+> $$
+> *Proof.* Multiply $\tilde Y = \theta \tilde D + \varepsilon$ by $\tilde D$
+> and take expectations. The error term drops out because
+> $\mathbb{E}[\varepsilon \tilde D] = \mathbb{E}\bigl[\mathbb{E}[\varepsilon \mid D, X]\,(D - m(X))\bigr] = 0$. $\square$
+
+With linear $\ell$ and $m$ this is the Frisch-Waugh-Lovell theorem of
+Section 02. The nuisances are now arbitrary functions, and the residuals
+must be learned.
+
+**Score and estimator.** The score $\psi = (\tilde Y - \theta \tilde D)\tilde D$
+is orthogonal (Section \@ref(sec-orthogonality)). With cross-fitted
+residuals $\check Y_i = Y_i - \hat\ell_{[k(i)]}(X_i)$ and
+$\check D_i = D_i - \hat m_{[k(i)]}(X_i)$,
+$$
+\hat\theta = \frac{\sum_i \check D_i \check Y_i}{\sum_i \check D_i^2},
+\qquad
+\widehat{\mathrm{SE}}(\hat\theta) =
+\frac{\sqrt{\sum_i \check D_i^2\, \hat e_i^2 / (n - 1)}}{\sum_i \check D_i^2 / \sqrt{n}},
+\qquad \hat e_i = \check Y_i - \hat\theta \check D_i .
+$$
+The standard error is the heteroskedasticity-robust sandwich of the
+residual-on-residual regression. Nothing is added for the first stage;
+that is oracle equivalence.
+
+> **Algorithm (DML for the partially linear model).**
+> 1. Split the indices into $K$ folds $I_1, \dots, I_K$.
+> 2. For each $k$, fit $\hat\ell_{[k]}$ and $\hat m_{[k]}$ on the data
+>    outside $I_k$; form $\check Y_i$ and $\check D_i$ for $i \in I_k$.
+> 3. Regress $\check Y$ on $\check D$ by least squares; report the
+>    robust standard error.
+
+**In R.** `est_dml(model = "plr")` runs the three steps. Two checks tie
+it to what you already know. With linear-regression nuisances fitted on
+the full sample, it *is* least squares with the controls included
+(classical FWL). The learners must be requested, because for a binary
+treatment the default learner for $m$ is a logit:
+
+```{r plm-fwl}
+dat_lin <- data.frame(y = dat$y, d = dat$d, dat[, x_names])
+fwl <- est_dml(dat_lin, y = "y", d = "d", x = x_names, cross_fit = FALSE,
+               learner_l = lrn("regr.lm"), learner_m = lrn("regr.lm"))
+c(dml_linear = fwl$estimate,
+  ols        = coef(lm(y ~ ., data = dat_lin))[["d"]])
+```
+
+With cross-fitted forests it is the estimator of Section 1's fourth row:
+
+```{r plm-forest}
+set.seed(1)
+fit_plm <- est_dml(
+  dat, y = "y", d = "d", x = x_names,
+  learner_l = lrn("regr.ranger", num.trees = 100),
+  learner_m = lrn("classif.ranger", predict_type = "prob", num.trees = 100),
+  folds = 5, seed = 1
+)
+fit_plm
+```
+
+**What $\theta$ means when the model is wrong.** Suppose the effect varies,
+$Y = g(0, X) + D\,\tau(X) + \varepsilon$, so the PLM is misspecified. The
+estimator still converges to the best linear predictor of $\tilde Y$ on
+$\tilde D$. For binary $D$ that limit is
+$$
+\theta^{*} = \frac{\mathbb{E}\bigl[m(X)\,(1 - m(X))\,\tau(X)\bigr]}{\mathbb{E}\bigl[m(X)\,(1 - m(X))\bigr]},
+$$
+an average of $\tau(X)$ with **overlap weights** $m(X)(1 - m(X))$. Units
+whose treatment is nearly determined by $X$ get almost no weight. This is
+neither the ATE nor the ATT. With the true nuisances supplied, the
+partially linear estimator lands on the overlap-weighted average and the
+interactive estimator of the next subsection lands on the ATE:
+
+```{r plm-heterogeneous}
+hte <- simulate_hte_dgp(n = 5000, seed = 2)
+w_overlap <- with(hte, m_true * (1 - m_true))
+c(
+  ATE               = mean(hte$tau_true),
+  overlap_weighted  = with(hte, sum(w_overlap * tau_true) / sum(w_overlap)),
+  plm_estimate      = est_dml(hte, "y", "d", l_hat = "l_true", m_hat = "m_true")$estimate,
+  irm_estimate      = est_dml(hte, "y", "d", model = "irm",
+                              p_hat = "m_true", mu0_hat = "g0_true", mu1_hat = "g1_true")$estimate
+)
+```
+
+**When it breaks.**
+
+- Effects are heterogeneous and the ATE or ATT is the question. Use the
+  interactive model.
+- $\mathbb{E}[\tilde D^2]$ is small: the covariates almost determine the
+  treatment. The denominator is close to zero and the estimate is noisy.
+  `est_dml()` reports this quantity under `diagnostics$identification`.
+- $\hat m$ is poor. The bias is $-\theta_0\,\mathbb{E}[(\hat m - m_0)^2] / \mathbb{E}[\tilde D^2]$
+  at second order (Section \@ref(sec-rates)); nothing protects against it.
+
+## Interactive model: the doubly robust score {#sec-irm}
+
+**Model.**
+$$
+Y = g(D, X) + \varepsilon, \quad \mathbb{E}[\varepsilon \mid D, X] = 0;
+\qquad
+D \in \{0, 1\}, \quad m(X) = \mathbb{P}(D = 1 \mid X).
+$$
+No restriction on how $D$ and $X$ interact. Targets: the ATE
+$\theta = \mathbb{E}[g(1, X) - g(0, X)]$ and the ATT
+$\mathbb{E}[g(1, X) - g(0, X) \mid D = 1]$.
+
+**Three representations, one orthogonal.** Section 03 wrote the ATE three
+ways. Only one of them can carry a machine learner.
+
+| Representation | $\theta = $ | Nuisance | Derivative at the truth | Orthogonal? |
+|---|---|---|---|---|
+| Regression adjustment | $\mathbb{E}[g(1, X) - g(0, X)]$ | $g$ | $\mathbb{E}[\Delta(1, X) - \Delta(0, X)]$ | no |
+| Inverse propensity weighting | $\mathbb{E}[Y\, H(D, X)]$ | $m$ | $-\mathbb{E}\bigl[Y\,\Delta(X)\,\bigl(\tfrac{D}{m^2} + \tfrac{1 - D}{(1 - m)^2}\bigr)\bigr]$ | no |
+| AIPW | $\mathbb{E}\bigl[g(1, X) - g(0, X) + H(D, X)(Y - g(D, X))\bigr]$ | $(g, m)$ | $0$ in both directions | yes |
+
+The AIPW representation is the other two glued together so that their
+first-order errors cancel (Section \@ref(sec-orthogonality) and Appendix
+\@ref(app-orthogonality)). Its remainder is the product of the two
+nuisance errors (Section \@ref(sec-rates)): double robustness.
+
+**Scores.** All three targets have scores linear in $\theta$,
+$\psi = \psi^b - \psi^a \theta$, with $\bar p = \mathbb{P}(D = 1)$ and
+$p_G = \mathbb{P}(G = 1)$ for a group indicator $G$:
+
+| Target | $\psi^b(W; \eta)$ | $\psi^a$ |
+|---|---|---|
+| ATE | $g(1, X) - g(0, X) + H(D, X)\,(Y - g(D, X))$ | $1$ |
+| ATT | $\bigl(D - (1 - D)\,\tfrac{m(X)}{1 - m(X)}\bigr)\,\bigl(Y - g(0, X)\bigr) / \bar p$ | $D / \bar p$ |
+| GATE | $\tfrac{G}{p_G}\,\psi^b_{\text{ATE}}$ | $\tfrac{G}{p_G}$ |
+
+The ATT score needs only $m$ and $g(0, \cdot)$: the treated arm is never
+imputed. The group score reweights the ATE score by group membership.
+
+> **Algorithm (DML for the ATE in the interactive model).**
+> 1. Split into $K$ folds.
+> 2. For each $k$, fit $\hat g_{[k]}(0, \cdot)$ on untreated units outside
+>    $I_k$, $\hat g_{[k]}(1, \cdot)$ on treated units outside $I_k$, and
+>    $\hat m_{[k]}$ on all units outside $I_k$; clip $\hat m$ to
+>    $[\epsilon, 1 - \epsilon]$.
+> 3. For $i \in I_k$ compute
+>    $\hat\varphi_i = \hat g(1, X_i) - \hat g(0, X_i) + \hat H_i\,(Y_i - \hat g(D_i, X_i))$.
+> 4. $\hat\theta = \mathbb{E}_n[\hat\varphi]$ and
+>    $\widehat{\mathrm{SE}} = \mathrm{sd}(\hat\varphi) / \sqrt{n}$.
+
+**In R.** `est_dml(model = "irm")` runs the algorithm; `est_aipw()` is the
+same estimator with the Section 03 interface, and the two agree to the
+last digit on the same folds. On the Section 1 sample with forests:
+
+```{r irm-forest}
+learners_irm <- list(
+  learner_p   = lrn("classif.ranger", predict_type = "prob", num.trees = 100),
+  learner_mu0 = lrn("regr.ranger", num.trees = 100),
+  learner_mu1 = lrn("regr.ranger", num.trees = 100)
+)
+set.seed(1)
+fit_ate <- do.call(est_dml, c(list(dat, y = "y", d = "d", x = x_names,
+                                   model = "irm", estimand = "ATE", seed = 1), learners_irm))
+set.seed(1)
+fit_att <- do.call(est_dml, c(list(dat, y = "y", d = "d", x = x_names,
+                                   model = "irm", estimand = "ATT", seed = 1), learners_irm))
+set.seed(1)
+fit_aipw <- est_aipw(dat, y = "y", d = "d", x = x_names, seed = 1,
+                     learner_p = learners_irm$learner_p,
+                     learner_mu0 = learners_irm$learner_mu0,
+                     learner_mu1 = learners_irm$learner_mu1)
+rbind(
+  ATE      = c(estimate = fit_ate$estimate,  std.error = fit_ate$std.error),
+  ATT      = c(estimate = fit_att$estimate,  std.error = fit_att$std.error),
+  est_aipw = c(estimate = fit_aipw$estimate, std.error = fit_aipw$std.error)
+)
+```
+
+**When it breaks.**
+
+- Weak overlap. $H$ divides by $\hat m$ and $1 - \hat m$. Clipping at
+  $\epsilon$ caps the weights at $1/\epsilon$; trimming units outside
+  $[\epsilon, 1 - \epsilon]$ changes the target population. Report both
+  (Section 03).
+- Both nuisances poor. The product $\|\hat m - m_0\|\,\|\hat g - g_0\|$
+  must be $o(n^{-1/2})$; one accurate nuisance buys slack for the other,
+  but not for both.
+- Non-binary treatment. Use the partially linear model, or the
+  generalizations in Section \@ref(sec-extensions).
+
+## High-dimensional linear model: double lasso {#sec-double-lasso}
+
+**Model.**
+$$
+Y = \alpha D + \beta' W + \varepsilon, \qquad D = \gamma' W + v,
+$$
+with $p$ controls, $p$ comparable to or larger than $n$, and
+**approximate sparsity**: the sorted coefficients decay fast enough that a
+few hundred of them carry the signal. This is the partially linear model
+with linear nuisances and the lasso as the learner. It is where the DML
+story started (Belloni, Chernozhukov, and Hansen 2014).
+
+**The naive procedure and its failure.** *Single selection*: run a lasso
+of $Y$ on $(D, W)$, keep the selected controls, refit by least squares,
+report the usual standard error. The lasso keeps controls that predict
+$Y$. It drops controls that predict $D$ strongly but $Y$ weakly. Those are
+exactly the confounders that omitted-variable bias is made of. In moment
+language the procedure solves $\mathbb{E}[(Y - \alpha D - \beta' W)\, D] = 0$
+with an estimated $\beta$, and the derivative in the direction $\Delta$
+is $-\mathbb{E}[W D]\,\Delta \ne 0$. Not orthogonal.
+
+**Double lasso.** Partial out with the lasso on both sides.
+
+1. Lasso $Y$ on $W$; residuals $\check Y$.
+2. Lasso $D$ on $W$; residuals $\check D$.
+3. Least squares of $\check Y$ on $\check D$; robust standard error.
+
+Controls that matter for *either* equation survive in at least one
+residual. That is the orthogonality of Section \@ref(sec-plm) again.
+*Double selection* (least squares on $D$ and the union of the two selected
+sets) is an equivalent variant.
+
+**Cross-fitting or not.** With the theoretical plug-in penalty, sparsity
+theory guarantees that the lasso does not overfit, and no sample
+splitting is needed (Theorem 4.2.1 in the book). With a cross-validated
+penalty that guarantee is gone, so cross-fit. There is a second
+subtlety. The lasso *shrinks* the coefficients it keeps. Shrinkage is
+nuisance error like any other, and Section \@ref(sec-rates) says it is
+amplified by $1 / \mathbb{E}[\tilde D^2]$. Post-selection refitting
+removes it; using the shrunken lasso predictions as $\hat\ell$ and
+$\hat m$ does not. The simulation shows both effects.
+
+**Simulation.** Example 4.3.1 of the book: $p = n = 100$,
+$\beta_j = \gamma_j = 1/j^2$, $W \sim N(0, I_p)$, $v \sim N(0, 0.25^2)$,
+$\alpha = 1$. Three estimators.
+
+| Estimator | Steps |
+|---|---|
+| Single selection | lasso $Y$ on $(D, W)$; least squares on $D$ and the selected $W$ |
+| Post-double-selection | lasso $Y$ on $W$ and $D$ on $W$; least squares on $D$ and the union of the selections |
+| CV lasso, cross-fitted | `est_dml()` with cross-validated lasso *predictions* as $\hat\ell$ and $\hat m$ |
+
+```{r double-lasso-experiment, cache = TRUE, cache.extra = tools::md5sum(helper_path)}
+lasso_results <- run_double_lasso_experiment(
+  n_sims = n_sims_lasso, n = 100, p = 100, theta = 1, sd_v = 0.25, folds = 5, seed = 1
+)
+lasso_tab <- summarise_dml_experiment(lasso_results)
+pick_lasso <- function(estimator, column) lasso_tab[[column]][lasso_tab$estimator == estimator]
+msq_dtilde <- mean(lasso_results$msq_treatment_residual, na.rm = TRUE)
+msq_m_err  <- mean(lasso_results$msq_m_error, na.rm = TRUE)
+```
+
+```{r tab-double-lasso, echo = FALSE}
+knitr::kable(
+  lasso_tab,
+  digits = 3,
+  col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean reported SE", "95% coverage"),
+  caption = "Lasso-based estimators, true effect 1, p = n = 100, residual treatment standard deviation 0.25."
+)
+```
+
+```{r fig-double-lasso, fig.height = 3, fig.cap = "Single selection loses the confounders that predict the treatment. Post-double-selection keeps them and refits without shrinkage. Shrunken cross-validated lasso predictions fail here because the residual treatment variance is tiny."}
+plot_dml_experiment(lasso_results, colors = lasso_colors, ncol = 3)
+```
+
+**Reading the results.**
+
+- **Single selection** has a bias of
+  `r fmt(pick_lasso("Single selection", "bias"))`. The treatment is
+  unpenalized and almost collinear with the leading controls, so the
+  outcome lasso keeps $D$ and drops most of those controls. Their
+  effects, $\sum_j \beta_j\gamma_j$ over the dropped set, land on the
+  coefficient of $D$ (Appendix \@ref(app-orthogonality)).
+- **Post-double-selection** is centred (bias
+  `r fmt(pick_lasso("Post-double-selection", "bias"))`) with coverage
+  `r fmt(pick_lasso("Post-double-selection", "coverage"))`. The lasso for
+  $D$ picks up the confounders the lasso for $Y$ misses, and the
+  least-squares refit carries no shrinkage.
+- **Cross-validated lasso predictions**, cross-fitted, are biased
+  (`r fmt(pick_lasso("CV lasso, cross-fitted", "bias"))`)
+  despite the orthogonal score and cross-fitting. The residual treatment
+  variance in this design is $\mathbb{E}[\tilde D^2] \approx$
+  `r fmt(msq_dtilde)`, and the lasso's squared error in $\hat m$ is
+  about `r fmt(msq_m_err, 3)`. Both nuisances are shrunk toward zero in
+  the same direction, so the remainder of Section \@ref(sec-rates),
+  $\bigl(\mathbb{E}[(\hat\ell - \ell)(\hat m - m)] - \theta\,\mathbb{E}[(\hat m - m)^2]\bigr) / \mathbb{E}[\tilde D^2]$,
+  is positive and multiplied by roughly `r round(1 / msq_dtilde)`. This
+  is the weak-residual-variation failure of Section \@ref(sec-plm)
+  combined with shrinkage.
+
+Three lessons. Refit after selecting when the lasso partials out; that is
+what post-lasso and the plug-in `rlasso` do. Read
+$\mathbb{E}[\tilde D^2]$ before trusting any partialling-out estimate;
+`est_dml()` reports it. And treat shrinkage as nuisance error: it counts
+against the rate condition like any other.
+
+**When it breaks.**
+
+- Sparsity fails: many small coefficients that together matter. The
+  lasso cannot approximate either nuisance, and no penalty choice helps.
+  Move to nonlinear learners or richer dictionaries.
+- Cross-validated penalties without cross-fitting: the overfitting bias
+  of Section 1 returns.
+- Perfect or near-perfect prediction of $D$ by $W$: the residual
+  $\check D$ has little variation, and every nuisance error is amplified.
+
+# Cross-fitting {#sec-crossfit}
+
+## The problem it solves
+
+Section \@ref(sec-skeleton) left one term open, the empirical process
+term
+$$
+(b) = \sqrt{n}\,(\mathbb{E}_n - \mathbb{E})\bigl[\psi(\theta_0, \hat\eta) - \psi(\theta_0, \eta_0)\bigr].
+$$
+It is a centred average, but of a function that was chosen by looking
+at the same data. There are two ways to make it vanish.
+
+- **Restrict the learner.** If every function the learner can produce
+  lies in a "simple" class (a Donsker class), a uniform central limit
+  theorem applies and $(b) \to 0$. Parametric models and low-dimensional
+  smooth nonparametrics qualify. Forests, boosting, neural networks, and
+  the lasso with data-driven tuning do not.
+- **Break the dependence.** Fit $\hat\eta$ on observations that are not
+  used to evaluate the score. Then, conditional on the fitting data,
+  $\hat\eta$ is a fixed function and $(b)$ is an ordinary centred average.
+
+Cross-fitting takes the second route. It places no restriction on the
+learner. Section 1's row "Orthogonal score, full-sample forests" shows
+what happens when neither route is taken: the score is right, the
+learner is adaptive, and $(b)$ does not vanish.
+
+## The construction
+
+> **Algorithm ($K$-fold cross-fitting).**
+> 1. Split the indices $\{1, \dots, n\}$ into $K$ folds $I_1, \dots, I_K$
+>    of similar size, stratified on $D$ when $D$ is binary.
+> 2. For each $k$, fit the nuisances $\hat\eta_{[k]}$ on the complement
+>    $I_k^c$.
+> 3. For each $i \in I_k$, evaluate the score with
+>    $\hat\eta_{[k(i)]}$, the fit that did not use observation $i$.
+> 4. Solve $\mathbb{E}_n[\psi(W_i; \theta, \hat\eta_{[k(i)]})] = 0$ on the
+>    pooled scores (or fold by fold; Section \@ref(sec-recipe)).
+
+Every observation contributes a score computed from a model that never
+saw it. Every nuisance fit uses a fraction $(K - 1)/K$ of the data. With
+$K = 2$ this is the original "swap" scheme; $K = 5$ is the usual default;
+larger $K$ helps in small samples (Remark 9.4.5 in the book).
+
+## Why it works: the conditional argument
+
+Fix a fold $k$ and condition on its training data $T_k = \{W_i : i \notin I_k\}$.
+The fitted nuisance $\hat\eta_{[k]}$ is then a fixed function. For
+$i \in I_k$ define
+$$
+Z_i = \psi(W_i; \theta_0, \hat\eta_{[k]}) - \psi(W_i; \theta_0, \eta_0).
+$$
+Conditional on $T_k$ the $Z_i$ are i.i.d., with mean
+$\mu_k = \mathbb{E}[Z_i \mid T_k]$ and variance
+$\sigma_k^2 = \mathbb{E}[Z_i^2 \mid T_k] - \mu_k^2$. The fold's
+contribution to $(b)$ is $\sqrt{n_k}\,(\bar Z_k - \mu_k)$, and by
+Chebyshev's inequality
+$$
+\mathbb{P}\bigl(\lvert \sqrt{n_k}\,(\bar Z_k - \mu_k)\rvert > t \,\big|\, T_k\bigr)
+\;\le\; \frac{\sigma_k^2}{t^2}.
+$$
+The variance $\sigma_k^2$ is bounded by
+$\mathbb{E}[(\psi(\hat\eta_{[k]}) - \psi(\eta_0))^2 \mid T_k]$, which goes
+to zero whenever $\hat\eta_{[k]}$ is consistent and the score is smooth
+in $\eta$. So each fold's centred average is $o_p(1)$ *after* the
+$\sqrt{n}$ scaling, and summing over $K$ folds gives $(b) = o_p(1)$. The
+means $\mu_k$ are exactly the bias term $(c)$ of Section
+\@ref(sec-skeleton), which orthogonality handles. Appendix
+\@ref(app-proof) writes this out.
+
+Two features of the argument matter. Nothing in it depends on what the
+learner is. And the only requirement on $\hat\eta$ is consistency, which
+is weaker than the rate condition of Step 2; the rate is needed for
+$(c)$, not for $(b)$.
+
+## What it costs, and what it does not fix
+
+**Costs.**
+
+- $K$ nuisance fits instead of one, on smaller samples. With adaptive
+  learners this is the price of valid inference, not a nuisance.
+- The estimate depends on the random partition. Section
+  \@ref(sec-recipe) removes that dependence with repeated partitions.
+
+**What it does not fix.** Cross-fitting cures the own-observation bias.
+It does nothing about the choice of moment. Table
+\@ref(tab:tab-experiment) has the proof: the cross-fitted plug-in forest
+keeps essentially the full bias of the in-sample plug-in. Sample
+splitting with a non-orthogonal score is the "natural algorithm, draft 3"
+of the Stanford lectures, and it still fails. Nor does cross-fitting
+create identification, repair overlap, or shrink the rate condition.
+
+**In R.** The residual diagnostics of `est_dml()` make the own-observation
+bias visible on a single sample. In-sample forests produce residuals that
+are too small, because the fitted values have absorbed part of the noise.
+
+```{r crossfit-diagnostics}
+set.seed(1)
+fit_insample <- est_dml(
+  dat, y = "y", d = "d", x = x_names,
+  learner_l = lrn("regr.ranger", num.trees = 100),
+  learner_m = lrn("classif.ranger", predict_type = "prob", num.trees = 100),
+  cross_fit = FALSE
+)
+compare <- function(fit) {
+  q <- fit$diagnostics$nuisance
+  c(rmse_l = q$rmse[q$nuisance == "l_hat"],
+    rmse_m = q$rmse[q$nuisance == "m_hat"],
+    mean_sq_D_resid = fit$diagnostics$identification$mean_sq_treatment_residual,
+    estimate = fit$estimate)
+}
+round(rbind(full_sample = compare(fit_insample), cross_fitted = compare(fit_plm)), 3)
+```
+
+The in-sample fit looks better on every nuisance metric. That is the
+warning sign, not a success: residuals that small are impossible for a
+treatment with this much unexplained variation. Cross-fitted residual
+metrics are honest estimates of the out-of-sample nuisance error, and the
+rate condition of Section \@ref(sec-rates) is about that error.
+
+# The recipe in practice {#sec-recipe}
+
+## The generic algorithm
+
+> **Inputs.** Data $\{W_i\}_{i=1}^n$; an orthogonal score $\psi(W; \theta, \eta)$
+> that identifies $\theta_0$; a learner for each component of $\eta$; the
+> number of folds $K$; the number of repeated partitions $S$.
+>
+> **For each partition $s = 1, \dots, S$:**
+> 1. Draw $K$ folds.
+> 2. Fit the nuisances on each complement; predict on the held-out fold.
+> 3. Form the cross-fitted scores $\psi(W_i; \theta, \hat\eta_{[k(i)]})$.
+> 4. Solve $\mathbb{E}_n[\psi] = 0$ for $\hat\theta_s$; compute $\hat\sigma_s^2$.
+>
+> **Report** $\hat\theta_1, \hat\sigma_1$ if $S = 1$, otherwise the median
+> aggregates of Section \@ref(sec-repeated).
+
+`est_dml()` is this algorithm. The rest of the section is about the
+choices inside it.
+
+## Linear scores and the Jacobian {#sec-linear-scores}
+
+Every score in this lecture is linear in $\theta$:
+$$
+\psi(W; \theta, \eta) = \psi^b(W; \eta) - \psi^a(W; \eta)\,\theta .
+$$
+Then step 4 has a closed form and so does the variance:
+$$
+\hat\theta = \frac{\sum_i \psi^b_i}{\sum_i \psi^a_i},
+\qquad
+\hat J = \frac{1}{n}\sum_i \psi^a_i,
+\qquad
+\hat\sigma^2 = \frac{1}{\hat J^2}\cdot\frac{1}{n - 1}\sum_i \bigl(\psi^b_i - \psi^a_i\,\hat\theta\bigr)^2,
+\qquad
+\widehat{\mathrm{SE}} = \hat\sigma / \sqrt{n}.
+$$
+
+| Score | $\psi^a$ | $\psi^b$ | $\hat J$ estimates |
+|---|---|---|---|
+| Partialling out | $\tilde D^2$ | $\tilde Y \tilde D$ | $\mathbb{E}[\tilde D^2]$, the residual treatment variance |
+| ATE (AIPW) | $1$ | $g(1, X) - g(0, X) + H(D, X)(Y - g(D, X))$ | $1$ |
+| ATT | $D / \bar p$ | $\bigl(D - (1 - D)\tfrac{m}{1 - m}\bigr)(Y - g(0, X)) / \bar p$ | $1$ |
+
+The Jacobian is where identification strength lives. For the ATE and ATT
+it is one by construction. For the partially linear model it is the
+residual treatment variance, and a small value inflates both the estimate
+and every remainder term (Sections \@ref(sec-plm) and
+\@ref(sec-double-lasso)).
+
+## Pooled or fold-averaged solutions {#sec-solve}
+
+Step 4 can be run in two ways.
+
+- **Pooled** (`solve = "pooled"`, DML2 in the paper): stack the
+  cross-fitted scores of all folds and solve once.
+- **Fold average** (`solve = "fold_average"`, DML1): solve within each
+  fold, then average the $K$ solutions.
+
+Both use the variance formula above with the pooled scores. They agree
+asymptotically. In finite samples the pooled solution is more stable,
+because a fold with a small $\hat J_k$ does not get a full $1/K$ share of
+the answer. Pooled is the default. The fold-level solutions are still
+worth reading: their spread is a cheap diagnostic of how much the answer
+depends on the partition.
+
+```{r solve-compare}
+set.seed(1)
+fit_fold_avg <- est_dml(
+  dat, y = "y", d = "d", x = x_names,
+  learner_l = lrn("regr.ranger", num.trees = 100),
+  learner_m = lrn("classif.ranger", predict_type = "prob", num.trees = 100),
+  folds = 5, seed = 1, solve = "fold_average"
+)
+rbind(pooled = c(estimate = fit_plm$estimate, std.error = fit_plm$std.error),
+      fold_average = c(estimate = fit_fold_avg$estimate, std.error = fit_fold_avg$std.error))
+fit_plm$fold_estimates
+```
+
+## Repeated cross-fitting {#sec-repeated}
+
+One partition is one random draw. Its estimate carries partition noise
+on top of sampling noise. Repeating the whole procedure on $S$
+independent partitions and aggregating removes the dependence on any one
+of them. Chernozhukov et al. (2018, Section 3.4) recommend the median:
+$$
+\tilde\theta = \operatorname{median}_s\, \hat\theta_s,
+\qquad
+\tilde\sigma^2 = \operatorname{median}_s \Bigl(\hat\sigma_s^2 + (\hat\theta_s - \tilde\theta)^2\Bigr).
+$$
+The second term inside the median charges the variance for the spread
+across partitions, so the interval does not pretend the partition was
+fixed. The mean works too, with the same correction; the median is less
+sensitive to one unlucky split.
+
+```{r repeated}
+set.seed(1)
+fit_rep <- est_dml(
+  dat, y = "y", d = "d", x = x_names,
+  learner_l = lrn("regr.ranger", num.trees = 100),
+  learner_m = lrn("classif.ranger", predict_type = "prob", num.trees = 100),
+  folds = 5, n_rep = 5, seed = 1
+)
+fit_rep$repetitions
+c(estimate = fit_rep$estimate, std.error = fit_rep$std.error)
+```
+
+Use $S \ge 5$ whenever the learners are flexible and $n$ is moderate.
+With $S = 1$, two analysts with different seeds report different numbers
+from the same data.
+
+## Choosing and tuning the learners {#sec-learners}
+
+The rate condition is about the *error* of each nuisance estimate. The
+cross-fitted residuals measure that error out of sample, so they also
+rank learners.
+
+> **Selecting learners to minimise the DML bias.**
+> For each candidate learner $j$ and each nuisance, compute the
+> cross-fitted mean squared prediction error, for instance
+> $\mathbb{E}_n[\check Y_j^2]$ and $\mathbb{E}_n[\check D_j^2]$.
+> Pick the learner with the smallest error for each nuisance separately.
+> Or form a linear ensemble of the candidates with the same criterion.
+
+Three rules go with the box.
+
+- **Few candidates.** Choosing among a handful of learners does not
+  disturb the theory (Corollary 9.2.3 in the book). Searching over
+  hundreds does; the validation data are then being used to fit.
+- **Tune inside the training folds.** Cross-validation for
+  hyperparameters must happen on the $K - 1$ training folds, never on
+  the held-out fold. Data-driven tuning plus cross-fitting is fine;
+  data-driven tuning without cross-fitting is Section 1's overfitting
+  bias.
+- **Different learners for different nuisances.** Nothing requires the
+  same method for $\ell$ and $m$. A binary treatment often wants a
+  calibrated classifier for $m$ and a flexible regression for $\ell$.
+
+On the Section 1 sample, three candidates for the partially linear
+nuisances: linear models, forests, and a lasso on the covariates and
+their squares.
+
+```{r learner-compare}
+dat_sq <- dat
+sq_names <- paste0(x_names, "_sq")
+dat_sq[sq_names] <- dat[x_names]^2
+
+candidates <- list(
+  linear = list(x = x_names,
+                l = lrn("regr.lm"),
+                m = lrn("classif.log_reg", predict_type = "prob")),
+  forest = list(x = x_names,
+                l = lrn("regr.ranger", num.trees = 100),
+                m = lrn("classif.ranger", predict_type = "prob", num.trees = 100)),
+  lasso_squares = list(x = c(x_names, sq_names),
+                       l = lrn("regr.cv_glmnet", nfolds = 5),
+                       m = lrn("classif.cv_glmnet", predict_type = "prob", nfolds = 5))
+)
+compare_learners <- t(sapply(candidates, function(cand) {
+  set.seed(1)
+  fit <- est_dml(dat_sq, y = "y", d = "d", x = cand$x,
+                 learner_l = cand$l, learner_m = cand$m, folds = 5, seed = 1)
+  q <- fit$diagnostics$nuisance
+  c(rmse_l = q$rmse[q$nuisance == "l_hat"], rmse_m = q$rmse[q$nuisance == "m_hat"],
+    estimate = fit$estimate, std.error = fit$std.error)
+}))
+round(compare_learners, 3)
+```
+
+Read the table by column, not by row. The learner with the smallest
+`rmse_l` is the right choice for $\ell$, the one with the smallest
+`rmse_m` for $m$, and they need not be the same. Here the squares give
+the lasso the curvature it needs, and it edges out the forest on both
+nuisances. The two flexible candidates agree on the effect. The linear
+candidate, with the largest errors, is the outlier.
+
+## Folds, clipping, and trimming
+
+- **Folds.** $K = 5$ is a sensible default. Use $K \ge 10$ when $n$ is
+  a few hundred, so that each nuisance fit sees enough data. Stratify the
+  folds on $D$ when $D$ is binary; `est_dml()` does this automatically.
+- **Clipping.** In the interactive model, cap $\hat m$ to
+  $[\epsilon, 1 - \epsilon]$ before forming $H$. The default
+  $\epsilon = 0.01$ bounds the weights at 100. Clipping is a variance
+  device and leaves the estimand alone.
+- **Trimming.** Dropping units with $\hat m$ outside $[\epsilon, 1 - \epsilon]$
+  changes the population the estimate refers to, as in Section 03.
+  Report the trimmed share and, when possible, the estimate with and
+  without trimming.
+- **Binary treatment in the partially linear model.** Predict $D$ with a
+  classifier and use its probability as $\hat m$; a regression forest on
+  a 0/1 outcome works but is less well calibrated in the tails.
+
+# Diagnostics and failure modes {#sec-diagnostics}
+
+## What to report
+
+A DML estimate is only as credible as the nuisances behind it. Report
+the quantities below with every estimate; `est_dml()` returns all of them.
+
+| Diagnostic | What it checks | Where |
+|---|---|---|
+| Cross-fitted RMSE and $R^2$ of each nuisance | rate condition; learner choice | `diagnostics$nuisance` |
+| Residual treatment variance $\mathbb{E}_n[\tilde D^2]$ | identification strength (partially linear) | `diagnostics$identification` |
+| Propensity range, clipped share, effective sample sizes | overlap (interactive) | `diagnostics$propensity`, `diagnostics$weights` |
+| Fold-level estimates | dependence on one partition | `fold_estimates` |
+| Repetition estimates | dependence across partitions | `repetitions` |
+| Estimates across two or three learners | model dependence | rerun; Section \@ref(sec-learners) |
+| In-sample versus cross-fitted residuals | overfitting of external predictions | `cross_fit = FALSE`; Section \@ref(sec-crossfit) |
+| Placebo outcomes, sensitivity analysis | identification | outside the estimator; Section 03 |
+
+```{r diagnostics-print}
+fit_plm$diagnostics$nuisance
+fit_plm$diagnostics$identification$mean_sq_treatment_residual
+fit_ate$diagnostics$propensity$clipped_summary
+c(ess_treated = fit_ate$diagnostics$weights$ess_treated,
+  ess_control = fit_ate$diagnostics$weights$ess_control)
+```
+
+## Failure modes
+
+Each entry: the symptom, then the remedy.
+
+- **Weak residual variation** (partially linear). $\mathbb{E}_n[\tilde D^2]$
+  is a small fraction of $\mathrm{var}(D)$; the standard error is large;
+  fold estimates scatter. Remedy: none inside the estimator. The
+  covariates nearly determine the treatment. Accept the imprecision, or
+  reconsider what variation identifies the effect.
+- **Weak overlap** (interactive). $\hat m$ near 0 or 1 for many units;
+  effective sample sizes far below $n_1$ and $n_0$. Remedy: clip, trim
+  and report the trimmed share, or target the ATT if the untreated
+  support is the problem.
+- **Nuisances too poor.** Large cross-fitted RMSE; the residual bias of
+  Section \@ref(sec-rates) is not negligible. Remedy: better learners
+  chosen by cross-fitted error, more data, or a doubly robust score when
+  one nuisance is much easier than the other.
+- **Shrinkage with weak variation.** The lasso case of Section
+  \@ref(sec-double-lasso). Remedy: refit after selection.
+- **Partition dependence.** Fold estimates or repetitions disagree by
+  more than a standard error. Remedy: repeated cross-fitting with median
+  aggregation; larger $K$ in small samples.
+- **In-sample nuisances from outside.** Residual metrics look too good;
+  the estimate drifts toward the plug-in. Remedy: the contract for
+  external predictions is out-of-fold, and the function cannot verify
+  it. Check the fold structure of what you were handed.
+- **Heterogeneous effects read as an ATE.** The partially linear
+  coefficient is an overlap-weighted average (Section \@ref(sec-plm)).
+  Remedy: the interactive model for a binary treatment.
+- **Bad controls and hidden confounding.** No DML diagnostic detects
+  them. Remedy: the placebo and sensitivity tools of Section 03, and the
+  adjustment-set discipline of Section 03.
+- **Too few observations per fold.** Nuisance fits fail or degrade.
+  Remedy: $K \ge 10$, simpler learners, repeated splits.
+
+The common thread: DML moves the difficulty from specifying a functional
+form to learning nuisances well and saying how well they were learned.
+The diagnostics are the second half of that bargain.
+
+# Practice {#sec-practice}
+
+## The replications
+
+Two papers anchor this section. Their replication notebooks are
+planned for `inst/replications/04_Doubly_Robust_and_Double_ML/` and are
+not yet part of the package.
+
+**Chernozhukov et al. (2018), Tables 1 and 2.**
+
+- *Table 1, Pennsylvania reemployment bonus experiment.* The treatment is
+  a randomized bonus offer; the outcome is unemployment duration. Because
+  assignment is randomized, identification is not the question. The table
+  teaches two things: DML with several learners agrees with the
+  experimental benchmark, and the partially linear and interactive models
+  give the same answer when the effect is close to constant.
+- *Table 2, 401(k) eligibility and net financial assets.* Eligibility is
+  observational; the design argues that income and a few demographics
+  make it as good as random. The table compares lasso, trees, forests,
+  boosting, and an ensemble in both models, with repeated splits. Watch
+  the cross-fitted RMSE rows next to the estimates: the learners that
+  predict better move together, and the estimate is far below the raw
+  difference in means.
+
+**Ellickson, Kar, and Reeder (2023), targeted promotions.** Emails are
+targeted by a rule that depends on customer history, so raw comparisons
+across emails are confounded. Stage one builds an orthogonal (AIPW)
+score for each customer and each email-versus-baseline contrast with
+forest nuisances; those are `est_dml(model = "irm")$score` plus the
+estimate, one number per unit. Stage two regresses the scores on the
+components that distinguish the emails. The replication teaches that DML
+scores are data: once orthogonalized, they can be projected, averaged
+within groups, or fed to a policy rule, and the projection inherits
+valid inference.
+
+## A reporting checklist
+
+1. State the estimand and the model: a partially linear coefficient, an
+   ATE, or an ATT.
+2. Defend the adjustment set as pre-treatment and causally valid
+   (Section 03).
+3. Name the learner for each nuisance and how it was chosen; report the
+   cross-fitted RMSE next to the estimate.
+4. Report the residual treatment variance (partially linear) or the
+   propensity range, clipped share, and effective sample sizes
+   (interactive).
+5. State $K$, the number of repeated partitions, the solution method,
+   and any clipping or trimming.
+6. Show the fold-level and repetition-level spread.
+7. Compare two or three learners; a large gap is model dependence.
+8. If external predictions were used, state that they are out-of-fold
+   and how the folds were built.
+9. Run a placebo outcome or a sensitivity analysis. DML does not deliver
+   identification.
+10. Interpret a partially linear coefficient as an overlap-weighted
+    effect when heterogeneity is plausible.
+
+# Extensions {#sec-extensions}
+
+The recipe does not change across designs. Only the score does. Each
+item below is one orthogonal score and one pair of nuisances.
+
+- **Instrumental variables** (Section 05). Partially linear IV
+  residualizes $Y$, $D$, and the instrument $Z$ on $X$, then runs
+  two-stage least squares on the residuals. The interactive version
+  ratios two AIPW-type scores, one for $Y$ and one for $D$, with the
+  instrument's propensity in the denominators, and targets the LATE.
+- **Difference-in-differences** (Section 07). The doubly robust DiD
+  score applies the AIPW construction to the outcome *change*, with a
+  propensity for belonging to the treated group. Conditional parallel
+  trends replaces conditional ignorability.
+- **Heterogeneous effects** (Section 08). The residuals of the
+  partially linear model satisfy $\tilde Y \approx \tau(X)\tilde D$; the
+  R-learner fits $\tau(X)$ by minimizing $(\tilde Y - \tau(X)\tilde D)^2$.
+  The DR-learner regresses the AIPW score on $X$. Both reuse this
+  lecture's nuisances.
+- **Group and treated-population effects.** The ATT and group-ATE scores
+  of Section \@ref(sec-irm); one estimator per group, same folds.
+- **Automatic DML.** For any linear functional of the regression
+  function there is a weight $\alpha(W)$, the Riesz representer, that
+  plays the role of $H(D, X)$ in the AIPW score. Automatic DML learns
+  $\alpha$ by machine learning instead of deriving it by hand, which
+  extends the recipe to functionals for which no closed form exists.
+- **Targeted maximum likelihood.** TMLE debiases the plug-in by
+  refitting $\hat g$ along the direction $H(D, X)$ until the score has
+  sample mean zero, then plugs in. It is first-order equivalent to DML
+  with the same nuisances and also needs cross-fitting with adaptive
+  learners.
+
+# Appendix {#sec-appendix}
+
+## Orthogonality calculations {#app-orthogonality}
+
+**Notation.** $W = (Y, D, X)$. The nuisance is $\eta$, its true value
+is $\eta_0$, and $\Delta = \eta - \eta_0$ is a fixed direction. The
+moment is $M(\theta, \eta) = \mathbb{E}[\psi(W; \theta, \eta)]$ and
+$$
+\partial_\eta M(\theta_0, \eta_0)[\Delta]
+= \frac{d}{dt}\, M(\theta_0, \eta_0 + t\Delta)\Big|_{t = 0} .
+$$
+$\|f\| = \sqrt{\mathbb{E}[f(W)^2]}$ is the $L^2$ norm. Two facts do
+all the work. Under $\mathbb{E}[\varepsilon \mid D, X] = 0$, the outcome
+error times any function of $(D, X)$ has mean zero. Under
+$\mathbb{E}[D \mid X] = m_0(X)$, the treatment residual
+$\tilde D = D - m_0(X)$ times any function of $X$ has mean zero.
+
+### Plug-in score
+
+Score $\psi = g(1, X) - g(0, X) - \theta$, nuisance $g$. With
+$g = g_0 + t\Delta$,
+$$
+M(\theta_0, g_0 + t\Delta) = t\,\mathbb{E}[\Delta(1, X) - \Delta(0, X)],
+\qquad
+\partial_g M[\Delta] = \mathbb{E}[\Delta(1, X) - \Delta(0, X)] .
+$$
+The derivative is not zero. The moment is linear in $\Delta$, so there
+is no second-order term to fall back on. The bias of the plug-in is
+exactly $\mathbb{E}[\hat g(1, X) - g_0(1, X)] - \mathbb{E}[\hat g(0, X) - g_0(0, X)]$.
+Whatever regularization does to the treatment contrast passes straight
+through.
+
+### Partialling-out score
+
+Score $\psi = \bigl(Y - \ell(X) - \theta\,(D - m(X))\bigr)(D - m(X))$,
+nuisance $\eta = (\ell, m)$. Write $U = Y - \ell_0(X) - \theta_0\tilde D$.
+In the partially linear model $U = \varepsilon$, so
+$\mathbb{E}[U \mid D, X] = 0$.
+
+*Direction in $\ell$.* With $\ell = \ell_0 + t\Delta_\ell$ and $m = m_0$,
+$$
+\psi = \bigl(U - t\Delta_\ell(X)\bigr)\tilde D,
+\qquad
+\partial_\ell M[\Delta_\ell] = -\mathbb{E}[\Delta_\ell(X)\,\tilde D]
+= -\mathbb{E}\bigl[\Delta_\ell(X)\,\mathbb{E}[\tilde D \mid X]\bigr] = 0 .
+$$
+
+*Direction in $m$.* With $m = m_0 + t\Delta_m$ and $\ell = \ell_0$,
+$D - m = \tilde D - t\Delta_m$ and
+$$
+\psi = \bigl(U + t\theta_0\Delta_m\bigr)\bigl(\tilde D - t\Delta_m\bigr)
+= U\tilde D - t\,U\Delta_m + t\,\theta_0\Delta_m\tilde D - t^2\theta_0\Delta_m^2 .
+$$
+The derivative at $t = 0$ is
+$-\mathbb{E}[U\Delta_m(X)] + \theta_0\,\mathbb{E}[\Delta_m(X)\tilde D] = 0 + 0$.
+
+*Exact remainder.* Put $\Delta_\ell = \hat\ell - \ell_0$ and
+$\Delta_m = \hat m - m_0$, both fixed functions. Then
+$Y - \hat\ell - \theta_0(D - \hat m) = U - \Delta_\ell + \theta_0\Delta_m$
+and $D - \hat m = \tilde D - \Delta_m$, so
+$$
+\psi(W; \theta_0, \hat\eta)
+= \bigl(U - \Delta_\ell + \theta_0\Delta_m\bigr)\bigl(\tilde D - \Delta_m\bigr) .
+$$
+Take expectations. The terms $U\tilde D$, $U\Delta_m$,
+$\Delta_\ell\tilde D$ and $\Delta_m\tilde D$ vanish by the two facts.
+What remains is
+$$
+\mathbb{E}[\psi(W; \theta_0, \hat\eta)]
+= \mathbb{E}[\Delta_\ell\,\Delta_m] - \theta_0\,\mathbb{E}[\Delta_m^2] .
+$$
+The expansion is exact: the score is bilinear in the nuisance errors,
+so there are no higher-order terms. Cauchy-Schwarz bounds it by
+$\|\Delta_\ell\|\,\|\Delta_m\| + |\theta_0|\,\|\Delta_m\|^2$. The Jacobian
+at $\hat\eta$ is $\mathbb{E}[(D - \hat m)^2] = \mathbb{E}[\tilde D^2] + \|\Delta_m\|^2$,
+so with $\hat\eta$ held fixed the population solution is
+$$
+\theta(\hat\eta) - \theta_0
+= \frac{\mathbb{E}[\Delta_\ell\Delta_m] - \theta_0\,\mathbb{E}[\Delta_m^2]}{\mathbb{E}[\tilde D^2] + \mathbb{E}[\Delta_m^2]} .
+$$
+Section \@ref(sec-rates) evaluates the second term of the numerator on
+the fitted propensity. Section \@ref(sec-double-lasso) is this formula
+with shrinkage in both errors.
+
+### AIPW score for the ATE
+
+Score $\psi = g(1, X) - g(0, X) + H(D, X)\,(Y - g(D, X)) - \theta$ with
+$H(D, X) = D / m(X) - (1 - D) / (1 - m(X))$, nuisance $\eta = (g, m)$.
+$H_0$ is $H$ at $m_0$.
+
+*Inverse-propensity identity.* For any function $f(D, X)$,
+$$
+\mathbb{E}\Bigl[\frac{D}{m_0(X)}\, f(D, X)\Bigr]
+= \mathbb{E}\Bigl[\frac{\mathbb{E}[D \mid X]}{m_0(X)}\, f(1, X)\Bigr]
+= \mathbb{E}[f(1, X)],
+\qquad
+\mathbb{E}\Bigl[\frac{1 - D}{1 - m_0(X)}\, f(D, X)\Bigr] = \mathbb{E}[f(0, X)] .
+$$
+
+*Direction in $g$.* With $g = g_0 + t\Delta_g$ and $m = m_0$,
+$$
+\partial_g M[\Delta_g]
+= \mathbb{E}[\Delta_g(1, X) - \Delta_g(0, X)] - \mathbb{E}[H_0(D, X)\,\Delta_g(D, X)] = 0
+$$
+by the identity with $f = \Delta_g$.
+
+*Direction in $m$.* Only $H$ depends on $m$. With $m = m_0 + t\Delta_m$,
+$$
+\dot H(D, X) := \frac{d}{dt} H\Big|_{t = 0}
+= -\Delta_m(X)\Bigl(\frac{D}{m_0(X)^2} + \frac{1 - D}{(1 - m_0(X))^2}\Bigr),
+\qquad
+\partial_m M[\Delta_m] = \mathbb{E}\bigl[\dot H(D, X)\,(Y - g_0(D, X))\bigr] = 0,
+$$
+because $\dot H$ is a function of $(D, X)$ and
+$\mathbb{E}[Y - g_0(D, X) \mid D, X] = 0$.
+
+*Inverse propensity weighting alone.* The score $Y H(D, X) - \theta$
+has the same derivative with $Y$ in place of $Y - g_0(D, X)$:
+$\mathbb{E}[\dot H\, Y] = \mathbb{E}[\dot H\, g_0(D, X)] \ne 0$. Subtracting
+$g_0$ inside the weighted term is what makes the derivative vanish.
+That is the middle row of the table in Section \@ref(sec-irm).
+
+*Exact remainder.* With $\Delta_g = \hat g - g_0$, $\Delta_m = \hat m - m_0$
+and $\hat H$ equal to $H$ at $\hat m$,
+$$
+\mathbb{E}[\psi(W; \theta_0, \hat\eta)]
+= \mathbb{E}[\Delta_g(1, X) - \Delta_g(0, X)]
++ \underbrace{\mathbb{E}[\hat H\,(Y - g_0(D, X))]}_{= 0}
+- \mathbb{E}[\hat H\,\Delta_g(D, X)] .
+$$
+Conditioning on $X$ in the last term gives
+$\mathbb{E}[\tfrac{m_0}{\hat m}\Delta_g(1, X)] - \mathbb{E}[\tfrac{1 - m_0}{1 - \hat m}\Delta_g(0, X)]$.
+Collecting terms,
+$$
+\mathbb{E}[\psi(W; \theta_0, \hat\eta)]
+= \mathbb{E}\Bigl[\frac{\hat m - m_0}{\hat m}\,\Delta_g(1, X)\Bigr]
++ \mathbb{E}\Bigl[\frac{\hat m - m_0}{1 - \hat m}\,\Delta_g(0, X)\Bigr] .
+$$
+Again the expansion is exact. If $\hat m$ is clipped to
+$[\epsilon, 1 - \epsilon]$, Cauchy-Schwarz gives
+$$
+\bigl|\mathbb{E}[\psi(W; \theta_0, \hat\eta)]\bigr|
+\le \frac{1}{\epsilon}\,\|\hat m - m_0\|\,
+\bigl(\|\hat g(1, \cdot) - g_0(1, \cdot)\| + \|\hat g(0, \cdot) - g_0(0, \cdot)\|\bigr) .
+$$
+The product form is double robustness. The factor $1 / \epsilon$ is the
+theoretical price of weak overlap, and the reason `est_dml()` clips.
+
+### ATT score
+
+Score $\psi = \psi^b - \psi^a\theta$ with
+$$
+\psi^b = \Bigl(D - (1 - D)\frac{m(X)}{1 - m(X)}\Bigr)\frac{Y - g(0, X)}{\bar p},
+\qquad
+\psi^a = \frac{D}{\bar p},
+$$
+nuisance $\eta = (g(0, \cdot), m, \bar p)$. At the truth,
+$\mathbb{E}[D\,(Y - g_0(0, X))] = \mathbb{E}[D\,(g_0(1, X) - g_0(0, X))] = \bar p\,\theta_0$
+and $\mathbb{E}[(1 - D)\tfrac{m_0}{1 - m_0}(Y - g_0(0, X))] = 0$, so
+$M(\theta_0, \eta_0) = 0$.
+
+*Direction in $g(0, \cdot)$.* With $g(0, \cdot) = g_0(0, \cdot) + t\Delta$,
+$$
+\partial M[\Delta]
+= -\frac{1}{\bar p}\,\mathbb{E}\Bigl[\Bigl(D - (1 - D)\frac{m_0}{1 - m_0}\Bigr)\Delta(X)\Bigr]
+= -\frac{1}{\bar p}\bigl(\mathbb{E}[m_0\Delta] - \mathbb{E}[m_0\Delta]\bigr) = 0,
+$$
+using $\mathbb{E}[D \mid X] = m_0$ and $\mathbb{E}[1 - D \mid X] = 1 - m_0$.
+
+*Direction in $m$.* Only the odds $m / (1 - m)$ depend on $m$. They
+multiply $(1 - D)(Y - g_0(0, X))$, whose conditional mean given
+$(D, X)$ is zero. The derivative is zero.
+
+*Direction in $\bar p$.* The score is $\bar p^{-1}$ times a function
+that does not involve $\bar p$, so the derivative is
+$-M(\theta_0, \eta_0) / \bar p = 0$. In the estimator $\bar p$ cancels
+between numerator and denominator, so its estimation is immaterial.
+
+*Exact remainder.* With $\Delta_g = \hat g(0, \cdot) - g_0(0, \cdot)$ and
+$\Delta_m = \hat m - m_0$,
+$$
+\mathbb{E}[\psi(W; \theta_0, \hat\eta)]
+= \frac{1}{\bar p}\,\mathbb{E}\Bigl[\frac{\hat m - m_0}{1 - \hat m}\,\Delta_g(X)\Bigr] .
+$$
+Only the untreated outcome model enters, and only in product with the
+propensity error. The ATT score is doubly robust in $(g(0, \cdot), m)$.
+
+### Single and double selection in the linear model
+
+Model $Y = \alpha D + \beta' W + \varepsilon$ and $D = \gamma' W + v$
+with $\mathbb{E}[\varepsilon \mid D, W] = 0$, $\mathbb{E}[v \mid W] = 0$,
+$\sigma_v^2 = \mathbb{E}[v^2]$, and $\Sigma_W = \mathbb{E}[WW']$. The
+coefficient of $Y$ on $W$ alone is $\pi = \alpha\gamma + \beta$.
+
+*Single selection is not orthogonal.* The refit after selecting on the
+outcome equation solves $\mathbb{E}[(Y - \alpha D - \hat\beta' W)\, D] = 0$
+in $\alpha$, with $\beta$ as the nuisance. In the direction $\Delta$,
+$$
+\partial_\beta M[\Delta] = -\mathbb{E}[D\,W']\,\Delta = -\gamma'\Sigma_W\Delta \ne 0
+$$
+unless $\gamma = 0$, that is, unless there is no confounding.
+
+*One formula for both procedures.* Let $S$ be the set of controls kept
+by a selection and refit by least squares, with $\Sigma_W = I$. Then the
+partialling-out errors are $\Delta_{\ell, j} = -\pi_j$ and
+$\Delta_{m, j} = -\gamma_j$ for $j \notin S$, and zero otherwise. The
+exact formula of the partialling-out subsection gives
+$$
+\theta(\hat\eta) - \alpha
+= \frac{\sum_{j \notin S}\pi_j\gamma_j - \alpha\sum_{j \notin S}\gamma_j^2}{\sigma_v^2 + \sum_{j \notin S}\gamma_j^2}
+= \frac{\sum_{j \notin S}\beta_j\gamma_j}{\sigma_v^2 + \sum_{j \notin S}\gamma_j^2},
+$$
+which is also the limit of least squares of $Y$ on $D$ and $W_S$. It is
+omitted-variable bias, summed over the dropped controls.
+
+- *Single selection* takes $S = S_\ell$, the controls the outcome lasso
+  keeps. A control with small $\beta_j$ and large $\gamma_j$ is dropped
+  and contributes its full $\beta_j\gamma_j$. When $D$ is almost
+  collinear with the leading controls, the lasso keeps $D$ and drops
+  those controls too; the numerator then contains their large
+  products.
+- *Post-double-selection* takes $S = S_\ell \cup S_m$. Every dropped
+  control has small $\beta_j$ and small $\gamma_j$, so each term of the
+  numerator is a product of two small numbers. That is the remainder
+  $\mathbb{E}[\Delta_\ell\Delta_m]$ in coordinates.
+- *Shrunken predictions* keep the controls but shrink them:
+  $\Delta_{m, j} = -s_j\gamma_j$ and $\Delta_{\ell, j} = -s_j'\pi_j$ with
+  $s_j, s_j' \in (0, 1]$ on the kept set. The same formula applies. The
+  numerator no longer vanishes on the kept controls, and the
+  denominator stays close to $\sigma_v^2$. When $\sigma_v^2$ is small,
+  as in Table \@ref(tab:tab-double-lasso), the ratio is large.
+
+## Proof sketch of asymptotic normality {#app-proof}
+
+This appendix fills in Section \@ref(sec-skeleton) for a linear score
+with $K$-fold cross-fitting and the pooled solution. It follows
+Chernozhukov et al. (2018, Theorems 3.1 and 3.2), simplified to a scalar
+$\theta$.
+
+### Setting
+
+- $W_1, \dots, W_n$ are i.i.d. draws of $W$.
+- The score is linear: $\psi(W; \theta, \eta) = \psi^b(W; \eta) - \psi^a(W; \eta)\,\theta$.
+- The folds $I_1, \dots, I_K$ have $n_k = n / K$ observations each, and
+  $K$ is fixed.
+- $\hat\eta_{[k]}$ is fitted on $I_k^c$. For $i \in I_k$ write
+  $\psi_i^a = \psi^a(W_i; \hat\eta_{[k]})$ and $\psi_i^b = \psi^b(W_i; \hat\eta_{[k]})$.
+- The estimator is $\hat\theta = \sum_i \psi_i^b / \sum_i \psi_i^a$ with
+  $\hat J = \mathbb{E}_n[\psi_i^a]$.
+
+For a fixed function $\eta$, $M(\theta, \eta) = \mathbb{E}[\psi(W; \theta, \eta)]$
+is the expectation over a fresh draw of $W$. $\mathbb{E}_{n,k}$ is the
+average over $i \in I_k$. "Given $I_k^c$" means conditional on the
+observations outside fold $k$, which fixes $\hat\eta_{[k]}$.
+
+### Conditions
+
+There are a set of functions $\mathcal{T}_n$ with
+$\mathbb{P}(\hat\eta_{[k]} \in \mathcal{T}_n) \to 1$ for every $k$, and
+sequences $r_n \to 0$ and $\lambda_n = o(n^{-1/2})$, such that for every
+$\eta \in \mathcal{T}_n$:
+
+- **(C1) Identification.** $M(\theta_0, \eta_0) = 0$ and
+  $J_0 = \mathbb{E}[\psi^a(W; \eta_0)] \ne 0$.
+- **(C2) Orthogonality.** $\partial_\eta M(\theta_0, \eta_0)[\eta - \eta_0] = 0$.
+- **(C3) Second-order remainder.** With
+  $f(t) = M(\theta_0, \eta_0 + t(\eta - \eta_0))$,
+  $\sup_{t \in (0, 1)} |f''(t)| \le \lambda_n$.
+- **(C4) Consistency.** $\|\psi(\cdot; \theta_0, \eta) - \psi(\cdot; \theta_0, \eta_0)\| \le r_n$
+  and $\|\psi^a(\cdot; \eta) - \psi^a(\cdot; \eta_0)\| \le r_n$.
+- **(C5) Moments.** $\sigma_0^2 = \mathbb{E}[\psi(W; \theta_0, \eta_0)^2]$
+  is finite and positive, and $\mathbb{E}[\psi^a(W; \eta_0)^2] < \infty$.
+
+Appendix \@ref(app-orthogonality) gives (C2) and (C3) for the scores of
+this lecture: $\lambda_n$ is of order
+$\|\hat\ell - \ell_0\|\,\|\hat m - m_0\| + \|\hat m - m_0\|^2$ for partialling
+out and $\epsilon^{-1}\|\hat m - m_0\|\,\|\hat g - g_0\|$ for AIPW. Learners
+whose $L^2$ error is $o(n^{-1/4})$ deliver $\lambda_n = o(n^{-1/2})$ and
+$r_n \to 0$.
+
+> **Theorem.** Under (C1) to (C5),
+> $$
+> \sqrt{n}\,(\hat\theta - \theta_0) \to N(0, V),
+> \qquad V = \sigma_0^2 / J_0^2,
+> $$
+> and $\hat\sigma^2 = \hat J^{-2}\,\mathbb{E}_n\bigl[(\psi_i^b - \psi_i^a\hat\theta)^2\bigr] \to_p V$.
+
+### Proof
+
+**Step 0: representation.** By construction
+$\sum_i (\psi_i^b - \psi_i^a\hat\theta) = 0$. Subtracting this from
+$\sum_i (\psi_i^b - \psi_i^a\theta_0)$ gives
+$\mathbb{E}_n[\psi(W_i; \theta_0, \hat\eta_{[k(i)]})] = (\hat\theta - \theta_0)\,\hat J$, so
+$$
+\sqrt{n}\,(\hat\theta - \theta_0)
+= \frac{\sqrt{n}\,\mathbb{E}_n[\psi(W_i; \theta_0, \hat\eta_{[k(i)]})]}{\hat J} .
+$$
+
+**Step 1: a lemma for cross-fitted averages.** Let $h(W; \eta)$ satisfy
+$\|h(\cdot; \eta) - h(\cdot; \eta_0)\| \le r_n$ for all $\eta \in \mathcal{T}_n$.
+Then
+$$
+\mathbb{E}_{n,k}[h(W_i; \hat\eta_{[k]})] - \mathbb{E}_{n,k}[h(W_i; \eta_0)] = O_p(r_n) .
+$$
+*Proof.* Given $I_k^c$, the differences
+$Z_i = h(W_i; \hat\eta_{[k]}) - h(W_i; \eta_0)$, $i \in I_k$, are i.i.d.
+On the event $\hat\eta_{[k]} \in \mathcal{T}_n$,
+$\mathbb{E}[Z_i^2 \mid I_k^c] \le r_n^2$. By Jensen,
+$\bar Z_k^2 \le \mathbb{E}_{n,k}[Z_i^2]$, so
+$\mathbb{E}[\bar Z_k^2 \mid I_k^c] \le r_n^2$ and Markov's inequality gives
+$\mathbb{P}(|\bar Z_k| > t \mid I_k^c) \le r_n^2 / t^2$. Take expectations
+and use $\mathbb{P}(\hat\eta_{[k]} \in \mathcal{T}_n) \to 1$. $\square$
+
+The conditioning is the point. Because $\hat\eta_{[k]}$ was fitted on
+$I_k^c$, it is a fixed function given $I_k^c$, and
+$\mathbb{E}[Z_i^2 \mid I_k^c]$ is an ordinary population moment at that
+function. Without cross-fitting $\hat\eta$ depends on $W_i$ and no such
+bound is available.
+
+**Step 2: the Jacobian.** Apply the lemma with $h = \psi^a$ and average
+over the $K$ folds:
+$\hat J = \mathbb{E}_n[\psi^a(W_i; \eta_0)] + O_p(r_n) = J_0 + o_p(1)$ by
+the law of large numbers, (C4) and (C5).
+
+**Step 3: decomposition of the numerator.** For each fold, with
+$Z_i = \psi(W_i; \theta_0, \hat\eta_{[k]}) - \psi(W_i; \theta_0, \eta_0)$,
+$$
+\sqrt{n_k}\,\mathbb{E}_{n,k}[\psi(W_i; \theta_0, \hat\eta_{[k]})]
+= \underbrace{\sqrt{n_k}\,\mathbb{E}_{n,k}[\psi(W_i; \theta_0, \eta_0)]}_{(a_k)}
++ \underbrace{\sqrt{n_k}\,\bigl(\mathbb{E}_{n,k}[Z_i] - \mathbb{E}[Z_i \mid I_k^c]\bigr)}_{(b_k)}
++ \underbrace{\sqrt{n_k}\,\mathbb{E}[Z_i \mid I_k^c]}_{(c_k)} .
+$$
+Since $n_k = n / K$,
+$$
+\sqrt{n}\,\mathbb{E}_n[\psi(W_i; \theta_0, \hat\eta_{[k(i)]})]
+= \frac{1}{\sqrt K}\sum_{k = 1}^K \bigl[(a_k) + (b_k) + (c_k)\bigr] .
+$$
+
+**Step 4: the bias term $(c_k)$.** Let
+$f(t) = M(\theta_0, \eta_0 + t(\hat\eta_{[k]} - \eta_0))$. Then
+$\mathbb{E}[Z_i \mid I_k^c] = f(1) - f(0)$. By (C1), $f(0) = 0$. By (C2),
+$f'(0) = 0$. Taylor's theorem with the Lagrange remainder gives
+$f(1) = \tfrac12 f''(\bar t)$ for some $\bar t \in (0, 1)$, so by (C3)
+$$
+|(c_k)| \le \tfrac12\sqrt{n_k}\,\lambda_n = o(1) .
+$$
+Orthogonality removes the term of order $\sqrt{n}\,\|\hat\eta - \eta_0\|$.
+The rate condition removes the term of order $\sqrt{n}\,\|\hat\eta - \eta_0\|^2$.
+
+**Step 5: the empirical-process term $(b_k)$.** Given $I_k^c$, the $Z_i$
+are i.i.d. with variance at most $\mathbb{E}[Z_i^2 \mid I_k^c] \le r_n^2$
+on the event $\hat\eta_{[k]} \in \mathcal{T}_n$. So $(b_k)$ has
+conditional mean zero and conditional variance at most $r_n^2$, and
+Chebyshev's inequality gives
+$$
+\mathbb{P}\bigl(|(b_k)| > t \,\big|\, I_k^c\bigr) \le r_n^2 / t^2 \to 0 .
+$$
+Taking expectations, $(b_k) = o_p(1)$. This is the only step that uses
+cross-fitting, and it uses only consistency, not the rate.
+
+**Step 6: the oracle term and the limit.**
+$K^{-1/2}\sum_k (a_k) = \sqrt{n}\,\mathbb{E}_n[\psi(W_i; \theta_0, \eta_0)]$
+is $\sqrt{n}$ times an average of i.i.d. mean-zero variables with
+variance $\sigma_0^2$. By the central limit theorem it converges to
+$N(0, \sigma_0^2)$. Steps 0, 2, 4, 5 and Slutsky's lemma give
+$$
+\sqrt{n}\,(\hat\theta - \theta_0)
+= \frac{N(0, \sigma_0^2) + o_p(1)}{J_0 + o_p(1)}
+\;\to\; N\bigl(0, \sigma_0^2 / J_0^2\bigr) .
+$$
+
+**Step 7: the variance estimator.** Write
+$\psi_i^b - \psi_i^a\hat\theta = \psi(W_i; \theta_0, \hat\eta_{[k(i)]}) - \psi_i^a(\hat\theta - \theta_0)$.
+The second piece has mean square $O_p(n^{-1})$ by Step 6 and (C5). For
+the first piece, the conditioning argument of Step 1 applied to $Z_i^2$
+gives $\mathbb{E}_n[Z_i^2] = O_p(r_n^2)$, and the triangle inequality in
+the empirical $L^2$ norm gives
+$$
+\Bigl|\sqrt{\mathbb{E}_n[\psi(W_i; \theta_0, \hat\eta_{[k(i)]})^2]}
+- \sqrt{\mathbb{E}_n[\psi(W_i; \theta_0, \eta_0)^2]}\Bigr|
+\le \sqrt{\mathbb{E}_n[Z_i^2]} = O_p(r_n) .
+$$
+So $\mathbb{E}_n[(\psi_i^b - \psi_i^a\hat\theta)^2] \to_p \sigma_0^2$ by the
+law of large numbers, and $\hat\sigma^2 \to_p \sigma_0^2 / J_0^2 = V$ by
+Step 2. $\square$
+
+### Remarks
+
+- **Where each ingredient enters.** Identification: Steps 2 and 4
+  ($f(0) = 0$). Orthogonality: Step 4 ($f'(0) = 0$). The rate: Step 4
+  ($\sqrt{n}\,\lambda_n \to 0$). Cross-fitting: Steps 1, 5 and 7, through
+  the conditioning on $I_k^c$. Nuisance consistency: Steps 2, 5 and 7.
+  Without cross-fitting, Step 5 needs a Donsker condition on the
+  learner. Without orthogonality, $(c_k)$ is of order
+  $\sqrt{n}\,\|\hat\eta - \eta_0\|$, which diverges for any learner slower
+  than $n^{-1/2}$.
+- **Fold average.** The fold-average solution replaces Step 0 by
+  $\hat\theta_k = \sum_{I_k}\psi_i^b / \sum_{I_k}\psi_i^a$ and averages
+  the $K$ solutions. The same steps apply fold by fold, with
+  $\hat J_k \to_p J_0$, and the limit is unchanged.
+- **Repeated partitions.** Steps 4 and 5 show that
+  $\sqrt{n}\,(\hat\theta_s - \theta_0) = J_0^{-1}\sqrt{n}\,\mathbb{E}_n[\psi(W_i; \theta_0, \eta_0)] + o_p(1)$
+  for every partition $s$, and the leading term does not depend on the
+  partition. So $\sqrt{n}\,(\hat\theta_s - \hat\theta_{s'}) = o_p(1)$,
+  and the mean or median over a fixed number $S$ of partitions has the
+  same limit. The correction $(\hat\theta_s - \tilde\theta)^2$ in the
+  median variance is $o_p(n^{-1})$ in theory; it matters in finite
+  samples, where the $o_p(1)$ terms are not yet small.
+
+## References
+
+- Belloni, Alexandre, Victor Chernozhukov, and Christian Hansen. 2014. "Inference on Treatment Effects after Selection among High-Dimensional Controls." *Review of Economic Studies*.
+- Chernozhukov, Victor, Denis Chetverikov, Mert Demirer, Esther Duflo, Christian Hansen, Whitney Newey, and James Robins. 2018. "Double/Debiased Machine Learning for Treatment and Structural Parameters." *The Econometrics Journal*.
+- Chernozhukov, Victor, Christian Hansen, Nathan Kallus, Martin Spindler, and Vasilis Syrgkanis. 2026. *Applied Causal Inference Powered by ML and AI*. Online, version 0.1.2.
+- Chernozhukov, Victor, Whitney K. Newey, and Rahul Singh. 2022. "Automatic Debiased Machine Learning of Causal and Structural Effects." *Econometrica*.
+- Ellickson, Paul B., Wreetabrata Kar, and James C. Reeder III. 2023. "Estimating Marketing Component Effects: Double Machine Learning from Targeted Digital Promotions." *Marketing Science*.
+- Kennedy, Edward H. 2023. "Towards Optimal Doubly Robust Estimation of Heterogeneous Causal Effects." *Electronic Journal of Statistics*.
+- Nie, Xinkun, and Stefan Wager. 2021. "Quasi-Oracle Estimation of Heterogeneous Treatment Effects." *Biometrika*.
+- Robins, James M., Andrea Rotnitzky, and Lue Ping Zhao. 1994. "Estimation of Regression Coefficients When Some Regressors Are Not Always Observed." *Journal of the American Statistical Association*.
+- Robinson, Peter M. 1988. "Root-N-Consistent Semiparametric Regression." *Econometrica*.
+- Sant'Anna, Pedro H. C., and Jun Zhao. 2020. "Doubly Robust Difference-in-Differences Estimators." *Journal of Econometrics*.
+- Syrgkanis, Vasilis. *MS&E 228: Applied Causal Inference Powered by ML and AI.* Lecture slides, Stanford University.
+- van der Laan, Mark J., and Daniel Rubin. 2006. "Targeted Maximum Likelihood Learning." *International Journal of Biostatistics*.

@@ -7,3 +7,17 @@
 data_raw/
 gpt_pro_context.zip
 _gpt_pro_context/
+
+# Vignette and build products
+inst/doc
+/doc/
+/Meta/
+vignettes/*.html
+vignettes/*.pdf
+vignettes/*.R
+vignettes/*.log
+vignettes/*_files/
+vignettes/*_cache/
+
+# Stray device output from ad-hoc R runs
+Rplots.pdf

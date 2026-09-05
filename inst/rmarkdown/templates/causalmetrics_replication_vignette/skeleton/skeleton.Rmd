@@ -1,7 +1,7 @@
 ---
 title: "Replication: [Paper Title]"
-subtitle: "[Identification Strategy] - illustration using [Author Year]"
-author: "Replicated by [Your Name]"
+subtitle: "[Identification strategy], illustrated with [Author (Year)]"
+author: "[Your Name]"
 date: "`r Sys.Date()`"
 output:
   bookdown::pdf_document2:
@@ -14,263 +14,361 @@ output:
     toc_depth: 3
     number_sections: true
     fig_caption: true
-vignette: >
-  %\VignetteIndexEntry{causalmetrics Replication Vignette}
-  %\VignetteEncoding{UTF-8}
-  %\VignetteEngine{knitr::rmarkdown}
-bibliography: references.bib
 link-citations: true
+params:
+  data_path: "path/to/replication-package/data.dta"
 ---
 
 ```{r setup, include = FALSE}
 knitr::opts_chunk$set(
-  collapse  = TRUE,
-  comment   = "#>",
-  fig.align = "center",
-  fig.width = 7,
+  collapse   = TRUE,
+  comment    = "#>",
+  fig.align  = "center",
+  fig.width  = 7,
   fig.height = 4.5,
-  dpi       = 150,
-  message   = FALSE,
-  warning   = FALSE
+  out.width  = "80%",
+  dpi        = 150,
+  message    = FALSE,
+  warning    = FALSE,
+  echo       = FALSE
 )
 
-# This template is designed to knit before you replace placeholders.
-# Paper-specific code chunks are marked eval = FALSE until edited.
-optional_packages <- c(
-  "data.table", "ggplot2", "fixest", "modelsummary", "kableExtra"
+# This template knits before you replace any placeholder: every paper-specific
+# chunk is `eval = FALSE` until you edit it.
+#
+# Save the file under inst/replications/<NN>_<Topic>/ with a short bibkey-style
+# name such as thornton2008demand.Rmd: R limits package paths to 100 bytes.
+#
+# Estimators, tables, and plots are called directly from their packages.
+# causalmetrics supplies est_aipw() and the LaTeX wrappers table_task(),
+# wrap_latex_table(), plot_task(), and wrap_latex_figure().
+required_pkgs <- c(
+  "causalmetrics", "haven", "dplyr", "tidyr", "broom", "estimatr", "fixest",
+  "modelsummary", "kableExtra", "ggplot2"
 )
-missing_packages <- optional_packages[
-  !vapply(optional_packages, requireNamespace, logical(1), quietly = TRUE)
+missing_pkgs <- required_pkgs[
+  !vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)
 ]
-if (length(missing_packages) > 0) {
+if (length(missing_pkgs) > 0) {
   message(
-    "Optional packages not installed: ",
-    paste(missing_packages, collapse = ", "),
-    ". Install them before running the empirical chunks."
+    "Install before running the empirical chunks: ",
+    paste(missing_pkgs, collapse = ", ")
   )
+}
+if (requireNamespace("causalmetrics", quietly = TRUE)) {
+  suppressPackageStartupMessages(library(causalmetrics))
+}
+
+options(modelsummary_factory_latex = "kableExtra")
+options(modelsummary_factory_html  = "kableExtra")
+
+# Helpers local to this replication. They are not package exports.
+fmt_num <- function(x, digits = 3) {
+  ifelse(is.na(x), "", formatC(x, digits = digits, format = "f", big.mark = ","))
 }
 ```
 
 # Pedagogical goal {.unnumbered}
 
-> **One sentence: what should a reader learn from this vignette?**
+> **One sentence: what should a reader learn from this replication?**
 >
 > Example: *How to move from a randomized encouragement design to an IV
 > analysis when take-up is endogenous, while auditing sample construction,
 > attrition, balance, and first-stage strength.*
 
-This vignette uses **[Author Year]** as an illustration of **[identification strategy]**. The paper studies [one-sentence research question]. The point of the vignette is not to reproduce every result in the paper, but to teach the workflow for this design.
+This replication uses **[Author (Year)]** to illustrate **[identification
+strategy]**. The paper asks [one-sentence research question]. The point is to
+teach the workflow for this design, not to reproduce every table in the paper.
 
-**What is NOT in this vignette:**
+**Not replicated here:**
 
-- [Robustness check] - [reason for exclusion]
-- [Supplementary specification] - [reason]
-- [Paper-specific calculation] - [reason]
+- [Robustness check]: [reason for exclusion]
+- [Supplementary specification]: [reason]
 
----
+# Research question
 
-# Design and data
+- **Question.** [What causal effect, of what treatment, on which outcome, for whom?]
+- **Mechanism.** [Why the treatment should move the outcome, in the paper's own theory.]
+- **Why this design.** [Why this identification strategy fits the setting; what the naive comparison gets wrong.]
 
-## Identification strategy
+# Design and identification
 
-[2-4 paragraphs.]
-
-- Causal estimand and parameter of interest.
-- Identification assumptions, stated formally and in plain English.
-- Threats to identification and how the paper addresses them.
-- Estimator used (be specific: e.g., "TWFE is inappropriate due to staggered timing; the paper uses Sun-Abraham via `fixest::sunab()`").
-
-## Data
-
-```{r load-data, eval = FALSE}
-# The demonstration dataset is built by data-raw/prep_replication_*.R.
-# Replace dataset_name with the dataset object exported by your package.
-data("dataset_name", package = "causalmetrics")
-dt <- data.table::as.data.table(dataset_name)
-
-dim(dt)
-```
-
-Variable definitions for this analysis:
+- **Estimand.** [ATE / ATT / ITT / LATE / CATE], defined for [population].
+- **Assumptions.** [Formal statement, then the plain-English version.]
+- **Threats.** [What could break identification and how the paper addresses each threat.]
+- **Estimator.** [Be specific. Example: "TWFE is inappropriate under staggered adoption; the paper uses Sun-Abraham via `fixest::sunab()`."]
 
 | Role | Variable | Description |
 |------|----------|-------------|
 | Unit | `unit_var` | [description] |
 | Time | `time_var` | [description] |
-| Treatment | `treat_var` | [description] |
-| Outcome | `outcome_var` | [description] |
-| Controls | `control_vars` | [description] |
-| Fixed effects | `fixed_effect_vars` | [description] |
-| Cluster | `cluster_var` | [description] |
+| Assignment $Z$ | `assign_var` | [description; equals $D$ under perfect compliance] |
+| Treatment $D$ | `treat_var` | [description] |
+| Outcome $Y$ | `outcome_var` | [description] |
+| Controls | `cov1`, `cov2` | pre-treatment only |
+| Cluster | `cluster_var` | [level of assignment or of correlated shocks] |
 
-# Section 2: [Data construction and sample audit]
+# Data and sample construction
 
-> **What this section teaches:** [one idea]
+> **What this section teaches:** sample restrictions change the estimand, so
+> record them before estimating anything.
 
-Auditing the sample construction is the first defense against silently changing the estimand. We use `diag_filter_flow()` to record observation counts at each filtering step, and `diag_special_codes()` to catch sentinel codes that would otherwise be treated as numeric outcomes.
+```{r load-data, eval = FALSE}
+if (!file.exists(params$data_path)) {
+  stop(
+    "Data file not found: ", params$data_path,
+    "\nUpdate params$data_path in the YAML header."
+  )
+}
+raw <- haven::read_dta(params$data_path)
 
-```{r sample-flow, eval = FALSE}
-flow <- causalmetrics::diag_filter_flow(dt, list(
-  "Initial observations" = function(d) rep(TRUE, nrow(d)),
-  "First filter"         = function(d) d[["your_indicator"]] == 1,
-  "Second filter"        = function(d) !is.na(d[["your_variable"]])
-  # Add filters as needed.
-))
-
-knitr::kable(
-  flow,
-  caption = "Sample construction.",
-  booktabs = TRUE
-)
-```
-
-```{r special-codes, eval = FALSE}
-# Example: detect sentinel codes.
-causalmetrics::diag_special_codes(
-  dt,
-  vars = c("var1", "var2"),
-  codes = c(-1, 88, 99)
-)
-```
-
-# Section 3: [Descriptive statistics]
-
-> **What this section teaches:** [one idea]
-
-```{r summary, eval = FALSE}
-sum_tab <- causalmetrics::desc_summary(
-  dt,
-  vars = c("var1", "var2", "var3"),
-  by   = "treat_var"
-)
-
-causalmetrics::to_latex(
-  sum_tab,
-  caption = "Summary statistics by treatment.",
-  label = "tab:summary"
-)
-```
-
-# Section 4: [Design-specific diagnostics]
-
-> **What this section teaches:** what to check before estimation for this identification strategy.
-
-Different identification strategies need different diagnostics. Edit this section based on the design.
-
-**For RCT / randomized encouragement:**
-
-```{r balance, eval = FALSE}
-causalmetrics::desc_balance(
-  dt,
-  vars = c("cov1", "cov2"),
-  treat = "treat"
-) |>
-  causalmetrics::to_latex(
-    caption = "Baseline balance.",
-    label = "tab:balance"
+# Paper-specific cleaning and variable construction stay in this file.
+dt <- raw |>
+  dplyr::mutate(
+    # treat_var   = ...,
+    # outcome_var = ...
   )
 ```
 
-**For DiD:**
-
-```{r did-diag, eval = FALSE}
-# Plot treatment timing across cohorts.
-causalmetrics::plot_treatment_timing(
-  dt,
-  unit = "unit",
-  time = "time",
-  treat = "treat"
+```{r sample-flow, eval = FALSE}
+# Record observation counts at each restriction. Edit the steps.
+steps <- list(
+  "Raw file"             = function(d) d,
+  "Drop missing outcome" = function(d) dplyr::filter(d, !is.na(outcome_var)),
+  "Analysis sample"      = function(d) dplyr::filter(d, sample_flag == 1)
 )
+flow <- Reduce(
+  function(acc, nm) {
+    d <- steps[[nm]](acc$data)
+    acc$table <- rbind(acc$table, data.frame(Step = nm, Observations = nrow(d)))
+    acc$data <- d
+    acc
+  },
+  names(steps),
+  init = list(data = dt, table = NULL)
+)
+analysis_sample <- flow$data
+
+flow$table |>
+  table_task(format.args = list(big.mark = ",")) |>
+  wrap_latex_table(
+    caption = "Sample construction.",
+    label   = "tab:sample_flow",
+    notes   = "Observation counts after each restriction."
+  )
 ```
 
-**For IV:**
+# Descriptive statistics
 
-```{r iv-diag, eval = FALSE}
-# First-stage regression. Call fixest directly.
+> **What this section teaches:** [one idea, e.g. why raw group differences
+> motivate the design]
+
+```{r summary-stats, eval = FALSE}
+modelsummary::datasummary_balance(
+  ~ treat_var,
+  data   = dplyr::select(analysis_sample, treat_var, cov1, cov2, outcome_var),
+  output = "kableExtra"
+) |>
+  kableExtra::kable_styling(latex_options = "HOLD_position") |>
+  wrap_latex_table(
+    caption = "Summary statistics by treatment status.",
+    label   = "tab:summary"
+  )
+```
+
+# Design-specific diagnostics
+
+> **What this section teaches:** what to check before estimation for this
+> identification strategy.
+
+Keep the diagnostics that match the design and delete the rest.
+
+**Randomized assignment or encouragement.** Assignment rate by arm, baseline
+balance with robust standard errors, attrition by arm, and take-up when $Z$
+differs from $D$.
+
+```{r rct-diagnostics, eval = FALSE}
+analysis_sample |>
+  dplyr::count(assign_var) |>
+  dplyr::mutate(share = n / sum(n))
+
+balance <- lapply(c("cov1", "cov2"), function(v) {
+  fit <- estimatr::lm_robust(
+    stats::reformulate("assign_var", response = v),
+    data    = analysis_sample,
+    se_type = "HC2"
+  )
+  data.frame(
+    covariate  = v,
+    difference = fit$coefficients[["assign_var"]],
+    std_error  = fit$std.error[["assign_var"]]
+  )
+})
+do.call(rbind, balance) |>
+  table_task(digits = 3) |>
+  wrap_latex_table(caption = "Baseline balance.", label = "tab:balance")
+```
+
+**Selection on observables.** Propensity-score overlap, weight tails,
+effective sample size, and balance after weighting or matching.
+`est_aipw()` reports the first three in its `$diagnostics`.
+
+```{r soo-diagnostics, eval = FALSE}
+ps_fit <- glm(treat_var ~ cov1 + cov2, data = analysis_sample, family = binomial())
+analysis_sample$p_hat <- predict(ps_fit, type = "response")
+
+plot_task(analysis_sample, ggplot2::aes(x = p_hat, fill = factor(treat_var))) +
+  ggplot2::geom_histogram(
+    ggplot2::aes(y = ggplot2::after_stat(density)),
+    bins = 30, alpha = 0.5, position = "identity"
+  ) +
+  ggplot2::labs(x = "Estimated propensity score", y = "Density", fill = "Treated")
+```
+
+**Instrumental variables.** First-stage strength and the reduced form,
+clustered at the level of assignment.
+
+```{r iv-diagnostics, eval = FALSE}
 first_stage <- fixest::feols(
-  endog_var ~ instrument_var + control_var | fixed_effect_var,
-  data = dt,
+  treat_var ~ instrument_var + cov1 | fe_var,
+  data    = analysis_sample,
   cluster = ~ cluster_var
 )
-fixest::fitstat(first_stage, "ivf1")
+summary(first_stage)
 ```
 
-**For RD:**
+**Difference-in-differences.** Treatment timing by cohort, pre-trends, and
+the choice between TWFE and a heterogeneity-robust estimator.
 
-```{r rd-diag, eval = FALSE}
-# McCrary density test, bandwidth sensitivity, and covariate balance at cutoff.
-# rdrobust::rddensity(...)
+```{r did-diagnostics, eval = FALSE}
+timing <- analysis_sample |>
+  dplyr::group_by(unit_var) |>
+  dplyr::summarise(
+    cohort = suppressWarnings(min(time_var[treat_var == 1])),
+    .groups = "drop"
+  )
+
+plot_task(timing, ggplot2::aes(x = cohort)) +
+  ggplot2::geom_bar() +
+  ggplot2::labs(x = "First treated period", y = "Units")
 ```
 
-# Section 5: Estimation
+**Regression discontinuity.** Density (manipulation) test, covariate
+continuity at the cutoff, and bandwidth sensitivity with `rdrobust` and
+`rddensity`.
 
-> **What this section teaches:** the main estimator for this design.
+# Estimation
 
-External estimators are called directly. causalmetrics does not wrap them.
+> **What this section teaches:** the main estimator for this design, called
+> directly from its package.
 
 ```{r estimate, eval = FALSE}
-# Edit this chunk for the relevant identification strategy.
+# Keep the block that matches the design; delete the rest.
 
-# Example - staggered DiD via Sun-Abraham:
-fit <- fixest::feols(
-  outcome_var ~ fixest::sunab(cohort_var, time_var) | unit_fe + time_fe,
-  data = dt,
-  cluster = ~ cluster_var
+# Experiment or encouragement design: ITT with robust SEs, then LATE via IV.
+fit_itt <- estimatr::lm_robust(
+  outcome_var ~ assign_var + cov1,
+  data     = analysis_sample,
+  clusters = cluster_var
+)
+fit_late <- estimatr::iv_robust(
+  outcome_var ~ treat_var + cov1 | assign_var + cov1,
+  data     = analysis_sample,
+  clusters = cluster_var
 )
 
-summary(fit, agg = "att")
+# Selection on observables: AIPW with cross-fitted nuisance predictions.
+fit_aipw <- est_aipw(
+  analysis_sample,
+  y = "outcome_var", d = "treat_var", x = c("cov1", "cov2"),
+  folds = 5, seed = 1
+)
+
+# Instrumental variables with fixed effects.
+fit_iv <- fixest::feols(
+  outcome_var ~ cov1 | fe_var | treat_var ~ instrument_var,
+  data    = analysis_sample,
+  cluster = ~ cluster_var
+)
+fixest::fitstat(fit_iv, ~ ivf1 + ivwald1)
+
+# Staggered difference-in-differences via Sun-Abraham.
+fit_did <- fixest::feols(
+  outcome_var ~ fixest::sunab(cohort_var, time_var) | unit_var + time_var,
+  data    = analysis_sample,
+  cluster = ~ cluster_var
+)
+summary(fit_did, agg = "att")
 ```
 
 ## Regression table
 
 ```{r regtable, eval = FALSE}
 modelsummary::modelsummary(
-  list("Main" = fit),
-  output    = "latex",
+  list("ITT" = fit_itt, "LATE" = fit_late),
+  output    = "kableExtra",
   estimate  = "{estimate}{stars}",
   statistic = "({std.error})",
   stars     = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
-  gof_map   = c("nobs", "r.squared"),
-  notes     = "Clustered standard errors at [level]."
+  coef_map  = c("assign_var" = "Assigned", "treat_var" = "Treated"),
+  gof_map   = c("nobs", "r.squared")
+) |>
+  wrap_latex_table(
+    caption = "Main estimates.",
+    label   = "tab:main",
+    notes   = "Standard errors clustered at [level] in parentheses."
+  )
+```
+
+## Figure
+
+```{r main-figure, eval = FALSE}
+coef_df <- broom::tidy(fit_itt, conf.int = TRUE) |>
+  dplyr::filter(term != "(Intercept)")
+
+fig <- plot_task(coef_df, ggplot2::aes(x = term, y = estimate)) +
+  ggplot2::geom_pointrange(ggplot2::aes(ymin = conf.low, ymax = conf.high)) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+  ggplot2::labs(x = NULL, y = "Estimate")
+
+wrap_latex_figure(
+  fig,
+  caption = "Main estimates.",
+  label   = "fig:main",
+  notes   = "Bars are 95 percent confidence intervals."
 )
 ```
 
-## Event study figure
-
-```{r event-study, eval = FALSE, fig.cap = "Event study coefficients."}
-# plot_event_study() reads fixest output directly.
-causalmetrics::plot_event_study(fit) +
-  ggplot2::labs(x = "Event time", y = "ATT")
-```
-
-# Section 6: Interpretation
+# Interpretation
 
 [2-4 paragraphs.]
 
 - What the point estimate means substantively.
-- What the LATE / ATT / ATE represents in this context.
+- Which population the estimand refers to (ATE, ATT, ITT, LATE) and why.
 - Magnitude relative to the outcome's baseline level.
-- Comparison to the paper's headline number.
+- Comparison with the paper's headline number.
 - Limitations the paper acknowledges.
 
 # Decision summary
 
-This block is the formal record that the SKILL.md references. It captures the workflow decisions made in this vignette.
+This block is the formal record of the workflow decisions made in this
+replication. Keep it machine-readable.
 
 ```yaml
-design: "staggered DiD with heterogeneous treatment timing"
-estimator: "native call, e.g. fixest::sunab"
+design: "e.g. randomized encouragement with imperfect compliance"
+estimand: "e.g. ITT of the offer; LATE for compliers"
+estimator: "native call, e.g. estimatr::iv_robust or fixest::sunab"
 diagnostics_run:
-  - diag_filter_flow: "N units, N observations final sample"
-  - diag_special_codes: "codes checked"
-  - design_specific_diagnostic: "result"
+  - sample_flow: "N raw, N final"
+  - balance: "result"
+  - design_specific: "result"
 clustering: "level"
 fixed_effects: "list"
-controls: "list"
+controls: "pre-treatment list"
 output: "tables and figures produced"
 key_judgment: >
-  Why this estimator was chosen over alternatives. What the threats to
-  identification are. What is being estimated and on what population.
+  Why this estimator was chosen over alternatives, what the threats to
+  identification are, and what is being estimated on which population.
 limitations:
   - "limitation 1"
   - "limitation 2"
@@ -278,4 +376,17 @@ limitations:
 
 # References {.unnumbered}
 
-Add citation entries to `references.bib` and cite with `[@example2024]`.
+[Author (Year). Title. Journal.]
+
+# Appendix: code {.unnumbered}
+
+```{r setup-appendix-labels, echo = FALSE}
+# Echo the code of every chunk after load-data, without re-running it.
+all_chunks <- knitr::all_labels()
+start_pos <- match("load-data", all_chunks)
+appendix_chunks <- all_chunks[(start_pos + 1):length(all_chunks)]
+appendix_chunks <- setdiff(appendix_chunks, "setup-appendix-labels")
+```
+
+```{r ref.label = appendix_chunks, echo = TRUE, eval = FALSE}
+```

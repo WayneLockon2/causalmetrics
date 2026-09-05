@@ -74,7 +74,7 @@ plot_opening_scatter <- function(df) {
       y = mean(group_means$y_mean),
       label = paste0("Naive gap\n= ", round(naive_diff, 2)),
       hjust = 0, size = 3.3,
-      label.size = NA, fill = alpha("white", 0.8)
+      border.colour = NA, fill = alpha("white", 0.8)
     ) +
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
@@ -179,14 +179,14 @@ plot_robinson_step1 <- function(df) {
                linetype = "dashed", linewidth = 0.6) +
     annotate("label",
              x = min(df$x), y = max(df$y),
-             label = paste0("Naive Δ = ", round(naive_diff, 2),
+             label = paste0("Naive gap = ", round(naive_diff, 2),
                             "\n(biased: X differs by group)"),
-             hjust = 0, vjust = 1, size = 3.2, label.size = NA,
+             hjust = 0, vjust = 1, size = 3.2, border.colour = NA,
              fill = alpha("white", 0.85)) +
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
     labs(
-      title = "Step 1 — The naive comparison",
+      title = "Step 1: The naive comparison",
       subtitle = "Group-mean difference, ignoring X.",
       x = "X", y = "Y", color = NULL, fill = NULL
     ) +
@@ -210,8 +210,11 @@ plot_robinson_step2 <- function(df, poly_deg = 3) {
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
     labs(
-      title = "Step 2 — Predict Y from X",
-      subtitle = "Fit Ê[Y∣X] on all units; vertical lines are residuals  Ỹ = Y − Ê[Y∣X].",
+      title = "Step 2: Predict Y from X",
+      subtitle = expression(paste(
+        "Fit ", hat(E) * "[Y | X]", " on all units; vertical lines are residuals ",
+        tilde(Y) == Y - hat(E) * "[Y | X]", "."
+      )),
       x = "X", y = "Y", color = NULL, fill = NULL
     ) +
     soo_theme()
@@ -236,8 +239,11 @@ plot_robinson_step3 <- function(df, poly_deg = 3) {
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
     labs(
-      title = "Step 3 — Predict D from X (propensity)",
-      subtitle = "Fit ê(X) = Ê[D∣X]; vertical lines are residuals  D̃ = D − ê(X).",
+      title = "Step 3: Predict D from X (propensity)",
+      subtitle = expression(paste(
+        "Fit ", hat(e)(X) == hat(E) * "[D | X]", "; vertical lines are residuals ",
+        tilde(D) == D - hat(e)(X), "."
+      )),
       x = "X", y = "D (0/1)", color = NULL, fill = NULL
     ) +
     soo_theme()
@@ -258,17 +264,19 @@ plot_robinson_step4 <- function(df, poly_deg = 3) {
     geom_vline(xintercept = 0, color = "grey70", linewidth = 0.3) +
     annotate("label",
              x = min(df_r$d_resid), y = max(df_r$y_resid),
-             label = paste0("Residualized slope ≈ ", round(slope, 2),
-                            "\n(unbiased estimate of τ)"),
-             hjust = 0, vjust = 1, size = 3.2, label.size = NA,
+             label = paste0("Residualized slope = ", round(slope, 2),
+                            "\n(estimate of the ATE)"),
+             hjust = 0, vjust = 1, size = 3.2, border.colour = NA,
              fill = alpha("white", 0.85)) +
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
     labs(
-      title = "Step 4 — Regress residuals on residuals",
-      subtitle = "Slope of Ỹ on D̃ is the partialled-out treatment effect.",
-      x = "D̃ = D − ê(X)",
-      y = "Ỹ = Y − Ê[Y∣X]",
+      title = "Step 4: Regress residuals on residuals",
+      subtitle = expression(paste(
+        "Slope of ", tilde(Y), " on ", tilde(D), " is the partialled-out treatment effect."
+      )),
+      x = expression(tilde(D) == D - hat(e)(X)),
+      y = expression(tilde(Y) == Y - hat(E) * "[Y | X]"),
       color = NULL, fill = NULL
     ) +
     soo_theme()
@@ -303,9 +311,9 @@ plot_aipw_step1 <- function(df, poly_deg = 2) {
   fit_t <- lm(y ~ poly(x, poly_deg), data = d %>% filter(treat == 1))
   curves <- bind_rows(
     tibble(x = x_grid, y = predict(fit_c, newdata = data.frame(x = x_grid)),
-           model = "μ̂₀(x): control model"),
+           model = "control"),
     tibble(x = x_grid, y = predict(fit_t, newdata = data.frame(x = x_grid)),
-           model = "μ̂₁(x): treated model")
+           model = "treated")
   )
   reg_est <- mean(d$mu1 - d$mu0)
 
@@ -316,15 +324,18 @@ plot_aipw_step1 <- function(df, poly_deg = 2) {
               color = "grey20", linewidth = 0.9, inherit.aes = FALSE) +
     annotate("label",
              x = min(d$x), y = max(d$y),
-             label = paste0("Regression-imputation\nestimate ≈ ", round(reg_est, 2)),
-             hjust = 0, vjust = 1, size = 3.2, label.size = NA,
+             label = paste0("Regression-imputation\nestimate = ", round(reg_est, 2)),
+             hjust = 0, vjust = 1, size = 3.2, border.colour = NA,
              fill = alpha("white", 0.85)) +
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
-    scale_linetype_manual(values = c("μ̂₀(x): control model" = "dashed",
-                                     "μ̂₁(x): treated model" = "solid")) +
+    scale_linetype_manual(
+      values = c(control = "dashed", treated = "solid"),
+      labels = c(control = expression(hat(mu)[0](x) * ": control model"),
+                 treated = expression(hat(mu)[1](x) * ": treated model"))
+    ) +
     labs(
-      title = "Step 1 — Outcome-regression imputation",
+      title = "Step 1: Outcome-regression imputation",
       subtitle = "Two arm-specific fits; the gap between curves is the regression estimate.",
       x = "X", y = "Y", color = NULL, fill = NULL, linetype = NULL
     ) +
@@ -341,10 +352,12 @@ plot_aipw_step2 <- function(df, poly_deg = 2) {
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
     labs(
-      title = "Step 2 — Residuals from the own-arm regression",
-      subtitle = "ε̂ᵢ = Yᵢ − μ̂_{Dᵢ}(Xᵢ). These are what AIPW corrects for.",
+      title = "Step 2: Residuals from the own-arm regression",
+      subtitle = expression(paste(
+        hat(epsilon)[i] == Y[i] - hat(mu)[D[i]](X[i]), ". These are what AIPW corrects for."
+      )),
       x = "X",
-      y = "Residual  ε̂",
+      y = expression("Residual " * hat(epsilon)),
       color = NULL, fill = NULL
     ) +
     soo_theme()
@@ -353,18 +366,20 @@ plot_aipw_step2 <- function(df, poly_deg = 2) {
 plot_aipw_step3 <- function(df, poly_deg = 2) {
   d <- .soo_aipw_pieces(df, poly_deg)
 
-  ggplot(d, aes(x = x, y = resid, color = group, fill = group, size = ipw)) +
+  ggplot(d, aes(x = x, y = resid, color = group, fill = group)) +
     geom_segment(aes(xend = x, yend = 0), alpha = 0.30, linewidth = 0.3) +
-    geom_point(shape = 21, alpha = 0.7) +
+    geom_point(aes(size = ipw), shape = 21, alpha = 0.7) +
     geom_hline(yintercept = 0, color = "grey30", linewidth = 0.4) +
     scale_fill_manual(values = soo_fills) +
     scale_color_manual(values = soo_colors) +
     scale_size_area(max_size = 8, name = "IPW weight") +
     labs(
-      title = "Step 3 — Up-weight residuals where overlap is thin",
-      subtitle = "Point size ∝ 1/ê(X) for treated, 1/(1−ê(X)) for controls.",
+      title = "Step 3: Up-weight residuals where overlap is thin",
+      subtitle = expression(paste(
+        "Point size " %prop% " 1/", hat(e)(X), " for treated, 1/(1 - ", hat(e)(X), ") for controls."
+      )),
       x = "X",
-      y = "Residual  ε̂",
+      y = expression("Residual " * hat(epsilon)),
       color = NULL, fill = NULL
     ) +
     soo_theme()
@@ -401,7 +416,7 @@ plot_aipw_step4 <- function(df, poly_deg = 2) {
     scale_fill_manual(values = c(term = "#B5D4F4", total = "#185FA5"),
                       guide = "none") +
     labs(
-      title = "Step 4 — AIPW = regression term + propensity-weighted correction",
+      title = "Step 4: AIPW = regression term + propensity-weighted correction",
       subtitle = "If the regression model is wrong, the correction term debiases the estimate.",
       x = NULL, y = "Component value"
     ) +

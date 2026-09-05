@@ -13,9 +13,9 @@
 Character. Same string with outer table env removed if present.
 }
 \description{
-Removes \begin{table}\link{...} ... \end{table} wrapping from a LaTeX string
-if the string is wrapped in one. Also strips any inner \centering and
-\caption{}/\label{} since wrap_latex_table rebuilds those from
-user-supplied arguments.
+Removes an outer \verb{\\\\begin\{table\}} ... \verb{\\\\end\{table\}} wrapper (with any
+placement option) from a LaTeX string if the string is wrapped in one. Also
+strips an inner \verb{\\\\centering} and any \verb{\\\\caption\{\}}/\verb{\\\\label\{\}}, since
+\code{wrap_latex_table()} rebuilds those from user-supplied arguments.
 }
 \keyword{internal}

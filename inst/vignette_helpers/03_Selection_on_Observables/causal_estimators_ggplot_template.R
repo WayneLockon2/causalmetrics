@@ -210,9 +210,10 @@ plot_causal_template <- function(
       geom_label(
         data = spec$bin_effects,
         aes(x = x_mid, y = (y_treated + y_control) / 2, label = label),
+        parse = TRUE,
         inherit.aes = FALSE,
         size = 3,
-        label.size = NA,
+        border.colour = NA,
         alpha = 0.9
       )
   }
@@ -290,7 +291,7 @@ plot_causal_template <- function(
         inherit.aes = FALSE,
         nudge_x = 4,
         size = 3,
-        label.size = NA
+        border.colour = NA
       )
   }
 
@@ -299,13 +300,17 @@ plot_causal_template <- function(
     scale_color_manual(values = c(Control = "#993C1D", Treated = "#185FA5")) +
     scale_alpha_identity(guide = "none") +
     scale_size_area(max_size = 10, name = "Weight") +
-    scale_linetype_manual(
-      values = c(
-        "observed support" = "solid",
-        "extrapolated" = "dashed"
-      ),
-      drop = FALSE
-    ) +
+    # Only panels with fitted lines map linetype; adding the scale elsewhere
+    # triggers a "no shared levels" warning in ggplot2 >= 4.0.
+    (if (!is.null(spec$lines)) {
+      scale_linetype_manual(
+        values = c(
+          "observed support" = "solid",
+          "extrapolated" = "dashed"
+        ),
+        drop = FALSE
+      )
+    }) +
     labs(
       title = spec$title,
       subtitle = paste0("Estimated effect = ", round(spec$ate, 2)),
@@ -350,7 +355,7 @@ build_lm_spec <- function(df, x_ref = median(df$x, na.rm = TRUE)) {
       x = x_ref,
       y0 = as.numeric(y0_ref),
       y1 = as.numeric(y1_ref),
-      label = paste0("gap ≈ ", round(y1_ref - y0_ref, 2))
+      label = paste0("gap = ", round(y1_ref - y0_ref, 2))
     )
   )
 }
@@ -505,12 +510,14 @@ build_cem_spec <- function(
     left_join(bins %>% select(bin_id, xmin, xmax), by = "bin_id") %>%
     mutate(
       x_mid = (xmin + xmax) / 2,
-      bin_weight = case_when(
-        estimand == "ATT" ~ n_treated,
-        estimand == "ATE" ~ n_treated + n_control,
-        estimand == "ATC" ~ n_control
+      bin_weight = switch(
+        estimand,
+        ATT = n_treated,
+        ATE = n_treated + n_control,
+        ATC = n_control,
+        stop("`estimand` must be one of 'ATT', 'ATE', or 'ATC'.")
       ),
-      label = paste0("τ = ", round(tau, 2))
+      label = paste0("tau == ", round(tau, 2))
     )
 
   ate <- weighted.mean(bin_effects$tau, bin_effects$bin_weight)
@@ -577,7 +584,7 @@ build_aipw_spec <- function(df) {
       x = x_ref,
       y0 = as.numeric(y0_ref),
       y1 = as.numeric(y1_ref),
-      label = paste0("weighted fit gap ≈ ", round(y1_ref - y0_ref, 2))
+      label = paste0("weighted fit gap = ", round(y1_ref - y0_ref, 2))
     )
   )
 }

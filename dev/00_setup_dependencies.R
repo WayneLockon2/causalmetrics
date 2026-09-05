@@ -1,16 +1,26 @@
 # dev/00_setup_dependencies.R
 # Run this once when setting up the development environment.
 
+# Runtime dependencies (DESCRIPTION Depends and Imports).
 required <- c(
-    "data.table", "fixest", "checkmate", "rlang",
-    "generics", "ggplot2"
+    "tidyverse", "data.table", "fixest", "estimatr", "broom", "modelsummary",
+    "kableExtra", "checkmate", "ggplot2", "knitr", "rlang"
 )
 
+# Used by est_aipw(), the vignettes, and the tests (DESCRIPTION Suggests).
 suggested <- c(
-    "grf", "rdrobust", "did", "MatchIt",
-    "ranger", "xgboost", "glmnet", "estimatr",
-    "broom", "modelsummary", "kableExtra", "huxtable",
-    "DBI", "knitr", "rmarkdown", "testthat"
+    "bookdown", "car", "dplyr", "ggthemes", "grf", "MatchIt", "mlr3",
+    "mlr3learners", "patchwork", "randomizr", "ranger", "ri2", "rmarkdown",
+    "sandwich", "testthat", "tibble"
+)
+
+# Planned but not yet used: extra mlr3 learners and table/database backends.
+planned <- c("glmnet", "xgboost", "huxtable", "DBI")
+
+# Used only by the paper replications in inst/replications/.
+replication_only <- c(
+    "haven", "scales", "CBPS", "hbal", "Matching", "DoubleML", "qte",
+    "sensemakr", "mfx", "DescTools", "ggpubr"
 )
 
 dev_only <- c(
@@ -31,4 +41,6 @@ install_if_missing <- function(pkgs) {
 
 install_if_missing(required)
 install_if_missing(suggested)
+install_if_missing(replication_only)
+install_if_missing(planned)
 install_if_missing(dev_only)

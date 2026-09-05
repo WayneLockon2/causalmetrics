@@ -1,3 +1,17 @@
 ^causalmetrics\.Rproj$
 ^\.Rproj\.user$
 ^LICENSE\.md$
+^README\.Rmd$
+^data_raw$
+^dev$
+^figures$
+^doc$
+^Meta$
+^\.gitignore$
+\.Rhistory$
+\.DS_Store$
+^_gpt_pro_context$
+^gpt_pro_context\.zip$
+^Rplots\.pdf$
+^vignettes/.*_cache$
+^vignettes/.*_files$

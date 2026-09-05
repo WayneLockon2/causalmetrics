@@ -1,3 +1,6 @@
+# Tell data.table that this package understands its `[` semantics.
+.datatable.aware <- TRUE
+
 # Coerce to data.table (copy if data.frame)
 .cm_as_dt <- function(dt) {
     if (data.table::is.data.table(dt)) return(dt)

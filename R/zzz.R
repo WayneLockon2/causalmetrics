@@ -1,13 +1,19 @@
 # R/zzz.R
+#
+# Package hooks. `.onLoad()` runs whenever the namespace is loaded (including
+# `causalmetrics::fun` calls); `.onAttach()` runs only on `library()`.
 
 .onLoad <- function(libname, pkgname) {
-    # Nothing needed yet; placeholder for future setup
+    # Use a reasonable default for data.table threading.
+    # The user can override with setDTthreads() after loading.
+    if (requireNamespace("data.table", quietly = TRUE)) {
+        n <- data.table::getDTthreads()
+        if (n == 0L) {
+            data.table::setDTthreads(percent = 50)
+        }
+    }
 }
 
-
-# R/zzz.R
-
-#' @keywords internal
 .onAttach <- function(libname, pkgname) {
     # Packages to attach when causalmetrics is loaded.
     # These MUST also be listed in DESCRIPTION Depends.
@@ -21,23 +27,11 @@
         "tidyverse"
     )
 
-    # Check which are already attached
+    # We rely on Depends in DESCRIPTION to actually attach these. The block
+    # below is defensive: if a package was detached after the Depends
+    # mechanism fired, attempt to reattach it quietly.
     attached <- attach_pkgs %in% .packages()
     to_attach <- attach_pkgs[!attached]
-
-    # Suppress the startup messages from attached packages so the output
-    # is clean. The user sees only the causalmetrics banner and a one-line
-    # summary of what was attached.
-    attach_quietly <- function(pkg) {
-        suppressPackageStartupMessages(
-            requireNamespace(pkg, quietly = TRUE) &&
-                attachNamespace(pkg)
-        )
-    }
-
-    # We rely on Depends in DESCRIPTION to actually attach these. The block
-    # below is defensive — if for some reason a package was unloaded after
-    # the Depends mechanism fired, attempt to reattach it.
     for (pkg in to_attach) {
         if (requireNamespace(pkg, quietly = TRUE)) {
             tryCatch(
@@ -69,25 +63,15 @@
     packageStartupMessage(paste(msg, collapse = "\n"))
 }
 
-#' @keywords internal
-.onLoad <- function(libname, pkgname) {
-    # Use a reasonable default for data.table threading.
-    # The user can override with setDTthreads() after loading.
-    if (requireNamespace("data.table", quietly = TRUE)) {
-        n <- data.table::getDTthreads()
-        if (n == 0L) {
-            data.table::setDTthreads(percent = 50)
-        }
-    }
-}
-
 #' Detect function name conflicts between attached packages
+#'
+#' @param pkgs Character vector of package names. Only packages currently on
+#'   the search path are compared.
+#' @return Character vector of conflict descriptions such as
+#'   `"filter(): dplyr masks stats"`, or `character(0)` when fewer than two of
+#'   the packages are attached or no names overlap.
 #' @keywords internal
 .cm_detect_conflicts <- function(pkgs) {
-    # Returns a character vector of conflict descriptions like
-    # "filter(): dplyr masks stats" — but we only check among the
-    # packages we attach.
-
     envs <- lapply(pkgs, function(p) {
         nm <- paste0("package:", p)
         if (nm %in% search()) as.environment(nm) else NULL

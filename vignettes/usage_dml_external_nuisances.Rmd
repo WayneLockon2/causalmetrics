@@ -1,0 +1,386 @@
+---
+title: "Using est_dml(): learners, external nuisances, and repeated cross-fitting"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using est_dml(): learners, external nuisances, and repeated cross-fitting}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(causalmetrics)
+
+run_mlr3 <- requireNamespace("mlr3", quietly = TRUE) &&
+  requireNamespace("mlr3learners", quietly = TRUE)
+run_ranger <- run_mlr3 && requireNamespace("ranger", quietly = TRUE)
+if (run_mlr3) {
+  library(mlr3)
+  library(mlr3learners)
+}
+
+# ---- locate Python and the bundled predictor script ----------------------
+py_script <- system.file("python", "nuisance_predictor.py", package = "causalmetrics")
+
+.python_has_deps <- function(bin) {
+  if (!nzchar(bin) || !file.exists(bin)) return(FALSE)
+  status <- suppressWarnings(system2(
+    bin,
+    args   = c("-c", shQuote("import pandas, numpy, sklearn")),
+    stdout = FALSE, stderr = FALSE
+  ))
+  identical(as.integer(status), 0L)
+}
+python_candidates <- unique(c(
+  Sys.getenv("CAUSALMETRICS_PYTHON", unset = ""),
+  unname(Sys.which("python3")),
+  unname(Sys.which("python")),
+  "/opt/anaconda3/bin/python"
+))
+python_candidates <- python_candidates[nzchar(python_candidates)]
+python_ok  <- vapply(python_candidates, .python_has_deps, logical(1))
+python_bin <- if (any(python_ok)) python_candidates[python_ok][[1]] else ""
+run_python <- nzchar(python_bin) && nzchar(py_script)
+
+options(modelsummary_get = "broom")
+```
+
+```{r status-note, echo=FALSE, results="asis"}
+cat(
+  "> **Status:** mlr3 learners ", if (run_mlr3) "available" else "not installed",
+  "; ranger ", if (run_ranger) "available" else "not installed",
+  "; Python with pandas/numpy/scikit-learn ",
+  if (run_python) paste0("detected at `", python_bin, "`") else "not found (those chunks are shown but not run)",
+  ".\n", sep = ""
+)
+```
+
+## What `est_dml()` does
+
+`est_dml()` implements the double/debiased machine learning (DML) recipe:
+a Neyman-orthogonal score, cross-fitted nuisance predictions, and
+influence-function inference. It owns only the causal layer. The nuisance
+functions can be produced by `mlr3` learners inside the function or by
+anything else that can write a column of out-of-fold predictions.
+
+Two models are available.
+
+| `model` | Target | Nuisances | Score |
+|---|---|---|---|
+| `"plr"` | coefficient $\theta$ in $Y = \theta D + g(X) + \varepsilon$ | $\ell(X) = E[Y \mid X]$, $m(X) = E[D \mid X]$ | partialling out: $(\tilde Y - \theta \tilde D)\tilde D$ |
+| `"irm"` | ATE or ATT of a binary $D$ | $p(X) = P(D = 1 \mid X)$, $\mu_0(X)$, $\mu_1(X)$ | doubly robust (AIPW) |
+
+The interactive model is `est_aipw()` with the choice of fold solution and
+repeated cross-fitting added; with the same nuisances and folds the two functions
+return identical numbers. The partially linear model is the generalized
+Frisch-Waugh-Lovell estimator of Robinson (1988): residualize $Y$ and $D$
+on $X$ with any learner, then regress the residuals on each other.
+
+## A partially linear example
+
+The outcome depends on the covariates nonlinearly, and the treatment is a
+continuous dose confounded by the same covariates. The true effect is 1.5.
+
+```{r simulate-plr}
+set.seed(1)
+n  <- 1500
+x1 <- rnorm(n)
+x2 <- rnorm(n)
+d  <- 0.5 * x1 + sin(x2) + rnorm(n)
+y  <- 1.5 * d + x1^2 + exp(x2 / 2) + rnorm(n)
+dat <- data.frame(y = y, d = d, x1 = x1, x2 = x2)
+```
+
+A linear regression with the covariates as controls gets the functional
+form of the confounding wrong:
+
+```{r naive-ols}
+coef(summary(lm(y ~ d + x1 + x2, data = dat)))["d", ]
+```
+
+`est_dml()` with its default learners is the same linear partialling-out,
+but cross-fitted. The interesting version uses random forests for both
+nuisances:
+
+```{r dml-plr, eval=run_ranger}
+fit_lin <- est_dml(dat, y = "y", d = "d", x = c("x1", "x2"), seed = 1)
+
+set.seed(1)   # ranger draws its own randomness from the session RNG
+fit_rf <- est_dml(
+  dat, y = "y", d = "d", x = c("x1", "x2"),
+  learner_l = lrn("regr.ranger", num.trees = 300),
+  learner_m = lrn("regr.ranger", num.trees = 300),
+  folds = 5, seed = 1
+)
+fit_rf
+```
+
+The print method reports the cross-fitted root mean squared error of each
+nuisance. Those numbers are the first diagnostic to read: DML can only
+remove confounding that the learners actually capture.
+
+```{r dml-plr-diag, eval=run_ranger}
+fit_lin$diagnostics$nuisance
+fit_rf$diagnostics$nuisance
+fit_rf$diagnostics$identification
+```
+
+The identification block reports the mean squared treatment residual
+$E_n[\tilde D^2]$, the denominator of the estimator. When it is small
+relative to $\mathrm{var}(D)$, the covariates predict the treatment almost
+perfectly and the coefficient is weakly identified. Here about two thirds
+of the treatment variance survives partialling out.
+
+```{r resid-plot, eval=run_ranger, fig.cap="Residualized outcome against residualized treatment. The slope of the fitted line is the DML estimate."}
+res <- fit_rf$residuals
+plot_task(res, ggplot2::aes(x = d_tilde, y = y_tilde)) +
+  ggplot2::geom_point(alpha = 0.3, size = 1) +
+  ggplot2::geom_abline(intercept = 0, slope = fit_rf$estimate, linewidth = 0.9) +
+  ggplot2::labs(x = "D residual: D - m_hat(X)", y = "Y residual: Y - l_hat(X)")
+```
+
+## Why cross-fitting matters
+
+The same forests fitted on the full sample and evaluated on the same
+observations absorb part of the noise into the nuisance predictions. The
+treatment residuals shrink and the estimate drifts.
+
+```{r no-crossfit, eval=run_ranger}
+set.seed(1)
+fit_insample <- est_dml(
+  dat, y = "y", d = "d", x = c("x1", "x2"),
+  learner_l = lrn("regr.ranger", num.trees = 300),
+  learner_m = lrn("regr.ranger", num.trees = 300),
+  cross_fit = FALSE
+)
+data.frame(
+  fit = c("cross-fitted", "full sample"),
+  estimate = c(fit_rf$estimate, fit_insample$estimate),
+  std.error = c(fit_rf$std.error, fit_insample$std.error),
+  mean_sq_D_resid = c(fit_rf$diagnostics$identification$mean_sq_treatment_residual,
+                      fit_insample$diagnostics$identification$mean_sq_treatment_residual)
+)
+```
+
+`cross_fit = FALSE` exists to make this demonstration possible. It is not a
+setting to use for results.
+
+## Pooled or fold-averaged solutions, and repeated cross-fitting
+
+`solve = "pooled"` (the default, DML2 in the paper) stacks the scores from
+all folds and solves once; `solve = "fold_average"` (DML1) solves fold by
+fold and averages the fold estimates. The fold-level solutions are always
+stored, and their spread is a useful diagnostic of how much the estimate
+depends on the particular partition.
+
+```{r folds, eval=run_ranger}
+fit_rf$fold_estimates
+```
+
+Repeating the whole procedure on several random partitions and taking the
+median removes the dependence on any single split. The reported variance
+adds the spread of the repetition estimates around their median, as in
+Chernozhukov et al. (2018, Section 3.4).
+
+```{r reps, eval=run_ranger}
+set.seed(2)
+fit_rep <- est_dml(
+  dat, y = "y", d = "d", x = c("x1", "x2"),
+  learner_l = lrn("regr.ranger", num.trees = 300),
+  learner_m = lrn("regr.ranger", num.trees = 300),
+  folds = 5, n_rep = 5, seed = 1
+)
+fit_rep$repetitions
+c(estimate = fit_rep$estimate, std.error = fit_rep$std.error)
+```
+
+## The interactive model: ATE and ATT
+
+With a binary treatment and heterogeneous effects, `model = "irm"` uses the
+doubly robust score. The ATT score needs only the propensity score and the
+untreated outcome regression.
+
+```{r simulate-irm}
+set.seed(3)
+p   <- plogis(-0.2 + 0.8 * x1 - 0.4 * (x2 > 0))
+db  <- rbinom(n, 1, p)
+tau <- 1 + 0.5 * x1
+yb  <- 1 + x1 + x2^2 + db * tau + rnorm(n)
+dat_irm <- data.frame(y = yb, d = db, x1 = x1, x2 = x2)
+c(ATE = mean(tau), ATT = mean(tau[db == 1]))
+```
+
+```{r dml-irm, eval=run_ranger}
+learners_irm <- list(
+  learner_p   = lrn("classif.ranger", predict_type = "prob", num.trees = 300),
+  learner_mu0 = lrn("regr.ranger", num.trees = 300),
+  learner_mu1 = lrn("regr.ranger", num.trees = 300)
+)
+set.seed(4)
+fit_ate <- do.call(est_dml, c(list(dat_irm, y = "y", d = "d", x = c("x1", "x2"),
+                                   model = "irm", estimand = "ATE", seed = 1), learners_irm))
+set.seed(4)
+fit_att <- do.call(est_dml, c(list(dat_irm, y = "y", d = "d", x = c("x1", "x2"),
+                                   model = "irm", estimand = "ATT", seed = 1), learners_irm))
+fit_ate
+fit_att
+```
+
+Propensity clipping (`p_clip`) and trimming (`trim`) work as in
+`est_aipw()`, and the same overlap, weight, and effective-sample-size
+diagnostics are returned under `diagnostics$propensity` and
+`diagnostics$weights`.
+
+## External nuisances: the contract
+
+Whatever produces the nuisance predictions must return the rows of the input
+data in the same order, with these columns added.
+
+| `model` | Required columns | Meaning |
+|---|---|---|
+| `"plr"` | `l_hat`, `m_hat` | out-of-fold $\hat\ell(X_i)$ and $\hat m(X_i)$ |
+| `"irm"` | `p_hat`, `mu0_hat`, `mu1_hat` | out-of-fold propensity and arm-specific outcome regressions (`mu1_hat` not needed for the ATT) |
+| both | `fold_id` (optional) | the fold each row was held out in |
+
+Two rules are not visible in the column list. Predictions must be
+out-of-fold: a row's nuisance must come from a model that did not see that
+row. And `est_dml()` cannot check this; with supplied nuisances it trusts
+the caller. Passing `fold_id` is still worthwhile, because the per-fold
+solutions are then reported as a diagnostic.
+
+The bundled Python script implements the contract for both models.
+
+```{r call-python, eval=run_python, purl=FALSE}
+tmp_in  <- tempfile(fileext = ".csv")
+tmp_out <- tempfile(fileext = ".csv")
+data.table::fwrite(dat, tmp_in)
+
+status <- system2(
+  command = python_bin,
+  args = c(
+    shQuote(py_script),
+    "--model",  "plr",
+    "--input",  shQuote(tmp_in),
+    "--output", shQuote(tmp_out),
+    "--y",      "y",
+    "--d",      "d",
+    "--x",      "x1,x2",
+    "--folds",  "5",
+    "--seed",   "1"
+  )
+)
+if (!identical(as.integer(status), 0L)) {
+  stop("Python predictor failed with exit status ", status, ".")
+}
+augmented <- data.table::fread(tmp_out)
+head(augmented)
+```
+
+```{r call-python-fallback, eval=!run_python, echo=FALSE}
+message("Skipping the Python chunks: no interpreter with pandas, numpy, and scikit-learn was found.")
+```
+
+Sanity checks before estimating: no missing predictions, folds of similar
+size, and predictions on the scale of the targets.
+
+```{r sanity, eval=run_python, purl=FALSE}
+augmented[, .(
+  n         = .N,
+  na_l_hat  = sum(is.na(l_hat)),
+  na_m_hat  = sum(is.na(m_hat)),
+  rmse_l    = sqrt(mean((y - l_hat)^2)),
+  rmse_m    = sqrt(mean((d - m_hat)^2))
+)]
+augmented[, .N, by = fold_id][order(fold_id)]
+```
+
+```{r run-external, eval=run_python, purl=FALSE}
+fit_py <- est_dml(
+  augmented, y = "y", d = "d",
+  l_hat = "l_hat", m_hat = "m_hat", fold_id = "fold_id"
+)
+fit_py
+fit_py$fold_estimates
+```
+
+Because the Python folds travel with the data, the R learners can be
+cross-fitted on exactly the same partition, which makes the two producers
+directly comparable:
+
+```{r same-folds, eval=run_python && run_ranger, purl=FALSE}
+set.seed(5)
+fit_same_folds <- est_dml(
+  augmented, y = "y", d = "d", x = c("x1", "x2"),
+  learner_l = lrn("regr.ranger", num.trees = 300),
+  learner_m = lrn("regr.ranger", num.trees = 300),
+  fold_id = "fold_id"
+)
+data.frame(
+  producer  = c("Python (sklearn HGB)", "R (ranger, same folds)", "Truth"),
+  estimate  = c(fit_py$estimate, fit_same_folds$estimate, 1.5),
+  std.error = c(fit_py$std.error, fit_same_folds$std.error, NA_real_)
+)
+```
+
+The same script with `--model irm` writes `p_hat`, `mu0_hat`, `mu1_hat`, and
+`fold_id` for `est_dml(model = "irm")` or `est_aipw()`; see
+`vignette("usage_aipw_external_nuisances")`.
+
+## Reporting with modelsummary
+
+`tidy()` and `glance()` methods are registered for both estimators, so the
+objects go straight into `modelsummary()`:
+
+```{r modelsummary, eval=run_ranger}
+modelsummary::modelsummary(
+  list("PLR, linear" = fit_lin, "PLR, forests" = fit_rf,
+       "IRM ATE" = fit_ate, "IRM ATT" = fit_att),
+  gof_map = c("nobs", "method", "estimand"),
+  output = "markdown"
+)
+```
+
+## Caveats
+
+- **DML is estimation, not identification.** Conditional ignorability,
+  a pre-treatment adjustment set, and overlap are still assumptions to
+  argue for. Orthogonality and cross-fitting only protect the estimate from
+  the errors of the nuisance learners.
+- **What the partially linear coefficient means.** When effects are
+  heterogeneous, $\theta$ is a weighted average of conditional effects with
+  overlap weights $m(X)(1 - m(X))$, not the ATE. Use `model = "irm"` for
+  the ATE or ATT of a binary treatment.
+- **Weak residual variation.** Read `diagnostics$identification`. If the
+  covariates almost determine the treatment, no learner choice will make
+  the coefficient precise.
+- **Learner quality and tuning.** Compare the cross-fitted RMSE across
+  learners and pick the best one for each nuisance; tune inside the
+  training folds, never on the full sample.
+- **Repetitions.** With flexible learners on moderate samples, `n_rep = 5`
+  or more makes the reported estimate independent of one lucky or unlucky
+  split.
+- **Supplied nuisances must be out-of-fold.** In-sample predictions
+  reintroduce exactly the bias that cross-fitting removes, and the function
+  cannot detect it.
+
+## Related material
+
+- The Section 04 lecture vignette derives the scores and the orthogonality
+  and cross-fitting arguments used here.
+- `vignette("usage_aipw_external_nuisances")` covers the interactive model
+  contract in more detail.
+- Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C.,
+  Newey, W., and Robins, J. (2018). Double/debiased machine learning for
+  treatment and structural parameters. *The Econometrics Journal*, 21(1),
+  C1-C68.
