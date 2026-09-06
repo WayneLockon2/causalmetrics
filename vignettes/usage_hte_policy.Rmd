@@ -1,0 +1,283 @@
+---
+title: "Using causalmetrics for heterogeneous treatment effects and policy learning"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using causalmetrics for heterogeneous treatment effects and policy learning}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4,
+                      message = FALSE, warning = FALSE)
+library(causalmetrics)
+library(mlr3)
+library(mlr3learners)
+set.seed(1)
+run_ranger <- requireNamespace("ranger", quietly = TRUE)
+run_grf <- requireNamespace("grf", quietly = TRUE)
+run_policytree <- requireNamespace("policytree", quietly = TRUE)
+```
+
+## One object, many uses
+
+Every function in this part of the package consumes the same input: the
+cross-fitted doubly robust pseudo-outcome
+
+$$
+Y_i(\hat\eta) = \hat\mu_1(Z_i) - \hat\mu_0(Z_i)
+  + \Big(\frac{D_i}{\hat p(Z_i)} - \frac{1 - D_i}{1 - \hat p(Z_i)}\Big)\,(Y_i - \hat\mu_{D_i}(Z_i)),
+$$
+
+whose conditional mean given any function of the covariates is the
+conditional average treatment effect (CATE). `dr_scores()` builds it once.
+Then:
+
+| Task | Function |
+|---|---|
+| CATE models by meta-learning (S, T, X, DR, R) on any `mlr3` learner | `cate_learner()` |
+| Best linear predictor of the CATE, group average effects, simultaneous bands | `cate_blp()`, `cate_gate()` |
+| Out-of-sample model comparison with confidence intervals; stacking | `cate_score()`, `cate_ensemble()` |
+| Validation: heterogeneity test, calibration, TOC and QINI curves, AUTOC | `cate_validate()` |
+| Value of a treatment rule; learning rules (trees, linear, classifiers, budgets) | `policy_value()`, `policy_learn()` |
+| Targeting impact versus deprivation for a planner with curvature | `policy_frontier()` |
+| Simulated designs with a known CATE | `sim_hte()` |
+
+Learners come from `mlr3`, causal forests from `grf`, exact policy trees of
+any depth from `policytree`. The package owns the causal layer: scores,
+inference, scoring, validation, and welfare.
+
+## Data with a known CATE
+
+The `"smooth"` design has five standard normal covariates, confounded
+assignment, a nonlinear baseline, and a CATE that depends on `x1` and `x2`
+only. We split it into a training sample, a scoring sample, and a test
+sample.
+
+```{r data}
+dat <- sim_hte(n = 4500, dgp = "smooth", seed = 1)
+x <- paste0("x", 1:5)
+train <- dat[1:2000, ]
+score_set <- dat[2001:3250, ]
+test <- dat[3251:4500, ]
+head(dat[, c("y", "d", "x1", "x2", "tau_true", "p_true")], 3)
+```
+
+## Step 1: the scores
+
+With default learners (logistic regression for the propensity score, linear
+regression for the outcomes) and five folds:
+
+```{r scores}
+sc_train <- dr_scores(train, y = "y", d = "d", x = x, seed = 1)
+sc_train
+tidy(sc_train)
+```
+
+The score is noisy at the individual level (its 1st and 99th percentiles are
+far apart), but its conditional mean is the CATE, which is all the later
+steps need.
+
+Flexible learners replace the defaults. Any `mlr3` learner works; here we
+use random forests for the outcome regressions.
+
+```{r scores-rf, eval = run_ranger}
+rf <- lrn("regr.ranger", num.trees = 300, min.node.size = 20)
+sc_train_rf <- dr_scores(train, "y", "d", x, learner_mu = rf, seed = 1)
+sc_train_rf$diagnostics$nuisance
+```
+
+## Step 2: CATE models
+
+`cate_learner()` reuses the scores. Each method produces a cross-fitted
+pseudo-label and then fits `learner_final` to it on `x_het`, using all rows.
+We restrict heterogeneity to `x1` and `x2`.
+
+```{r learners, eval = run_ranger}
+rf_final <- lrn("regr.ranger", num.trees = 300, min.node.size = 50)
+methods <- c(dr = "dr", r = "r", x = "x", t = "t", s = "s")
+fits <- lapply(methods, function(m) {
+  cate_learner(scores = sc_train_rf, x_het = c("x1", "x2"), method = m,
+               learner = rf, learner_final = rf_final)
+})
+fits$dr
+sapply(fits, function(f) sqrt(mean((predict(f, test) - test$tau_true)^2)))
+```
+
+The last line is the root mean squared error against the true CATE on the
+test sample, something only a simulation can show. The next steps replace
+it with statistics that are available in real data.
+
+A parametric final stage is one line: pass `learner_final = lrn("regr.lm")`
+and the DR-learner becomes the best linear predictor of the next section.
+
+## Step 3: inference on summaries
+
+The best linear predictor of the CATE in a dictionary of covariate functions
+is ordinary least squares of the score on that dictionary, with
+heteroskedasticity-robust standard errors and a simultaneous band from the
+multiplier bootstrap.
+
+```{r blp}
+blp <- cate_blp(sc_train, ~ x1 + I(x2^2), seed = 1)
+blp
+grid <- data.frame(x1 = seq(-2, 2, by = 0.25), x2 = 0)
+plot_cate_blp(blp, grid, seed = 1)
+```
+
+The true CATE is `1 + x1 + 0.5 (x2^2 - 1)`, so the coefficients on `x1` and
+`x2^2` should be near 1 and 0.5; the intercept picks up the constant.
+Group average effects use the same machinery with group indicators:
+
+```{r gate}
+q_x1 <- cut(train$x1, quantile(train$x1, 0:4 / 4), include.lowest = TRUE,
+            labels = paste0("Q", 1:4))
+gate <- cate_gate(sc_train, q_x1, seed = 1)
+gate
+plot_cate_gate(gate)
+```
+
+## Step 4: causal forests next to the meta-learners
+
+`grf::causal_forest()` estimates the CATE with a forest built on the
+R-learner moment and returns confidence intervals. Its predictions and its
+own doubly robust scores drop into the same evaluation functions. The
+pseudo-outcome `grf` uses equals `dr_scores()` with `mu0 = Y.hat - W.hat tau`,
+`mu1 = Y.hat + (1 - W.hat) tau`.
+
+```{r grf, eval = run_grf}
+library(grf)
+cf <- causal_forest(as.matrix(train[, x]), train$y, train$d, num.trees = 500, seed = 1)
+tau_cf <- predict(cf)$predictions
+sc_grf <- dr_scores(train, "y", "d", p_hat = cf$W.hat,
+                    mu0_hat = cf$Y.hat - cf$W.hat * tau_cf,
+                    mu1_hat = cf$Y.hat + (1 - cf$W.hat) * tau_cf, p_clip = c(0, 1))
+all.equal(sc_grf$score, as.numeric(get_scores(cf)))
+```
+
+## Step 5: choose a model out of sample
+
+On the scoring sample, `cate_score()` computes the doubly robust loss of each
+candidate and its difference from the constant-effect model with a confidence
+interval. Differences of losses estimate differences of mean squared errors
+against the true CATE, which is why they can be compared with confidence.
+
+```{r score, eval = run_ranger}
+sc_score <- dr_scores(score_set, "y", "d", x, learner_mu = rf, seed = 2)
+cs <- cate_score(sc_score, dr_learner = fits$dr, r_learner = fits$r,
+                 x_learner = fits$x, t_learner = fits$t, s_learner = fits$s)
+cs
+```
+
+Avoid model names that partially match `scores`, such as `s` or `sc`; R
+would assign them to that argument.
+
+`cate_ensemble()` stacks the candidates. Q-aggregation keeps weights on the
+simplex and penalizes each model by its own loss.
+
+```{r ensemble, eval = run_ranger}
+ens <- cate_ensemble(sc_score, dr_learner = fits$dr, r_learner = fits$r,
+                     x_learner = fits$x, t_learner = fits$t, s_learner = fits$s,
+                     method = "q")
+ens
+sqrt(mean((predict(ens, test) - test$tau_true)^2))
+```
+
+## Step 6: validate on the test sample
+
+`cate_validate()` takes a fixed model and the test-sample scores. It reports
+the heterogeneity regression (slope ideally 1), calibration by quartile of the
+prediction, the TOC and QINI curves with one-sided simultaneous bands, and the
+areas under them.
+
+```{r validate, eval = run_ranger}
+sc_test <- dr_scores(test, "y", "d", x, learner_mu = rf, seed = 3)
+val <- cate_validate(sc_test, ens, n_boot = 499, seed = 1)
+val
+plot_cate_validation(val, "calibration")
+plot_cate_validation(val, "toc")
+```
+
+`AUTOC` and `AUQC` integrate the curves over all ranks and match
+`grf::rank_average_treatment_effect()` when the same scores are used.
+
+## Step 7: from CATE to policy
+
+A policy is a rule `X -> {0, 1}`. Its gain over treating no one is the mean
+of `pi(X) (Y(eta) - cost)`, an average of the score, so it comes with a
+standard error.
+
+```{r policy-value, eval = run_ranger}
+policy_value(sc_test, list(
+  ensemble_sign = predict(ens, test) > 0,
+  treat_all = rep(1, nrow(test)),
+  oracle = test$tau_true > 0
+))
+```
+
+`policy_learn()` maximizes the empirical welfare over a restricted class.
+The `"policy"` design has a CATE that is piecewise constant on a depth-two
+tree, so the exact search should recover it.
+
+```{r policy-learn}
+pol_dat <- sim_hte(4000, dgp = "policy", seed = 2)
+sc_pol <- dr_scores(pol_dat, "y", "d", x, seed = 1)
+pol <- policy_learn(sc_pol, method = "tree", depth = 2, seed = 1)
+pol
+attr(pol_dat, "optimal_tree")
+plot_policy_tree(pol)
+```
+
+Half of the rows were held out before the search, so the second row of the
+value table is an honest estimate. `engine = "policytree"` delegates the
+search to that package and allows any depth:
+
+```{r policytree, eval = run_policytree}
+pol_pt <- policy_learn(sc_pol, method = "tree", depth = 2, engine = "policytree", seed = 1)
+pol_pt$value
+mean(predict(pol_pt, pol_dat) == predict(pol, pol_dat))
+```
+
+Other classes: linear rules (`method = "linear"`), any weighted `mlr3`
+classifier (`method = "classifier"`), and the budgeted rule that treats the
+top share of a CATE model (`method = "budget"`, with `tau_hat`).
+
+## Step 8: targeting impact versus deprivation
+
+`policy_frontier()` implements the planner of Haushofer et al. (2025): with
+utility curvature `a`, a unit is worth treating in proportion to
+`u(y0 + tau) - u(y0)`. Linear utility targets impact; strong curvature
+targets the most deprived.
+
+```{r frontier, eval = run_ranger}
+fr <- policy_frontier(sc_test, ens, y0_hat = sc_test$nuisance$mu0, budget = 0.3,
+                      utility = "cara", curvature = c(0, 0.5, 2, 10))
+fr
+plot_policy_frontier(fr, curvature = 2)
+```
+
+## External nuisances
+
+Any engine can supply the out-of-fold predictions, exactly as for
+`est_dml()`. The bundled Python script writes `p_hat`, `mu0_hat`, `mu1_hat`
+columns; pass them by name and no learner is fitted.
+
+```{r external, eval = FALSE}
+sc_py <- dr_scores(train_with_predictions, "y", "d", x,
+                   p_hat = "p_hat", mu0_hat = "mu0_hat", mu1_hat = "mu1_hat",
+                   fold_id = "fold_id")
+```
+
+## References
+
+- Athey, S. and Wager, S. (2021). Policy learning with observational data. *Econometrica*, 89(1), 133-161.
+- Chernozhukov, V., Hansen, C., Kallus, N., Spindler, M., and Syrgkanis, V. (2026). *Applied Causal Inference Powered by ML and AI*, chapters 14-15.
+- Haushofer, J., Niehaus, P., Paramo, C., Miguel, E., and Walker, M. (2025). Targeting impact versus deprivation. *American Economic Review*.
+- Kennedy, E. H. (2023). Towards optimal doubly robust estimation of heterogeneous causal effects. *Electronic Journal of Statistics*, 17(2).
+- Künzel, S. R., Sekhon, J. S., Bickel, P. J., and Yu, B. (2019). Metalearners for estimating heterogeneous treatment effects using machine learning. *PNAS*, 116(10).
+- Nie, X. and Wager, S. (2021). Quasi-oracle estimation of heterogeneous treatment effects. *Biometrika*, 108(2).
+- Semenova, V. and Chernozhukov, V. (2021). Debiased machine learning of conditional average treatment effects and other causal functions. *The Econometrics Journal*, 24(2).
+- Yadlowsky, S., Fleming, S., Shah, N., Brunskill, E., and Wager, S. (2021). Evaluating treatment prioritization rules via rank-weighted average treatment effects. arXiv:2111.07966.

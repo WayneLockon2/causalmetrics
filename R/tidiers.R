@@ -12,7 +12,8 @@
 #' [est_dml()] objects. Both follow the `broom` conventions used by
 #' `modelsummary`.
 #'
-#' @param x A `cm_aipw` or `cm_dml` object.
+#' @param x A `cm_aipw`, `cm_dml`, `cm_scores`, `cm_blp`, `cm_gate`, `cm_cate`,
+#'   `cm_cate_score`, or `cm_policy` object.
 #' @param conf.int Logical. Include confidence limits (default `TRUE`).
 #' @param conf.level Confidence level; defaults to the level stored in the
 #'   object and is recomputed from the standard error otherwise.
@@ -110,4 +111,69 @@ glance.cm_dml <- function(x, ...) {
   )
   for (nm in names(rmse)) out[[nm]] <- rmse[[nm]]
   out
+}
+
+# Heterogeneous effects and policy learning ------------------------------------
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_scores <- function(x, conf.int = TRUE, conf.level = 0.95, ...) {
+  crit <- stats::qnorm(1 - (1 - conf.level) / 2)
+  out <- data.frame(term = "ATE", estimate = x$ate$estimate, std.error = x$ate$std.error,
+                    statistic = x$ate$estimate / x$ate$std.error,
+                    p.value = 2 * stats::pnorm(-abs(x$ate$estimate / x$ate$std.error)),
+                    stringsAsFactors = FALSE)
+  if (conf.int) {
+    out$conf.low <- out$estimate - crit * out$std.error
+    out$conf.high <- out$estimate + crit * out$std.error
+  }
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_blp <- function(x, conf.int = TRUE, conf.level = x$conf_level, ...) {
+  out <- x$coefficients[, c("term", "estimate", "std.error", "statistic", "p.value")]
+  if (conf.int) {
+    crit <- stats::qnorm(1 - (1 - conf.level) / 2)
+    out$conf.low <- out$estimate - crit * out$std.error
+    out$conf.high <- out$estimate + crit * out$std.error
+  }
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_gate <- function(x, ...) {
+  out <- x$table
+  names(out)[names(out) == "group"] <- "term"
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_cate <- function(x, ...) {
+  data.frame(row = seq_along(x$tau_hat), tau_hat = x$tau_hat)
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_cate_score <- function(x, ...) {
+  out <- x$table
+  names(out)[names(out) == "model"] <- "term"
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_policy <- function(x, ...) {
+  x$value
+}
+
+#' @rdname cm_tidiers
+#' @export
+glance.cm_scores <- function(x, ...) {
+  data.frame(nobs = x$n, treated_share = mean(x$d), folds = length(unique(x$fold_id)),
+             learner_p = x$learners$p, learner_mu0 = x$learners$mu0, learner_mu1 = x$learners$mu1,
+             stringsAsFactors = FALSE)
 }

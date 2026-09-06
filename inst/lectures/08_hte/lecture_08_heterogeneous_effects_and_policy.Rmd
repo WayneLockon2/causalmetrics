@@ -1,0 +1,1434 @@
+---
+title: "Causal Inference in Economics and Marketing"
+subtitle: "Section 08: Heterogeneous Treatment Effects and Policy Learning"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.2, fig.align = "center", fig.pos = "H",
+  out.width = "95%", collapse = TRUE, comment = "#>"
+)
+# Code and output in footnotesize.
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+# This lecture lives in inst/lectures/08_hte/ of the package source. When
+# knitted from the source tree it loads the development version of the
+# package; when the package is installed it uses the installed helpers.
+helper_rel <- file.path("vignette_helpers", "08_hte", "hte_lecture_helpers.R")
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_path <- file.path(pkg_root, "inst", helper_rel)
+} else {
+  library(causalmetrics)
+  helper_path <- system.file(helper_rel, package = "causalmetrics")
+}
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(mlr3)
+library(mlr3learners)
+source(helper_path)
+helper_md5 <- tools::md5sum(helper_path)
+n_sims_learners <- 60
+n_sims_policy <- 40
+fmt <- function(x, digits = 2) formatC(x, digits = digits, format = "f")
+run_grf <- requireNamespace("grf", quietly = TRUE)
+run_policytree <- requireNamespace("policytree", quietly = TRUE)
+x5 <- paste0("x", 1:5)
+```
+
+# From "does it work" to "for whom" and "whom to treat" {#sec-problem}
+
+## Three questions
+
+Sections 02 to 07 answered one question: what is the average effect of a
+treatment? The average treatment effect (ATE), the ATT, and the ATT(g,t) of
+the last section are all averages. They inform a uniform decision: roll the
+policy out to everyone, or to no one.
+
+Two further questions sit behind most applied work.
+
+- **For whom does it work?** The conditional average treatment effect
+  (CATE), $\tau(x) = E[Y(1) - Y(0) \mid X = x]$, describes how the effect
+  varies with observed characteristics.
+- **Whom should we treat?** A policy $\pi(x) \in \{0, 1\}$ assigns treatment
+  from characteristics. Its value is the average gain it produces.
+
+A positive ATE can hide a subgroup that is harmed. A null ATE can hide a
+subgroup that responds strongly. Marketing lives on this: a discount that is
+worthless on average may pay for itself among price-sensitive customers.
+Development economics lives on it too: a cash transfer may be worth most to
+households that are not the poorest.
+
+## Why the CATE is a harder object
+
+Every target so far was a number. The CATE is a function. That changes what
+we can hope for.
+
+- Estimating a function is a prediction problem. Prediction rates are slower
+  than $n^{-1/2}$ and confidence intervals do not come for free.
+- Even with both potential outcomes observed, estimating $\tau(x)$ would be
+  as hard as estimating the regression of $Y(1) - Y(0)$ on $X$.
+- Genovese and Wasserman (2008) show that adaptive confidence bands for a
+  curve do not exist in general. Bands must target a simpler surrogate, or
+  restrict the dimension of $X$.
+
+The response is to relax the goal, and the lecture is organized by how much
+we relax it (Chernozhukov et al. 2026, ch. 14).
+
+| Goal | What we get | Section |
+|---|---|---|
+| A low-dimensional summary: best linear predictor or group effects | Root-$n$ inference, uniform bands | \@ref(sec-summaries) |
+| Confidence intervals at a point with forests | Valid in low dimensions, brittle otherwise | \@ref(sec-forests) |
+| A flexible CATE model with small mean squared error | No intervals; out-of-sample scores and tests | \@ref(sec-learners), \@ref(sec-selection) |
+| Tests that a model has found heterogeneity | Calibration, targeting curves | \@ref(sec-validation) |
+| A good policy, without caring about the CATE's magnitude | Regret bounds, honest values | \@ref(sec-policy) |
+
+## Identification
+
+Conditional exogeneity, $D \perp (Y(0), Y(1)) \mid Z$, identifies the CATE
+for any $X \subseteq Z$:
+$$
+\tau(X) = E\big[\, g(1, Z) - g(0, Z) \mid X \,\big], \qquad g(d, z) = E[Y \mid D = d, Z = z].
+$$
+Two remarks matter later.
+
+- $X$ may be a small subset of the controls $Z$. Confounding is handled by
+  $Z$; heterogeneity is described by $X$. The high-dimensional CATE
+  $\delta(Z) = E[Y(1) - Y(0) \mid Z]$ and its coarsening $\tau(X) = E[\delta(Z) \mid X]$
+  are different objects.
+- On $Z$, the effect among the treated equals the effect among the
+  controls: $E[Y(1) - Y(0) \mid Z, D = 1] = E[Y(1) - Y(0) \mid Z, D = 0] = \delta(Z)$.
+  This fails for a subset $X$, because the distribution of $Z$ given $X$
+  differs across arms. The X-learner of Section \@ref(sec-x-learner) is built
+  on the first fact.
+
+## The first CATE model: an interaction regression {#sec-interaction}
+
+The simplest CATE model is the regression with interactions,
+$Y = \beta_0 + \beta_1 D + \beta_2' X + D\, X'\beta_3 + e$, which gives
+$\hat\tau(x) = \hat\beta_1 + x'\hat\beta_3$ (Facure 2023, ch. 18). We use a
+simulated design throughout. Think of $D$ as a marketing nudge, $Y$ as
+spending, and $x_1, \dots, x_5$ as customer characteristics. The true CATE
+is $1 + x_1 + 0.5 (x_2^2 - 1)$; assignment depends on $x_1$ and $x_2$; the
+baseline is nonlinear in $x_2$.
+
+```{r running-data}
+dat <- sim_hte(n = 4000, dgp = "smooth", seed = 1)
+train <- dat[1:2000, ]
+score_set <- dat[2001:3000, ]
+test <- dat[3001:4000, ]
+fit_int <- lm(y ~ d * (x1 + x2 + x3 + x4 + x5), data = train)
+tau_int <- coef(fit_int)["d"] + as.matrix(test[, x5]) %*% coef(fit_int)[paste0("d:", x5)]
+c(rmse = sqrt(mean((tau_int - test$tau_true)^2)), cor = cor(tau_int, test$tau_true))
+```
+
+The regression catches the linear part of the heterogeneity in $x_1$ and
+misses the curvature in $x_2$. It also has no protection against
+misspecification of the baseline: the terms in $X$ must absorb confounding
+and describe heterogeneity at the same time. Figure \@ref(fig:interaction)
+shows both facts.
+
+```{r interaction, echo = FALSE, fig.cap = "Interaction-regression CATE against the truth on the test sample. Left: along x1 the linear model tracks the truth. Right: along x2 it cannot bend."}
+df <- tibble(x1 = test$x1, x2 = test$x2, truth = test$tau_true, model = as.numeric(tau_int))
+p1 <- ggplot(df, aes(x1)) + geom_point(aes(y = truth), colour = "grey60", size = 0.6) +
+  geom_point(aes(y = model), colour = hte_colors[["DR-learner"]], size = 0.6) +
+  labs(y = "CATE", subtitle = "Grey: truth; blue: interaction regression") + hte_theme()
+p2 <- ggplot(df, aes(x2)) + geom_point(aes(y = truth), colour = "grey60", size = 0.6) +
+  geom_point(aes(y = model), colour = hte_colors[["DR-learner"]], size = 0.6) +
+  labs(y = NULL, subtitle = " ") + hte_theme()
+patchwork::wrap_plots(p1, p2)
+```
+
+The rest of the lecture separates the two jobs. Confounding is removed
+once, by cross-fitted nuisances. Heterogeneity is then a regression of a
+single constructed variable on $X$.
+
+## Roadmap
+
+Section \@ref(sec-score) builds that variable, the doubly robust
+pseudo-outcome, and shows why its conditional mean is the CATE. Section
+\@ref(sec-learners) turns any regression method into a CATE model and
+compares the meta-learners in three designs. Section \@ref(sec-summaries)
+gives valid inference on summaries and on forests. Sections
+\@ref(sec-selection) and \@ref(sec-validation) select and validate a model
+out of sample. Section \@ref(sec-policy) learns and evaluates policies.
+Section \@ref(sec-traps) collects traps, Section \@ref(sec-practice) the
+replications and a checklist. The appendix holds the formal statements.
+
+# One signal, many uses: the doubly robust pseudo-outcome {#sec-score}
+
+## Definition and the key property
+
+Let $p(z) = P(D = 1 \mid Z = z)$ and $g(d, z) = E[Y \mid D = d, Z = z]$,
+with $\eta = (p, g)$. The doubly robust pseudo-outcome is
+$$
+Y(\eta) = g(1, Z) - g(0, Z) + H(p)\,\big(Y - g(D, Z)\big), \qquad
+H(p) = \frac{D}{p(Z)} - \frac{1 - D}{1 - p(Z)}.
+$$
+It is the summand of the AIPW estimator of Section 04. Its mean is the ATE.
+Its conditional mean is the CATE:
+$$
+E[Y(\eta_0) \mid X] = \tau(X).
+$$
+*Skeleton.* Condition on $Z$ first. Given $Z$, $E[H(p_0)(Y - g_0(D, Z)) \mid Z] = 0$
+because $E[D(Y - g_0(1,Z)) \mid Z] = p_0(Z) \cdot 0$ and likewise for the
+control term. What remains is $g_0(1, Z) - g_0(0, Z) = \delta(Z)$. Then
+average over $Z$ given $X$.
+
+The property that makes everything else work is **conditional Neyman
+orthogonality**: the derivative of $E[Y(\eta) \mid X]$ with respect to
+$\eta$ at $\eta_0$ is zero. Errors in $\hat p$ and $\hat g$ enter the
+conditional mean only through their product,
+$$
+E[Y(\eta_0) - Y(\hat\eta) \mid X] = E\big[(H(p_0) - H(\hat p))(g_0(D, Z) - \hat g(D, Z)) \mid X\big],
+$$
+so the pseudo-outcome is as good as the true one whenever the product of the
+two nuisance errors is small. Appendix \@ref(app-orthogonality) proves the
+identity in three lines.
+
+## Cross-fitting the nuisances
+
+As in Section 04, the nuisances are cross-fitted: $\hat p$ and $\hat g$ are
+trained on folds that exclude the observation they predict. The final
+regression of $Y(\hat\eta)$ on $X$ may then use all rows (Chernozhukov et
+al. 2026, Remark 15.1.1). Overfitting in the first stage cannot leak into
+the second, because the label of row $i$ never saw row $i$.
+
+## Code: building the scores
+
+`dr_scores()` builds the vector once. Every later function consumes the
+returned object.
+
+```{r scores}
+sc_train <- dr_scores(train, y = "y", d = "d", x = x5, seed = 1)
+sc_train
+```
+
+With linear nuisances the outcome model is misspecified (the baseline is
+quadratic in $x_2$) while the logistic propensity model is correctly
+specified. Random forests fit both nuisances flexibly. In a simulation we
+can also plug in the true nuisances, which no analyst has. The regression
+of the score on the true CATE, whose slope should be one, summarizes how
+close each version gets.
+
+```{r scores-three}
+rf_first <- hte_forest(min_node = 20, trees = 300)
+rf_final <- hte_forest(min_node = 100, trees = 300)
+sc_train_rf <- dr_scores(train, "y", "d", x5, learner_mu = rf_first, seed = 1)
+sc_train_oracle <- dr_scores(train, "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true")
+slope_tab <- sapply(list(linear = sc_train, forest = sc_train_rf, true_nuisances = sc_train_oracle), function(s) {
+  b <- cate_blp(s, ~ tau_true, uniform = FALSE)$coefficients
+  c(slope_on_true_cate = b$estimate[2], hc1_se = b$std.error[2], sd_score = sd(s$score))
+})
+round(slope_tab, 3)
+```
+
+The slope moves toward one and the score's standard deviation falls as
+the nuisances improve. The gap that remains with estimated nuisances is
+the product term above: small on average, but concentrated where the
+outcome error and the propensity error are both large, which here is the
+tail of $x_2$. Figure \@ref(fig:score-mean) checks the key property with
+the forest nuisances, which the rest of the lecture uses: a running mean of
+the score along $x_1$ follows the truth.
+
+```{r score-mean, echo = FALSE, fig.cap = "The conditional mean of the pseudo-outcome is the CATE. Left: the score against the true CATE, with the OLS line (slope reported). Right: a binned mean of the score along x1 (points) against the true CATE averaged in the same bins (line)."}
+slope <- slope_tab["slope_on_true_cate", "forest"]
+df <- tibble(score = sc_train_rf$score, truth = train$tau_true, x1 = train$x1)
+p1 <- ggplot(df, aes(truth, score)) + geom_point(alpha = 0.25, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, colour = hte_colors[["DR-learner"]]) +
+  coord_cartesian(ylim = c(-15, 20)) +
+  labs(x = "True CATE", y = "Pseudo-outcome", subtitle = paste0("OLS slope = ", fmt(slope))) + hte_theme()
+bins <- df %>% mutate(bin = cut(x1, breaks = quantile(x1, 0:20 / 20), include.lowest = TRUE)) %>%
+  group_by(bin) %>% summarise(x1 = mean(x1), score = mean(score), truth = mean(truth), .groups = "drop")
+p2 <- ggplot(bins, aes(x1)) + geom_line(aes(y = truth), colour = "black") +
+  geom_point(aes(y = score), colour = hte_colors[["DR-learner"]], size = 2) +
+  labs(y = "Mean in bin", subtitle = "Binned score (points) and true CATE (line)") + hte_theme()
+patchwork::wrap_plots(p1, p2)
+```
+
+The score is noisy: an individual value divides a residual by a propensity.
+That noise is the price of unbiasedness at the individual level, and it is
+why the rest of the lecture never looks at one score alone. It averages
+them, regresses them, or classifies their sign.
+
+## Two alternatives and why they lose
+
+`dr_scores(type = "ipw")` returns $Y H(\hat p)$, the inverse-propensity
+signal, whose conditional mean is also the CATE. `type = "reg"` returns
+$\hat g(1, Z) - \hat g(0, Z)$, the plug-in signal. The first is unbiased only
+if the propensity is right and has much larger variance; the second is
+unbiased only if the outcome model is right and has no variance protection.
+The doubly robust signal combines them.
+
+```{r score-types}
+sc_ipw <- dr_scores(train, "y", "d", x5, type = "ipw", seed = 1)
+sc_reg <- dr_scores(train, "y", "d", x5, type = "reg", learner_mu = rf_first, seed = 1)
+type_tab <- sapply(list(dr = sc_train_rf, ipw = sc_ipw, reg = sc_reg), function(s) {
+  b <- cate_blp(s, ~ tau_true, uniform = FALSE)$coefficients
+  c(slope_on_true_cate = b$estimate[2], hc1_se = b$std.error[2], sd_score = sd(s$score))
+})
+round(type_tab, 3)
+```
+
+The plug-in signal has the smallest variance and a slope below one: a
+regularized outcome model shrinks the heterogeneity it cannot represent.
+The inverse-propensity signal needs only the propensity, which is right
+here, but its standard deviation is
+`r fmt(type_tab["sd_score", "ipw"] / type_tab["sd_score", "dr"], 1)`
+times that of the doubly robust signal. The doubly robust signal keeps
+the slope of the inverse-propensity signal at a fraction of its variance.
+
+## Connection to Section 04
+
+The mean of the score is the AIPW estimate of the ATE, with the same
+standard error as `est_aipw()`:
+
+```{r score-ate}
+tidy(sc_train_rf)
+```
+
+Everything below is a regression of the score on something: on a
+dictionary of covariate functions (Section \@ref(sec-summaries)), on a
+machine learner (Section \@ref(sec-learners)), on a candidate model's own
+predictions (Section \@ref(sec-validation)), or on the sign of a policy
+(Section \@ref(sec-policy)).
+
+# Meta-learners: turning a regression method into a CATE model {#sec-learners}
+
+## The idea and a notation
+
+A meta-learner decomposes CATE estimation into regression problems and hands
+each to an off-the-shelf method (Künzel et al. 2019). Write
+$O_H(\{X_i, L_i, W_i\})$ for a regression oracle: it takes covariates,
+labels, and optional weights and returns an estimate of the weighted
+best predictor $\arg\min_{h \in H} E[W (L - h(X))^2]$ (Chernozhukov et al.
+2026, Section 15.1). Every meta-learner below ends with one call to this
+oracle on the heterogeneity variables $X$. The learners differ in the label
+$L_i$ they construct, and in how they construct it. All first stages are
+cross-fitted; the final call uses all rows.
+
+## S- and T-learners {#sec-s-t}
+
+The **S-learner** fits one model of $Y$ on $(D, Z)$ and sets
+$L_i = \hat g(1, Z_i) - \hat g(0, Z_i)$. The **T-learner** fits one model
+per arm, $\hat g_1$ on the treated and $\hat g_0$ on the controls, and sets
+$L_i = \hat g_1(Z_i) - \hat g_0(Z_i)$. Both converge to the best
+approximation of the CATE in the final oracle's class if the outcome models
+are consistent. Both fail in characteristic ways.
+
+- The S-learner regularizes the treatment like any other covariate. When
+  the effect is small relative to the baseline variation, a penalized or
+  tree-based learner shrinks it toward zero, or drops $D$ entirely.
+- The T-learner cannot share information across arms. When one arm is
+  small, its model is heavily regularized while the other is flexible, and
+  the difference of two mismatched fits produces spurious heterogeneity.
+
+The second failure is Figure \@ref(fig:t-failure), on the first design of
+Chernozhukov et al. (2026, Example 15.1.1): 5 percent treated, a constant
+effect of 0.5, a baseline with a jump on $[0.6, 0.8]$, and noise of 0.05.
+
+```{r t-failure, echo = FALSE, fig.cap = "Design 1 (5 percent treated, constant effect, jump in the baseline), one sample of n = 500. Left: the cross-fitted outcome models of the T-learner; the control model finds the jump, the treated model, fitted on about 25 points, finds it only noisily. Right: the resulting CATE estimates of the T- and X-learners against the truth."}
+dgp1 <- sim_hte(500, dgp = "simple_cate", seed = 4)
+fl1 <- fit_all_learners(dgp1, "x1", newdata = dgp1, learner = hte_forest(min_node = 5, trees = 200),
+                        learner_final = hte_forest(min_node = 50, trees = 200))
+df1 <- tibble(x1 = dgp1$x1, d = dgp1$d, y = dgp1$y,
+              mu0 = fl1$scores$nuisance$mu0, mu1 = fl1$scores$nuisance$mu1) %>% arrange(x1)
+p1 <- ggplot(df1, aes(x1)) +
+  geom_point(aes(y = y, colour = factor(d, labels = c("control", "treated"))), size = 0.7, alpha = 0.6) +
+  geom_line(aes(y = mu0), colour = "black", linewidth = 0.8) +
+  geom_line(aes(y = mu1), colour = hte_colors[["T-learner"]], linewidth = 0.8) +
+  scale_colour_manual(values = c(control = "grey60", treated = hte_colors[["T-learner"]]), name = NULL) +
+  labs(y = "Outcome", subtitle = "Outcome models: control (black), treated (orange)") + hte_theme()
+p2 <- plot_learner_fits(dgp1, fl1$preds, c("T-learner", "X-learner")) + labs(subtitle = "CATE: black = truth")
+patchwork::wrap_plots(p1, p2)
+```
+
+## X-learner {#sec-x-learner}
+
+The X-learner (Künzel et al. 2019) uses the fact that the effect is the
+same among treated and controls once we condition on $Z$. Each arm can
+therefore estimate the CATE with only *one* imputed counterfactual:
+$$
+\delta^T(Z) = E[Y - g_0(Z) \mid Z, D = 1], \qquad
+\delta^C(Z) = E[g_1(Z) - Y \mid Z, D = 0].
+$$
+The treated version needs only the control model $g_0$, which is estimated
+on the large arm; the control version needs only $g_1$. The two estimates
+are blended with the propensity, $\hat\delta(Z) = (1 - \hat p)\hat\delta^T + \hat p\,\hat\delta^C$,
+so that where treatment is rare, the version that uses the well-estimated
+control model gets the weight. The label is $L_i = \hat\delta(Z_i)$. The
+right panel of Figure \@ref(fig:t-failure) shows the repair.
+
+Two refinements come from the covariate-shift view: $\hat\delta^T$ is
+trained on the treated but evaluated everywhere, so training it with weights
+$(1 - \hat p)^2 / \hat p$ (and $\hat\delta^C$ with $\hat p^2 / (1 - \hat p)$)
+targets the population where it will be used (`adapt = TRUE`, the
+domain-adapted X-learner). And the X-learner's outcome models can feed the
+DR-learner below in place of the T-learner's.
+
+## DR-learner {#sec-dr-learner}
+
+The **DR-learner** regresses the pseudo-outcome of Section \@ref(sec-score)
+on $X$: $L_i = Y_i(\hat\eta)$ (Kennedy 2023; Foster and Syrgkanis 2023).
+Its error bound is
+$$
+E\big[(\hat\tau - \tau^*)^2\big] \lesssim r_n^2 + \mathrm{Err}(\hat g)^2\, \mathrm{Err}(H(\hat p))^2,
+$$
+where $r_n^2$ is the rate the oracle would achieve with the true label and
+$\tau^*$ is the best approximation in the oracle's class. Only the product
+of the nuisance errors enters: this is double robustness for a function
+(Appendix \@ref(app-learner-bounds) sketches the argument). The price is
+variance. The label divides a residual by $\hat p$ or $1 - \hat p$, and when
+overlap is weak in parts of the covariate space the label takes extreme
+values there.
+
+## R-learner {#sec-r-learner}
+
+The **R-learner** (Nie and Wager 2021) starts from Robinson's
+decomposition. If the CATE depends on $X$ only, then
+$$
+Y - E[Y \mid Z] = \tau(X)\,(D - E[D \mid Z]) + \epsilon, \qquad E[\epsilon \mid D, Z] = 0,
+$$
+so $\tau$ minimizes $E[(\tilde Y - \tau(X)\tilde D)^2]$ with $\tilde Y = Y - l(Z)$,
+$\tilde D = D - p(Z)$. Rewriting the loss as
+$E[\tilde D^2 (\tilde Y / \tilde D - \tau(X))^2]$ makes it a weighted
+regression: label $L_i = \tilde Y_i / \tilde D_i$, weight
+$W_i = \tilde D_i^2$. The final oracle must accept weights. The error bound
+is
+$$
+E\big[(\hat\tau - \tau_0)^2\big] \lesssim r_n^2 + \mathrm{Err}(\hat p)^4 + \mathrm{Err}(\hat p)^2 \mathrm{Err}(\hat l)^2,
+$$
+so the propensity matters more than in the DR-learner, but nothing is
+divided by it.
+
+What does the R-learner estimate when the CATE depends on more than $X$,
+or when the oracle's class is misspecified? Not the best approximation of
+$\tau_0$, but an overlap-weighted one:
+$$
+E\big[(\tilde Y - \tau(X)\tilde D)^2\big] = E\big[(\delta(Z) - \tau(X))^2 \mathrm{Var}(D \mid Z)\big] + E[\epsilon^2].
+$$
+*Skeleton.* Substitute $\tilde Y = \delta(Z)\tilde D + \epsilon$, expand, use
+$E[\epsilon \mid D, Z] = 0$ to kill the cross term, and
+$E[\tilde D^2 \mid Z] = \mathrm{Var}(D \mid Z)$. Regions where treatment is
+nearly deterministic get no weight. That is a bias relative to the DR-learner's
+target, and a large variance reduction.
+
+## Guidelines and an experiment {#sec-guidelines}
+
+Table \@ref(tab:guidelines) condenses the discussion.
+
+```{r guidelines, echo = FALSE}
+tibble(
+  Learner = c("S", "T", "X", "DR", "R"),
+  `Needs` = c("outcome model", "outcome models", "outcome models (+ propensity to blend)",
+              "outcome or propensity model", "propensity and outcome model"),
+  `Converges to` = c("best approximation of the CATE", "best approximation", "best approximation",
+                     "best approximation", "overlap-weighted approximation"),
+  `Weak when` = c("effect small relative to baseline (shrinks it)", "one arm is small",
+                  "CATE as complex as the baseline", "overlap weak (extreme labels)",
+                  "propensity poorly estimated; ignores low-overlap regions")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Meta-learners at a glance.") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9) %>%
+  column_spec(2:4, width = "4cm")
+```
+
+Two experiments make the guidelines concrete. The first uses the three
+designs of Chernozhukov et al. (2026, Example 15.1.1) with random-forest
+oracles: design 1 as above; design 2 with a simple baseline and the jump
+in the CATE, 5 percent treated; design 3 like design 2 with 95 percent
+treated. Learners are fitted on 70 percent of a sample, the two ensembles
+of Section \@ref(sec-ensembles) are stacked on the remaining 30 percent,
+and the root mean squared error is computed against the true CATE on a
+fresh sample.
+
+```{r learner-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_learners)}
+mc <- run_metalearner_experiment(n_sims = n_sims_learners, n_grid = c(500, 2000), seed = 1)
+mc_tab <- summarise_metalearner_experiment(mc)
+```
+
+```{r tab-learner-mc, echo = FALSE}
+mc_tab %>%
+  mutate(cell = paste0(fmt(mean_rmse, 3), " (", fmt(sd_rmse, 3), ")")) %>%
+  select(dgp, n, learner, cell) %>%
+  tidyr::pivot_wider(names_from = learner, values_from = cell) %>%
+  mutate(dgp = sub(":.*", "", dgp)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Design", "n", "S", "T", "X", "DA X", "DR", "R", "Q-agg.", "Best"),
+      caption = paste0("Root mean squared error of the CATE (mean and standard deviation over ",
+                       n_sims_learners, " simulations) with random-forest oracles. Design 1: constant effect, ",
+                       "jump in the baseline, 5 percent treated. Design 2: jump in the effect, simple baseline, ",
+                       "5 percent treated. Design 3: as design 2 with 95 percent treated.")) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8) %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+```
+
+```{r learner-mc-numbers, echo = FALSE}
+best_of <- function(design, size) {
+  t <- mc_tab %>% filter(grepl(design, dgp), n == size, !learner %in% c("Q-aggregation", "Best single"))
+  as.character(t$learner[which.min(t$mean_rmse)])
+}
+```
+
+Three patterns stand out.
+
+- Design 1 rewards outcome modelling with borrowed strength: the X-learner
+  is best (`r best_of("DGP 1", 500)` at $n = 500$), because the control
+  model is easy and the effect is constant. The learners that divide by
+  the propensity pay for it: with about 17 treated units in the training
+  part, the DR-learner's label multiplies their residuals by 20.
+- Design 3 rewards the T-learner: with 95 percent treated the treated model
+  is the good one and the effect is complex, so borrowing the control model
+  hurts (`r best_of("DGP 3", 500)` is best at $n = 500$).
+- Growing $n$ from 500 to 2000 lowers every learner's error but does not
+  change which learner is best within a design. The learners that divide by
+  the propensity remain behind with forest final stages even at
+  $n = 2000$: their labels are noisy, and a forest fitted to noisy labels
+  needs large leaves and many observations. The ensembles track the best
+  base learner in every design without being told which one it is.
+
+The book obtains the same qualitative picture with gradient-boosted
+oracles, with the DR- and R-learners closer to the front in designs 1 and
+2. The lesson is that the ranking depends on the oracle, the sample size,
+and the design: there is no single best meta-learner, and Section
+\@ref(sec-selection) replaces the guesswork with a data-driven choice.
+
+The second experiment isolates double robustness. It uses the running
+"smooth" design with *linear* oracles. The outcome regressions are
+misspecified (the baseline is quadratic in $x_2$) while the logistic
+propensity model is exactly right. The final stage is linear in $x_1$ and
+$x_2^2$, which contains the true CATE.
+
+```{r misspec-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5)}
+mis <- run_misspecification_experiment(n_sims = 200, n = 2000, seed = 2)
+mis_tab <- summarise_misspecification_experiment(mis)
+```
+
+```{r tab-misspec, echo = FALSE}
+mis_tab %>%
+  mutate(across(c(bias_rms, sd_rms, rmse), ~ fmt(.x, 3))) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Learner", "Bias", "Standard deviation", "RMSE"),
+      caption = "Misspecified linear outcome models, correct logistic propensity; n = 2000, 200 simulations. Bias is the root mean square over test points of the mean error across simulations; the standard deviation is the root mean square of the simulation standard deviation; RMSE combines both.") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+The S-, T-, and X-learners inherit the outcome model's bias and cannot
+remove it with more data; their errors are almost entirely bias. The DR-
+and R-learners have almost no bias, because the correct propensity model
+protects them as the error bounds promise, and their errors are variance,
+which shrinks with $n$. This is the reason
+to prefer them whenever the outcome model is the shaky part of the
+analysis, which in observational data it usually is.
+
+## Multi-arm and other extensions
+
+With $K$ arms the S- and T-learners extend directly (one model with the arm
+as a feature, or $K$ models), and pairwise X- and R-learners can be built
+for each contrast. The R-learner then depends on the reference arm, and
+Zhou, Zhang, and Tu (2023) propose a reference-free version that estimates
+$E[Y^{(k)} - Y \mid X]$ for every arm under a simplex constraint. Neural
+networks with a shared representation and a balancing penalty (Shalit,
+Johansson, and Sontag 2017) are another route to outcome modelling under
+covariate shift. None of these change the logic of this section: a
+pseudo-label, then a regression.
+
+## Interpreting a black-box CATE {#sec-interpret}
+
+A forest-based $\hat\tau$ is not readable. Two devices restore
+interpretation without new assumptions.
+
+- **Distillation**: fit a shallow regression tree to $\hat\tau(X_i)$ on
+  $X_i$ and read its splits.
+- **Group differences**: compare covariate means between the top and
+  bottom groups of $\hat\tau$ (Section \@ref(sec-validation) reports them).
+
+```{r distill}
+dr_fit <- cate_learner(scores = sc_train_rf, x_het = x5, method = "dr", learner_final = rf_final)
+tau_test <- predict(dr_fit, test)
+distill <- rpart::rpart(tau_hat ~ ., data = data.frame(tau_hat = tau_test, test[, x5]),
+                        control = rpart::rpart.control(maxdepth = 2, minbucket = 50, cp = 0.01))
+distill
+```
+
+The distillation is fitted to predictions on the test sample, never to
+in-sample fitted values of a forest, which overfit their own noisy labels.
+Its root splits on `r as.character(distill$frame$var[1])`, the variable
+that drives the effect linearly in the design; the splits below use
+`r paste(setdiff(unique(as.character(distill$frame$var)), c("<leaf>", as.character(distill$frame$var[1]))), collapse = " and ")`.
+
+# Inference on summaries of the CATE {#sec-summaries}
+
+## Best linear predictor {#sec-blp}
+
+The most useful relaxation replaces $\tau(x)$ by its best linear
+approximation in a dictionary $p(x)$ of $d \ll n$ functions:
+$$
+\beta_0 = \arg\min_\beta E\big[(\tau(X) - p(X)'\beta)^2\big]
+        = E[p(X)p(X)']^{-1} E[p(X)\,\tau(X)]
+        = E[p(X)p(X)']^{-1} E[p(X)\,Y(\eta_0)],
+$$
+where the last equality uses $E[Y(\eta_0) \mid X] = \tau(X)$. So $\beta_0$
+is the population regression coefficient of the pseudo-outcome on $p(X)$,
+and its sample analogue is ordinary least squares of $Y_i(\hat\eta)$ on
+$p(X_i)$ (Semenova and Chernozhukov 2021; Chernozhukov et al. 2026, Section
+14.2).
+
+*Skeleton of why OLS inference is valid.* Write $\hat\beta - \beta_0 =
+\hat Q^{-1} \mathbb{E}_n[p(X)(Y(\hat\eta) - p(X)'\beta_0)]$ with $\hat Q =
+\mathbb{E}_n[p(X)p(X)']$. Replace $Y(\hat\eta)$ by $Y(\eta_0)$: the
+difference has conditional mean equal to the product of the nuisance
+errors (Section \@ref(sec-score)), which is $o(n^{-1/2})$ under the rate
+condition of Section 04, and a conditional variance that vanishes with
+consistency of the nuisances. What remains is OLS with the oracle
+outcome, whose HC sandwich is the right variance. The dictionary can be
+group indicators, polynomials, or splines. When it is group indicators the
+coefficients are group average treatment effects (GATEs).
+
+`cate_blp()` runs the regression, reports HC1 standard errors, and adds a
+simultaneous band from the multiplier bootstrap of Section 07 applied to the
+influence functions $\hat Q^{-1} p(X_i) \hat e_i$.
+
+```{r blp}
+blp <- cate_blp(sc_train_rf, ~ x1 + I(x2^2), seed = 1)
+blp
+blp_oracle <- cate_blp(sc_train_oracle, ~ x1 + I(x2^2), uniform = FALSE)
+blp_oracle$coefficients %>% select(term, estimate, std.error) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+The true CATE is $0.5 + x_1 + 0.5 x_2^2$, so the three coefficients target
+$0.5$, $1$, and $0.5$. The coefficient on $x_1$ is on target. The
+coefficient on $x_2^2$ is `r fmt(blp$coefficients$estimate[3])` with the
+forest nuisances and `r fmt(blp_oracle$coefficients$estimate[3])` with the
+true nuisances: the difference is the product-of-errors term of Section
+\@ref(sec-score), which is largest in the tail of $x_2$, where the forest's
+outcome error and the propensity's leverage are both large. Better
+nuisances, not a different second stage, close that gap. The Wald test
+rejects a constant effect. The simultaneous critical value is above 1.96
+because it covers all three coefficients at once.
+
+Figure \@ref(fig:blp-curve) evaluates the curve along $x_1$ with pointwise
+and simultaneous bands. The simultaneous band covers the whole curve with
+probability 0.95; the pointwise band covers one pre-specified point.
+
+```{r blp-curve, fig.cap = "Best linear predictor of the CATE along x1 (x2 fixed at 0) with pointwise (dark) and simultaneous (light) 95 percent bands. The dashed line is the true CATE."}
+grid <- data.frame(x1 = seq(-2.5, 2.5, by = 0.1), x2 = 0)
+plot_cate_blp(blp, grid, seed = 1) +
+  geom_line(data = grid, aes(x1, 0.5 + x1), linetype = "dashed", colour = "black")
+```
+
+## Group average treatment effects {#sec-gate}
+
+With group indicators as the dictionary, `cate_gate()` returns the doubly
+robust GATEs with pointwise and simultaneous intervals and a joint test of
+equality.
+
+```{r gate}
+q_x1 <- cut(train$x1, quantile(train$x1, 0:4 / 4), include.lowest = TRUE, labels = paste0("Q", 1:4))
+gate <- cate_gate(sc_train_rf, q_x1, seed = 1)
+gate
+```
+
+```{r gate-plot, echo = FALSE, fig.height = 3.4, fig.cap = "Group average treatment effects by quartile of x1. Thick bars: pointwise 95 percent intervals; thin bars: simultaneous intervals valid for all four groups at once."}
+plot_cate_gate(gate)
+```
+
+The choice between pointwise and simultaneous intervals is a choice of
+question. A pre-registered interest in the bottom quartile alone uses the
+pointwise interval. A claim that "effects differ across quartiles" needs
+the joint test or the simultaneous intervals.
+
+## A subset of covariates is enough {#sec-subset}
+
+The dictionary used $x_1$ and $x_2$ while confounding was handled by all
+five covariates inside the scores. Nothing required $X = Z$. That is the
+practical advantage of the pseudo-outcome route: heterogeneity can be
+described in the two or three variables a decision maker can act on, while
+the nuisances use everything.
+
+## Continuous treatments {#sec-continuous-blp}
+
+With a continuous treatment the natural target is the derivative
+$E[\partial_t E[Y \mid T = t, X] \mid X]$ (Facure 2023, ch. 18). Under the
+partially linear interaction model
+$Y = (p(X)'\beta)\, T + f(Z) + e$, partialling out gives
+$\tilde Y = (p(X)'\beta)\, \tilde T + e$ with $\tilde Y = Y - E[Y \mid Z]$,
+$\tilde T = T - E[T \mid Z]$. So $\beta$ is OLS of $\tilde Y$ on
+$p(X)\tilde T$, which is the R-learner loss of Section \@ref(sec-r-learner)
+with a linear CATE. The residuals come from `est_dml(model = "plr")`; the
+regression on $p(X)\tilde T$ is one `lm()` call with HC standard errors.
+The heterogeneity is then a slope that varies with $X$, exactly the
+"sensitivity" that price experiments estimate.
+
+## Forests with confidence intervals {#sec-forests}
+
+Inference at a point $x$ is harder than inference on a summary. Random
+forests adapted for inference (Wager and Athey 2018; Athey, Tibshirani, and
+Wager 2019) deliver it in low dimensions. The ingredients are:
+
+- **honesty**: one subsample chooses the splits, another fills the leaves;
+- **subsampling** without replacement, with subsample size $s \ll n$;
+- **balanced splits** and a positive probability that each variable is
+  tried at each split;
+- fully grown trees with small leaves.
+
+Under these conditions predictions are asymptotically normal, and a
+variance estimate (from the variation across subsamples) gives confidence
+intervals. Two constructions are in use.
+
+- A **doubly robust forest** is an honest regression forest on the
+  pseudo-outcome $Y(\hat\eta)$. Its validity in high dimensions of $Z$
+  needs only the product of nuisance errors to be small conditionally on $X$
+  (Oprescu, Syrgkanis, and Wu 2019).
+- A **causal forest** solves the R-learner moment locally:
+  $E[(\tilde Y - \tau(x)\tilde D)\tilde D \mid X = x] = 0$, using forest
+  weights $K(x, X_i)$ that measure how often $X_i$ shares a leaf with $x$.
+  This is the generalized random forest of `grf`, and it is valid when the
+  CATE depends on the forest's variables only.
+
+The theory is exact only under the tuning it assumes; cross-validated
+hyperparameters break it. In practice the intervals are a useful signal of
+where the CATE is uncertain, not a guarantee. The comparison below uses the
+same data for `grf::causal_forest()` and for the DR-learner with a forest
+final stage.
+
+```{r forests, eval = run_grf}
+library(grf)
+cf <- causal_forest(as.matrix(train[, x5]), train$y, train$d, num.trees = 1000, seed = 1)
+pred_cf <- predict(cf, as.matrix(test[, x5]), estimate.variance = TRUE)
+dr_forest <- cate_learner(scores = sc_train_rf, x_het = x5, method = "dr",
+                          learner_final = lrn("regr.ranger", num.trees = 500, min.node.size = 50))
+c(rmse_causal_forest = sqrt(mean((pred_cf$predictions - test$tau_true)^2)),
+  rmse_dr_forest = sqrt(mean((predict(dr_forest, test) - test$tau_true)^2)),
+  coverage_causal_forest = mean(abs(pred_cf$predictions - test$tau_true) <= 1.96 * sqrt(pred_cf$variance.estimates)))
+```
+
+```{r forests-plot, echo = FALSE, eval = run_grf, fig.cap = "Causal forest (with pointwise 95 percent intervals) and DR-learner forest predictions along x1 on the test sample, other covariates as observed. The black line is the true CATE averaged in bins of x1."}
+df <- tibble(x1 = test$x1, truth = test$tau_true, cf = pred_cf$predictions,
+             cf_se = sqrt(pred_cf$variance.estimates), drf = predict(dr_forest, test)) %>%
+  mutate(bin = cut(x1, breaks = quantile(x1, 0:25 / 25), include.lowest = TRUE)) %>%
+  group_by(bin) %>%
+  summarise(x1 = mean(x1), truth = mean(truth), cf = mean(cf), cf_se = mean(cf_se), drf = mean(drf), .groups = "drop")
+ggplot(df, aes(x1)) +
+  geom_ribbon(aes(ymin = cf - 1.96 * cf_se, ymax = cf + 1.96 * cf_se), fill = hte_colors[["R-learner"]], alpha = 0.2) +
+  geom_line(aes(y = truth), colour = "black", linewidth = 1) +
+  geom_line(aes(y = cf, colour = "Causal forest (grf)"), linewidth = 0.8) +
+  geom_line(aes(y = drf, colour = "DR-learner, forest final stage"), linewidth = 0.8) +
+  scale_colour_manual(values = c("Causal forest (grf)" = hte_colors[["R-learner"]],
+                                 "DR-learner, forest final stage" = hte_colors[["DR-learner"]]), name = NULL) +
+  labs(y = "CATE (binned means)") + hte_theme()
+```
+
+Both forests find the slope in $x_1$; the doubly robust one is noisier
+because it regresses a noisy label. The causal forest's pointwise intervals
+cover the true CATE for
+`r round(100 * mean(abs(pred_cf$predictions - test$tau_true) <= 1.96 * sqrt(pred_cf$variance.estimates)))`
+percent of the test units, below the nominal 95 percent: the default
+tuning is not the tuning the theory assumes, and the intervals are a signal
+of uncertainty rather than a guarantee. Where the two forests disagree, the
+disagreement itself is informative: the R-learner moment weights regions by
+$\mathrm{Var}(D \mid Z)$, the DR-learner does not (Section
+\@ref(sec-r-learner)).
+
+# Choosing a CATE model out of sample {#sec-selection}
+
+## Why prediction metrics do not work
+
+A CATE model cannot be scored by the usual out-of-sample mean squared error:
+the target $\tau(X_i)$ is never observed, and neither is $Y_i(1) - Y_i(0)$.
+Comparing models by how well they predict $Y$ rewards the baseline, not the
+effect (Facure 2023, "Why prediction metrics are dangerous for causal
+models"). The pseudo-outcome solves this: it is an observed variable whose
+conditional mean is the target.
+
+## The doubly robust loss and its differences {#sec-dr-loss}
+
+For a candidate $\tau_m$ define, on a scoring sample,
+$$
+\hat L(\tau_m) = \mathbb{E}_n\big[(Y(\hat\eta) - \tau_m(X))^2\big].
+$$
+The loss itself contains the irreducible variance of the pseudo-outcome. Its
+differences do not: for two candidates,
+$$
+L(\tau_i; \eta_0) - L(\tau_j; \eta_0) = E[(\tau_i(X) - \tau_0(X))^2] - E[(\tau_j(X) - \tau_0(X))^2].
+$$
+*Skeleton.* Expand the squares; the cross term is
+$-2E[Y(\eta_0)(\tau_i - \tau_j)] = -2E[\tau_0(\tau_i - \tau_j)]$ by the key
+property, and $E[Y(\eta_0)^2]$ cancels in the difference. So ranking by
+$\hat L$ ranks by mean squared error against the true CATE. The difference
+is Neyman orthogonal in $\eta$, and Theorem 15.2.1 of Chernozhukov et al.
+(2026) gives $\sqrt n(\hat L_i - \hat L_j - \delta^*_{ij}) \to N(0, V)$ with
+$V$ the variance of the per-observation loss difference (Appendix
+\@ref(app-dr-loss)). Confidence intervals for the comparison follow.
+
+The interpretable version compares each model with the constant-effect
+model: $S(\tau) = 1 - \hat L(\tau) / \hat L(\hat\theta)$, in $(-\infty, 1]$,
+is the fraction of the constant model's loss the candidate removes.
+
+## Code: scoring the meta-learners {#sec-score-code}
+
+We fit the five meta-learners on the training sample with forests, then
+score them on the scoring sample. The scoring sample gets its own
+cross-fitted pseudo-outcomes.
+
+```{r score-fit}
+fit_one <- function(m, ...) cate_learner(scores = sc_train_rf, x = x5, x_het = c("x1", "x2"), method = m,
+                                         learner = rf_first, learner_final = rf_final, ...)
+models <- list(s_learner = fit_one("s"), t_learner = fit_one("t"), x_learner = fit_one("x"),
+               dr_learner = fit_one("dr"), r_learner = fit_one("r"))
+sc_score <- dr_scores(score_set, "y", "d", x5, learner_mu = rf_first, seed = 2)
+cs <- do.call(cate_score, c(list(sc_score), models))
+cs
+```
+
+```{r score-truth, echo = FALSE}
+truth_rmse <- sapply(models, function(m) sqrt(mean((predict(m, score_set) - score_set$tau_true)^2)))
+```
+
+The doubly robust losses order the models
+`r paste(cs$table$model[order(cs$table$loss)], collapse = ", ")`; the true
+root mean squared errors on the same rows, which only a simulation can
+compute, order them
+`r paste(names(sort(truth_rmse)), collapse = ", ")`. The confidence intervals
+say which differences are real: a candidate whose interval for `diff`
+includes zero has not been shown to beat a constant effect.
+
+## Ensembles {#sec-ensembles}
+
+Selecting the single best model has a $\sqrt{\log(M)/n}$ excess risk. Stacking
+the candidates by minimizing the doubly robust loss over convex weights
+achieves $M/n$; Q-aggregation, which adds the penalty $\sum_m w_m \hat L(\tau_m)$
+to the stacked loss, achieves $\log(M)/n$, the best possible dependence on
+both $M$ and $n$ (Lecué and Rigollet 2014; Lan and Syrgkanis 2023). The
+intercept is fixed at the ATE and the base predictions are centered, so the
+ensemble never moves the average effect.
+
+```{r ensemble}
+ens <- do.call(cate_ensemble, c(list(sc_score, method = "q"), models))
+round(ens$ensemble$weights, 3)
+ens_rules <- sapply(c("q", "convex", "best", "ols"), function(r) {
+  e <- do.call(cate_ensemble, c(list(sc_score, method = r), models))
+  sqrt(mean((predict(e, test) - test$tau_true)^2))
+})
+best_single_rmse <- min(sapply(models, function(m) sqrt(mean((predict(m, test) - test$tau_true)^2))))
+round(c(ens_rules, truth_best_single = best_single_rmse), 3)
+```
+
+The best base learner on the test sample has root mean squared error
+`r fmt(best_single_rmse, 3)`;
+the convex ensemble reaches `r fmt(ens_rules["convex"], 3)`, Q-aggregation
+`r fmt(ens_rules["q"], 3)`, and the single best-scored model
+`r fmt(ens_rules["best"], 3)`. No rule needs to know which base learner is
+best, and the convex rule comes closest. The scoring sample has only
+`r nrow(score_set)` rows, so its ranking of the learners is imperfect
+(Section \@ref(sec-score-code) showed the doubly robust losses and the true
+errors ordering the learners differently), and the ensembles inherit that
+noise. Unconstrained least squares can extrapolate outside the convex hull
+and is less stable.
+
+## What the pipeline cannot give
+
+The ensemble comes without confidence intervals for its predictions and can
+change with the random split, the seeds of the forests, or a few removed
+observations. Report sensitivity to these choices. For statements with
+error control, hold out a third sample and use the tests of the next
+section.
+
+# Validating the chosen model {#sec-validation}
+
+## Three samples
+
+Train on one sample, score and stack on a second, test on a third. The test
+sample sees the final model only as a fixed function $\tau^*$. Everything
+in this section is computed on the test sample's own cross-fitted
+pseudo-outcomes.
+
+```{r test-scores}
+sc_test <- dr_scores(test, "y", "d", x5, learner_mu = rf_first, seed = 3)
+val <- cate_validate(sc_test, ens, n_boot = 999, seed = 1)
+```
+
+## Heterogeneity test from the best linear predictor {#sec-het-test}
+
+Regress $Y(\hat\eta)$ on $(1, \tau^*(X) - \bar\tau^*)$. The slope converges
+to
+$$
+\beta_1 = \frac{\mathrm{Cov}(\tau_0(X), \tau^*(X))}{\mathrm{Var}(\tau^*(X))}
+        = \frac{\mathrm{Cov}(Y(1) - Y(0), \tau^*(X))}{\mathrm{Var}(\tau^*(X))}.
+$$
+A significant slope means the model is correlated with the individual
+effect, which also proves that heterogeneity in $X$ exists. A slope of one
+means the model's scale is right. The intercept is the ATE because the
+regressor is centered.
+
+```{r het-test}
+val$blp
+```
+
+Here the slope is `r fmt(val$blp$estimate[2])` with standard error
+`r fmt(val$blp$std.error[2])`: the test does not reject a zero slope, while
+the grouped diagnostics below detect heterogeneity clearly. The slope is a
+regression on a heavy-tailed outcome and a few extreme predictions carry
+much of its variance; the grouped statistics average within quantile
+groups and are far more stable. Report both.
+
+## Calibration {#sec-calibration}
+
+A calibrated CATE model satisfies $E[Y(1) - Y(0) \mid \tau^*(X) = t] = t$.
+The mean squared error decomposes as calibration error plus distortion,
+$E[(\tau^* - \tau_0)^2] = \mathrm{CAL}_2(\tau^*) + E[\mathrm{Var}(\tau_0(X) \mid \tau^*(X))]$
+(the proof is the variance decomposition with $E[\tau_0 \mid \tau^*]$ as the
+conditional mean), so any consistent model is eventually calibrated, but a
+model can be calibrated without being accurate. The binned check compares,
+in each quantile group of $\tau^*$, the doubly robust GATE with the mean
+prediction.
+
+```{r calibration}
+val$calibration$table
+c(cal1 = val$calibration$cal1, cal1_normalized = val$calibration$cal1_normalized,
+  p_equal = val$calibration$test_equal$p.value)
+```
+
+```{r calibration-plot, echo = FALSE, fig.height = 3.6, fig.cap = "Calibration of the ensemble on the test sample: doubly robust group average effect (with 95 percent intervals) against the mean prediction in each quartile of predicted CATE. Points on the diagonal are calibrated."}
+plot_cate_validation(val, "calibration")
+```
+
+## Targeting curves {#sec-toc}
+
+Suppose we can treat only a share $q$ of the population and rank units by
+$\tau^*$. The **TOC** curve (Chernozhukov et al. 2026, Section 15.3) is the
+average effect among the top $q$ minus the ATE,
+$$
+\mathrm{TOC}(q) = E\big[Y(1) - Y(0) \mid \tau^*(X) \ge \mu(\tau^*, q)\big] - \mathrm{ATE}
+              = \mathrm{Cov}\Big(Y(1) - Y(0),\ \frac{\mathbb{1}\{\tau^*(X) \ge \mu(\tau^*, q)\}}{q}\Big),
+$$
+and the **QINI** curve scales it by the share treated,
+$\mathrm{QINI}(q) = q\, \mathrm{TOC}(q) = \mathrm{Cov}(Y(1) - Y(0), \mathbb{1}\{\tau^*(X) \ge \mu(\tau^*, q)\})$.
+The covariance forms (Appendix \@ref(app-uplift)) show that both are
+identified by replacing $Y(1) - Y(0)$ with $Y(\eta_0)$, so both are
+averages of the pseudo-outcome with fixed weights. Their influence
+functions give pointwise standard errors; the multiplier bootstrap gives a
+one-sided simultaneous band. If the band lies above zero at any $q$, the
+model has found heterogeneity with statistical significance. The areas
+under the curves, AUTOC and AUQC, integrate over all ranks and are the
+rank-weighted average treatment effects of Yadlowsky et al. (2021).
+
+```{r toc}
+val$areas
+val$heterogeneity_statistic
+```
+
+```{r toc-plot, echo = FALSE, fig.cap = "TOC curve of the ensemble on the test sample with pointwise (dotted) and one-sided simultaneous (shaded) 95 percent lower bounds. Treating the top 20 percent by predicted CATE yields an average effect about TOC(0.2) above the ATE."}
+plot_cate_validation(val, "toc")
+```
+
+The TOC curve reads: treating the top 5 percent by predicted CATE yields
+an average effect `r fmt(val$curves$toc[val$curves$q == 0.05])` above the
+ATE of `r fmt(val$ate)`; the gain declines to zero as $q$ reaches one. The
+QINI curve reads as total gain over treating a random share $q$; it peaks
+at the share where marginal units stop being better than average.
+
+## Group differences {#sec-group-diff}
+
+When the top and bottom groups are separated statistically, describing them
+is the last diagnostic: covariate means in the two groups, or a shallow
+classification tree that separates them.
+
+```{r group-diff}
+val$group_diff %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+In the design, $x_1$ drives the effect linearly and $x_2$ quadratically.
+The table shows the top quartile has a much higher mean of $x_1$, while the
+mean of $x_2$ barely differs: a quadratic effect changes the spread of
+$x_2$, not its mean, and a comparison of means cannot see it. $x_3$ to
+$x_5$ do not differ, as they should not.
+
+## Ties
+
+A model that predicts the same value for many units (a tree, a coarse
+rule) leaves the top-$q$ set ill defined. The package treats units above
+the threshold deterministically and units at the threshold with the
+probability that fills the share $q$ (Chernozhukov et al. 2026, Remark
+15.3.1); the areas use the average weight within each tied block, which is
+the expectation of that rule.
+
+# Policy learning {#sec-policy}
+
+## Policies and their value {#sec-policy-value}
+
+A policy $\pi: X \to \{0, 1\}$ says whom to treat. Its gain over treating
+no one, net of a per-unit cost $c$, is
+$$
+V(\pi) = E\big[\pi(X)\,(Y(1) - Y(0) - c)\big] = E\big[\pi(X)\,(Y(\eta_0) - c)\big],
+$$
+the second equality by the key property of Section \@ref(sec-score), since
+$\pi(X)$ is a function of $X$. So the value of a *fixed* policy is an
+average of the pseudo-outcome, with a standard error from its influence
+function. The gain over treating everyone is $E[(\pi(X) - 1)(Y(\eta_0) - c)]$.
+Under a budget that allows a share $q$ to be treated, the best rule treats
+the top $q$ by $\tau(X)$ and its value is $q \cdot (\mathrm{TOC}(q) + \mathrm{ATE})$
+in the notation of Section \@ref(sec-toc).
+
+```{r policy-value}
+policy_value(sc_test, list(sign_of_ensemble = predict(ens, test) > 0,
+                           treat_all = rep(1, nrow(test)),
+                           oracle = test$tau_true > 0), cost = 0.5)
+```
+
+With a cost of 0.5 per treated unit, treating everyone is clearly worse
+than the rule that treats units whose predicted effect exceeds the cost.
+The rule that knows the true CATE and the estimated rule are
+indistinguishable within sampling error: the difference between them is
+smaller than two of its standard errors.
+
+## Optimal policies are classifiers {#sec-classification}
+
+Without constraints the optimal policy is $\pi^*(x) = \mathbb{1}\{\tau(x) > c\}$:
+only the *sign* of $\tau(x) - c$ matters. Learning a policy is therefore
+closer to classification than to regression. Mistakes cost more where
+$|\tau(x) - c|$ is large, so it is cost-sensitive classification. Formally,
+with $\Gamma = Y(\eta_0) - c$,
+$$
+\arg\max_\pi V(\pi) = \arg\max_\pi E\big[(2\pi(X) - 1)\,\Gamma\big]
+                    = \arg\max_\pi E\big[\mathbb{1}\{2\pi(X) - 1 = \mathrm{sign}(\Gamma)\}\,|\Gamma|\big].
+$$
+*Skeleton.* $(2\pi - 1)\Gamma = (2\pi - 1)\mathrm{sign}(\Gamma)|\Gamma|$, and
+$(2\pi - 1)\mathrm{sign}(\Gamma)$ equals $+1$ when the policy matches the
+sign and $-1$ otherwise; adding the constant $E|\Gamma|$ and halving gives
+the indicator form. So any weighted classifier, trained with labels
+$\mathrm{sign}(\hat\Gamma_i)$ and weights $|\hat\Gamma_i|$, maximizes the
+empirical value.
+
+## Empirical welfare maximization in a restricted class {#sec-ewm}
+
+Plugging a CATE model into the sign rule is one option. Empirical welfare
+maximization (Kitagawa and Tetenov 2018; Athey and Wager 2021) is another:
+choose the rule in a class $\Pi$ that maximizes the sample value
+$\hat V(\pi) = \mathbb{E}_n[\pi(X)\hat\Gamma]$. Restricting $\Pi$ has two
+purposes. A depth-two tree or a linear rule can be explained, audited, and
+implemented, which a forest cannot. And the regret of the learned rule,
+$$
+R(\hat\pi) = \max_{\pi \in \Pi} V(\pi) - V(\hat\pi)
+           \lesssim \sqrt{\frac{V^*\, \mathrm{VC}(\Pi)}{n}}
+           + \|H(\hat p) - H(p_0)\|\,\|\hat g - g_0\|,
+$$
+is controlled by the complexity of $\Pi$ (its VC dimension), not by the
+complexity of the CATE (Athey and Wager 2021, Theorem 1; Appendix
+\@ref(app-regret) sketches the reduction). The nuisance errors enter as a
+product, as everywhere else in this lecture. The plug-in rule inherits the
+CATE model's estimation error instead, which is larger when the CATE is
+harder to learn than its sign.
+
+## Code: learning a tree {#sec-policy-code}
+
+The `"policy"` design has a CATE that is piecewise constant on a
+depth-two tree in $x_1$, $x_2$, $x_3$ (plus a small smooth term in $x_4$),
+confounded assignment, and a nonlinear baseline. `policy_learn()` searches
+depth-one and depth-two trees exactly, holding out half of the rows to
+report an honest value.
+
+```{r policy-tree}
+pol_dat <- sim_hte(4000, dgp = "policy", seed = 2)
+sc_pol <- dr_scores(pol_dat, "y", "d", x5, learner_mu = rf_first, seed = 1)
+pol <- policy_learn(sc_pol, method = "tree", depth = 2, seed = 1)
+pol
+attr(pol_dat, "optimal_tree")
+```
+
+```{r policy-tree-plot, echo = FALSE, fig.height = 3, fig.cap = "The depth-two policy tree learned by empirical welfare maximization on the policy design. It recovers the structure of the optimal rule."}
+plot_policy_tree(pol)
+```
+
+The estimation-sample value is optimistic: it is the maximum over many
+candidate trees. The held-out value is not. `engine = "policytree"`
+delegates the search to the `policytree` package (Sverdrup et al. 2020),
+which handles any depth with the same objective:
+
+```{r policytree, eval = run_policytree}
+pol_pt <- policy_learn(sc_pol, method = "tree", depth = 2, engine = "policytree", seed = 1)
+c(agreement = mean(predict(pol_pt, pol_dat) == predict(pol, pol_dat)))
+```
+
+## Regret of trees versus plug-in rules {#sec-regret-mc}
+
+Figure \@ref(fig:policy-mc) compares four rules on the policy design as $n$
+grows: depth-one and depth-two trees from empirical welfare maximization,
+and the signs of T- and DR-learner CATE models. Regret is measured with the
+true CATE on a large test sample.
+
+```{r policy-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_policy), fig.height = 3.8, fig.cap = "Regret (value of the optimal rule minus value of the learned rule, in outcome units) on the policy design, mean over simulations with a two-standard-error band. The depth-two tree has the right class and learns fastest; the depth-one tree has the wrong class and its regret does not vanish; plug-in sign rules need to learn the magnitude before the sign."}
+pmc <- run_policy_experiment(n_sims = n_sims_policy, n_grid = c(500, 1000, 2000, 4000), seed = 3)
+pmc_tab <- pmc %>% group_by(n, policy) %>%
+  summarise(regret = mean(regret), se = sd(regret) / sqrt(n()), .groups = "drop")
+ggplot(pmc_tab, aes(n, regret, colour = policy)) +
+  geom_ribbon(aes(ymin = regret - 2 * se, ymax = regret + 2 * se, fill = policy), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.9) + geom_point() +
+  scale_x_log10(breaks = c(500, 1000, 2000, 4000)) +
+  scale_colour_manual(values = c("Tree, depth 1" = "#999999", "Tree, depth 2" = hte_colors[["DR-learner"]],
+                                 "Sign of T-learner CATE" = hte_colors[["T-learner"]],
+                                 "Sign of DR-learner CATE" = hte_colors[["R-learner"]]), name = NULL) +
+  scale_fill_manual(values = c("Tree, depth 1" = "#999999", "Tree, depth 2" = hte_colors[["DR-learner"]],
+                               "Sign of T-learner CATE" = hte_colors[["T-learner"]],
+                               "Sign of DR-learner CATE" = hte_colors[["R-learner"]]), guide = "none") +
+  labs(x = "n (log scale)", y = "Regret") + hte_theme() + guides(colour = guide_legend(nrow = 2))
+```
+
+Two lessons. The class must contain a good rule: the depth-one tree
+cannot express the optimal policy and its regret stays flat. Within the
+right class, learning the sign directly is easier than learning the
+magnitude: at every $n$ the depth-two tree beats the plug-in rules built
+from forests.
+
+## Budgets and other classes {#sec-policy-classes}
+
+- **Budget**: `policy_learn(method = "budget", budget = q, tau_hat = model)`
+  treats the top share $q$ ranked by a CATE model, the constrained optimum
+  when the ranking is right. Its value is the QINI curve at $q$ plus $q$
+  times the ATE.
+- **Linear rules** $\mathbb{1}\{x'b > 0\}$: Kitagawa and Tetenov solve the
+  exact problem by integer programming; the package fits the weighted
+  logistic surrogate, which is fast and usually close.
+- **Any classifier**: `method = "classifier"` passes labels and weights to
+  an `mlr3` classifier; deeper trees or forests give flexible but opaque
+  rules.
+
+```{r policy-classes}
+tau_pol <- cate_learner(scores = sc_pol, x_het = x5, method = "dr", learner_final = rf_final)
+rules <- list(
+  tree2 = pol,
+  budget30 = policy_learn(sc_pol, method = "budget", budget = 0.3, tau_hat = tau_pol, seed = 1),
+  linear = policy_learn(sc_pol, method = "linear", seed = 1)
+)
+do.call(rbind, lapply(names(rules), function(nm) cbind(rule = nm, rules[[nm]]$value[2, ])))
+```
+
+## Targeting impact versus deprivation {#sec-frontier}
+
+Haushofer, Niehaus, Paramo, Miguel, and Walker (2025) ask whom a cash
+transfer should reach: the poorest, or those who gain most. With a
+concave utility $u$ and predicted untreated outcome $\hat y_0$ (deprivation)
+and effect $\hat\tau$ (impact), a planner treats units in order of
+$u(\hat y_0 + \hat\tau) - u(\hat y_0)$. Linear utility ranks on impact;
+strong curvature ranks on deprivation. `policy_frontier()` traces the
+overlap of the chosen set with impact-only and deprivation-only targeting
+as curvature grows, and evaluates each rule with the doubly robust value.
+
+```{r frontier}
+fr <- policy_frontier(sc_test, ens, y0_hat = sc_test$nuisance$mu0, budget = 0.3,
+                      utility = "cara", curvature = c(0, 0.5, 1, 2, 5))
+fr
+```
+
+```{r frontier-plot, echo = FALSE, fig.height = 3.6, fig.cap = "Units selected by a planner with CARA curvature 1 and a 30 percent budget, in the plane of predicted untreated outcome and predicted effect. The planner trades impact for deprivation along the frontier."}
+plot_policy_frontier(fr, curvature = 1)
+```
+
+In the running design impact and deprivation are only weakly related, so
+the planner's choice moves smoothly from one corner to the other; the
+value of the rule falls as curvature rises because the value counts effects,
+not utility. The paper's finding is that in Kenya the two criteria pick
+different households, so deprivation-only targeting leaves impact on the
+table.
+
+## Cautions {#sec-policy-cautions}
+
+- **Variance and overlap.** A candidate policy that treats where the data
+  rarely treated has a noisy value; regret bounds carry the worst overlap
+  ratio. Variance penalization, distributionally robust objectives, and
+  pessimistic (lower-confidence-bound) objectives address this, at the cost
+  of leaving the classification reformulation.
+- **Adaptive data.** When assignment probabilities were updated during
+  collection (bandits), the pseudo-outcome must use the realized
+  probabilities and stabilizing weights (Zhan, Ren, Athey, and Zhou 2024).
+- **Dynamic regimes.** Sequential treatments need backward induction over
+  stages; Section 07's L19 material and Q-learning cover it.
+- **Honesty.** Report the value on data the search never saw. The
+  in-sample value of the best of many rules is biased upward.
+
+# Traps {#sec-traps}
+
+## Binary outcomes and the curvature trap {#sec-binary-trap}
+
+With a binary outcome the effect on the probability scale depends on where
+a unit sits on the response curve. Facure (2023, ch. 23) gives the cleanest
+example. A randomized nudge, income that moves only the baseline, and age
+that moves only the latent effect:
+$$
+Y^* = -4.5 + 0.001\,\mathrm{income} + D\,(1 + 0.01\,\mathrm{age}) + \varepsilon, \qquad Y = \mathbb{1}\{Y^* > t\}.
+$$
+On the latent scale, income has no effect heterogeneity. On the
+probability scale it does, through the slope of the normal CDF, and it can
+dominate age.
+
+```{r binary-trap, echo = FALSE, fig.cap = "Cumulative effect curves (Facure 2023): units ordered by a covariate, difference in means between treated and controls among the top share. Left: latent outcome, where only age matters. Right: the binary conversion with a 12 percent base rate, where income (which moves only the baseline) sorts units by treatment effect more sharply than age."}
+bin <- sim_hte(50000, dgp = "binary_outcome", threshold = 2, seed = 1)
+curves <- bind_rows(
+  cumulative_effect_curve(bin, "d", "latent", "age") %>% mutate(outcome = "Latent outcome", ordered_by = "age"),
+  cumulative_effect_curve(bin, "d", "latent", "income") %>% mutate(outcome = "Latent outcome", ordered_by = "income"),
+  cumulative_effect_curve(bin, "d", "y", "age") %>% mutate(outcome = "Conversion (12 percent)", ordered_by = "age"),
+  cumulative_effect_curve(bin, "d", "y", "income") %>% mutate(outcome = "Conversion (12 percent)", ordered_by = "income")
+)
+ggplot(curves, aes(share, effect, colour = ordered_by)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ factor(outcome, levels = c("Latent outcome", "Conversion (12 percent)")), scales = "free_y") +
+  scale_colour_manual(values = c(age = hte_colors[["DR-learner"]], income = hte_colors[["T-learner"]]), name = "Ordered by") +
+  labs(x = "Share of units (ordered from high to low)", y = "Effect among the top share") + hte_theme()
+```
+
+The trap has a use. When conversion is rare, units with a high baseline
+are on the steep part of the curve and respond most; when conversion is
+common, units with a low baseline do. A CATE model on the probability
+scale is right about the effect on conversion, which is what a business
+cares about, but the ranking it produces is driven by the baseline, not by
+the latent sensitivity. Decide which scale the decision lives on before
+modelling heterogeneity.
+
+## Extrapolation of parametric summaries {#sec-extrapolation}
+
+A best linear predictor in a polynomial of one covariate is fitted where
+the data are dense and extrapolated where they are not. Heavy tails in
+the covariate produce wild curves in the tails, while forests regularize
+toward the nearest data (Chernozhukov et al. 2026, Section 15.5). Plot the
+covariate's distribution next to the curve, and report the curve only over
+the central range.
+
+## Specification search {#sec-search}
+
+CATE estimates are noisy and rarely the paper's main object, so they are
+prone to being reported when interesting and dropped when not (Childers
+2024). Pre-register the heterogeneity dimensions or the analysis pipeline;
+use held-out data for every claim; treat data-driven subgroups as
+hypotheses to be tested in the next experiment.
+
+## Heterogeneity that is not the CATE {#sec-distributions}
+
+Two other questions hide under "heterogeneous effects".
+
+- **Effects on distributions.** Quantile treatment effects
+  $Q_{Y(1)}(u) - Q_{Y(0)}(u)$ and effects on the CDF are identified by the
+  same adjustment formulas as the mean, applied to $\mathbb{1}\{Y \le y\}$
+  (distribution regression) or to the check loss (quantile regression;
+  Chernozhukov, Fernández-Val, and Melly 2013). Parallel trends is the one
+  design where this fails, because the assumption is about means (Athey
+  and Imbens 2006).
+- **Distributions of effects.** The distribution of $Y(1) - Y(0)$ is *not*
+  identified without further assumptions, because the two potential
+  outcomes are never observed together. Only bounds (Makarov bounds from
+  the Fréchet-Hoeffding inequalities) or functional-form assumptions
+  deliver it.
+
+The CATE is neither: it is the conditional mean of the effect, the one
+feature of the effect distribution that adjustment identifies at every $x$.
+
+```{r qte}
+qte <- sapply(c(0.1, 0.25, 0.5, 0.75, 0.9), function(u) {
+  q1 <- quantreg::rq(y ~ 1, tau = u, data = subset(bin, d == 1))
+  q0 <- quantreg::rq(y ~ 1, tau = u, data = subset(bin, d == 0))
+  coef(q1) - coef(q0)
+})
+round(setNames(qte, paste0("QTE at ", c(0.1, 0.25, 0.5, 0.75, 0.9))), 3)
+```
+
+Quantile effects of the nudge on the binary outcome are zero at every
+quantile except where the treated distribution crosses the threshold; on
+the latent outcome they would all be about 1.4. The two scales tell
+different stories, again.
+
+# Practice {#sec-practice}
+
+## Replications and anchors {#sec-replications}
+
+Four papers anchor this section; their replication notes live next to
+the lecture in the notes repository.
+
+- **Athey and Wager (2021), policy learning with observational data.**
+  Depth-limited policy trees from doubly robust scores in the California
+  GAIN experiments; the simulation evidence (their Figure 2 and Appendix
+  Table III) is reproducible from the saved outputs, and the tree search
+  is `policy_learn()` or `policytree`.
+- **Haushofer, Niehaus, Paramo, Miguel, and Walker (2025), targeting impact
+  versus deprivation.** Causal forests predict untreated consumption and
+  the transfer effect; a planner with CARA or CRRA utility trades them off.
+  `policy_frontier()` reproduces the exercise from any pair of predictions.
+- **Yoganarasimhan, Barzegary, and Pani (2023), optimal free trials.**
+  Seven trial lengths as arms, lasso, boosting, causal trees and forests
+  compared by out-of-sample scoring; a multi-arm case that reduces to
+  pairwise contrasts and the scoring of Section \@ref(sec-selection).
+- **Zhan, Ren, Athey, and Zhou (2024), policy learning with adaptively
+  collected data.** Doubly robust scores with adaptive weights when the
+  assignment probabilities changed during the experiment.
+
+## A checklist for heterogeneity and targeting {#sec-checklist}
+
+1. State the question: description (for whom), or decision (whom to
+   treat). The second needs the value and a policy class, not the CATE's
+   magnitude.
+2. Split the data: train, score, test. Report which sample produced each
+   number.
+3. Build the pseudo-outcome with cross-fitted nuisances. Report the
+   nuisance learners, their fit, and the propensity distribution.
+4. For inference on summaries, use the best linear predictor or GATEs with
+   simultaneous bands. Say which covariates define heterogeneity and which
+   handle confounding.
+5. For flexible models, fit several meta-learners and forests, score them
+   on the scoring sample with confidence intervals, and stack.
+6. Validate the chosen model on the test sample: heterogeneity slope,
+   calibration, TOC and QINI with bands, AUTOC.
+7. For policies, learn in a class you can implement; report the held-out
+   value with a standard error, against treating everyone and no one.
+8. Check stability across seeds and splits; state the scale (latent,
+   probability, money) the decision lives on.
+
+# Appendix {#sec-appendix}
+
+## Conditional orthogonality of the pseudo-outcome {#app-orthogonality}
+
+Let $\eta = (p, g)$ and write $\mu_d = g(d, \cdot)$. Conditioning on $Z$,
+$$
+E[Y(\eta) \mid Z] = \mu_1 - \mu_0 + \frac{p_0}{p}\,(\mu_{1,0} - \mu_1) - \frac{1 - p_0}{1 - p}\,(\mu_{0,0} - \mu_0),
+$$
+where $\mu_{d,0} = g_0(d, Z)$. Collect terms:
+$$
+E[Y(\eta_0) - Y(\eta) \mid Z]
+ = \Big(1 - \frac{p_0}{p}\Big)(\mu_{1,0} - \mu_1) - \Big(1 - \frac{1 - p_0}{1 - p}\Big)(\mu_{0,0} - \mu_0)
+ = (H(p_0) - H(p))\,(g_0(D, Z) - g(D, Z))
+$$
+in conditional expectation, since $E[D \mid Z] = p_0$. Each factor vanishes
+at $\eta_0$, so the Gateaux derivative in any direction is zero, and the
+bias is the product of the two errors. Averaging over $Z$ given $X$ gives
+the statement of Section \@ref(sec-score).
+
+## Error bounds of the DR- and R-learners {#app-learner-bounds}
+
+*DR-learner.* Let $\hat\tau$ be the oracle's output on $\{X_i, Y_i(\hat\eta)\}$
+and $\bar\tau$ its output on the true labels $\{X_i, Y_i(\eta_0)\}$. For
+square-loss oracles that are stable (a Lipschitz map from labels to
+predictions, as least squares in a fixed class or a regularized learner
+under standard conditions), $\|\hat\tau - \bar\tau\|_{L_2(X)} \lesssim
+\|E[Y(\hat\eta) - Y(\eta_0) \mid X]\|_{L_2(X)} + \text{(noise term)}$. The
+first term equals $\|E[(H(p_0) - H(\hat p))(g_0 - \hat g) \mid X]\|$ by
+Appendix \@ref(app-orthogonality), bounded by the product of the nuisance
+$L_4$ errors by Cauchy-Schwarz. The noise term is second order because
+the label perturbation has conditional mean given by the product and
+conditional variance that vanishes with consistency. Then
+$\|\hat\tau - \tau^*\| \le \|\bar\tau - \tau^*\| + \|\hat\tau - \bar\tau\|$
+gives $r_n + \mathrm{Err}(\hat g)\mathrm{Err}(H(\hat p))$; squaring gives
+the bound in Section \@ref(sec-dr-learner). Foster and Syrgkanis (2023)
+give the general theorem (orthogonal statistical learning), Kennedy (2023)
+sharp rates for specific oracles.
+
+*R-learner.* The population loss is $L(\tau; \eta) = E[(Y - l(Z) - \tau(X)(D - p(Z)))^2]$.
+Its derivative in $\tau$ at $(\tau_0, \eta_0)$ is orthogonal to $\eta$ in
+the sense that $\partial_\eta \partial_\tau L(\tau_0; \eta_0) = 0$, which is
+the partialling-out orthogonality of Section 04 applied conditionally. The
+second-order remainder contains $E[(\hat p - p_0)^2 (\tau - \tau_0)^2]$-type
+terms and $E[(\hat p - p_0)(\hat l - l_0)(\tau - \tau_0)]$; bounding them
+by Cauchy-Schwarz gives the $\mathrm{Err}(\hat p)^4$ and
+$\mathrm{Err}(\hat p)^2\mathrm{Err}(\hat l)^2$ terms of Section
+\@ref(sec-r-learner) (Nie and Wager 2021, Theorem 1; Foster and Syrgkanis
+2023).
+
+## Loss differences are asymptotically normal {#app-dr-loss}
+
+Let $\Delta_i = (Y_i(\eta) - \tau_i)^2 - (Y_i(\eta) - \tau_j)^2 = (\tau_i - \tau_j)(\tau_i + \tau_j - 2Y(\eta))$
+evaluated at $X_i$. Then $\hat\delta_{ij} = \mathbb{E}_n[\Delta_i]$ is a
+sample mean whose population value at $\eta_0$ is
+$E[(\tau_i - \tau_0)^2] - E[(\tau_j - \tau_0)^2]$ (expand and use
+$E[Y(\eta_0) \mid X] = \tau_0$). The dependence on $\eta$ enters only
+through $E[Y(\eta) \mid X]$, so the functional is Neyman orthogonal and its
+nuisance error is the product bound of Appendix \@ref(app-orthogonality)
+weighted by $\tau_i - \tau_j$. Under
+$\sqrt n\,\|H(\hat p) - H(p_0)\|_{L_2}\|\hat g - g_0\|_{L_2} \to 0$ and
+consistency, $\sqrt n(\hat\delta_{ij} - \delta^*_{ij}) \to N(0, V)$ with
+$V = \mathrm{Var}(\Delta)$, estimated by the sample variance of
+$\hat\Delta_i$ (Chernozhukov et al. 2026, Theorem 15.2.1). The variance is
+bounded below by $4E[(\tau_i - \tau_j)^2 \mathrm{Var}(Y(\eta_0) \mid X)]$
+(their Appendix 15.A), which is why models must be separated by more than
+the estimation error for the comparison to be informative.
+
+## TOC and QINI as covariances {#app-uplift}
+
+Let $A = Y(1) - Y(0)$ and $B_q = \mathbb{1}\{\tau^*(X) \ge \mu(\tau^*, q)\} / P(\tau^*(X) \ge \mu(\tau^*, q))$,
+so $E[B_q] = 1$. Then $\mathrm{TOC}(q) = E[A \mid B_q > 0] - E[A] = E[AB_q] - E[A]E[B_q] = \mathrm{Cov}(A, B_q)$.
+Likewise $\mathrm{QINI}(q) = (E[A \mid B_q > 0] - E[A])\,P(B_q > 0) = \mathrm{Cov}(A, \mathbb{1}\{B_q > 0\})$.
+Since $B_q$ is a function of $X$ and $E[A \mid X] = E[Y(\eta_0) \mid X]$,
+both covariances are unchanged when $A$ is replaced by $Y(\eta_0)$. The
+influence function of $\widehat{\mathrm{TOC}}(q)$ is
+$\psi_q = (Y(\eta_0) - \theta_0)(\mathbb{1}\{\cdot\}/\pi_0(q) - 1) - \mathrm{TOC}(q)$
+with $\theta_0$ the ATE and $\pi_0(q)$ the treated share; the estimated
+ATE and share are nuisances whose first-order effect vanishes because the
+functional is orthogonal to both (the covariance form is invariant to the
+centering). Joint normality over a grid of $q$ and the simultaneous band
+follow from the high-dimensional central limit theorem and the multiplier
+bootstrap of Section 07 (Chernozhukov et al. 2026, Theorem 15.3.1).
+Integrating over all $q$ with $u = k/n$ gives the rank weights of Section
+\@ref(sec-toc): the unit ranked $r$ contributes $\sum_{k \ge r} 1/k - 1$ to
+AUTOC.
+
+## Regret of empirical welfare maximization {#app-regret}
+
+Let $\hat\pi = \arg\max_{\pi \in \Pi} \hat V(\pi)$ with
+$\hat V(\pi) = \mathbb{E}_n[\pi(X)\hat\Gamma]$ and $\pi^* = \arg\max_{\pi \in \Pi} V(\pi)$.
+Then
+$$
+V(\pi^*) - V(\hat\pi) = [V(\pi^*) - \hat V(\pi^*)] + [\hat V(\pi^*) - \hat V(\hat\pi)] + [\hat V(\hat\pi) - V(\hat\pi)]
+                     \le 2 \sup_{\pi \in \Pi} |\hat V(\pi) - V(\pi)|,
+$$
+because the middle bracket is at most zero by the definition of
+$\hat\pi$. The supremum splits into the oracle part, with the true
+$\Gamma$, and the nuisance part. The oracle part is the supremum of an
+empirical process indexed by $\Pi$ and is $O_p(\sqrt{V^*\,\mathrm{VC}(\Pi)/n})$
+by a uniform law of large numbers with the variance proxy $V^*$. The
+nuisance part is $\sup_\pi |\mathbb{E}_n[\pi(X)(\hat\Gamma - \Gamma)]|$,
+whose leading term is the product of nuisance errors by the orthogonality
+of the pseudo-outcome, with cross-fitting removing the dependence between
+$\hat\eta$ and the sample (Athey and Wager 2021, Theorem 1 and Lemma 2).
+
+## References
+
+- Athey, Susan, and Guido W. Imbens. 2006. "Identification and Inference in Nonlinear Difference-in-Differences Models." *Econometrica*.
+- Athey, Susan, Julie Tibshirani, and Stefan Wager. 2019. "Generalized Random Forests." *Annals of Statistics*.
+- Athey, Susan, and Stefan Wager. 2021. "Policy Learning with Observational Data." *Econometrica*.
+- Chernozhukov, Victor, Iván Fernández-Val, and Blaise Melly. 2013. "Inference on Counterfactual Distributions." *Econometrica*.
+- Chernozhukov, Victor, Christian Hansen, Nathan Kallus, Martin Spindler, and Vasilis Syrgkanis. 2026. *Applied Causal Inference Powered by ML and AI*, chapters 14 and 15.
+- Childers, David. 2024. "Outcome and Effect Heterogeneity." Lecture notes.
+- Facure, Matheus. 2023. *Causal Inference for the Brave and True*, chapters 18, 21, and 23.
+- Foster, Dylan J., and Vasilis Syrgkanis. 2023. "Orthogonal Statistical Learning." *Annals of Statistics*.
+- Genovese, Christopher, and Larry Wasserman. 2008. "Adaptive Confidence Bands." *Annals of Statistics*.
+- Haushofer, Johannes, Paul Niehaus, Carlos Paramo, Edward Miguel, and Michael Walker. 2025. "Targeting Impact versus Deprivation." *American Economic Review*.
+- Kennedy, Edward H. 2023. "Towards Optimal Doubly Robust Estimation of Heterogeneous Causal Effects." *Electronic Journal of Statistics*.
+- Kitagawa, Toru, and Aleksey Tetenov. 2018. "Who Should Be Treated? Empirical Welfare Maximization Methods for Treatment Choice." *Econometrica*.
+- Künzel, Sören R., Jasjeet S. Sekhon, Peter J. Bickel, and Bin Yu. 2019. "Metalearners for Estimating Heterogeneous Treatment Effects Using Machine Learning." *Proceedings of the National Academy of Sciences*.
+- Lan, Hui, and Vasilis Syrgkanis. 2023. "Causal Q-Aggregation for CATE Model Selection." arXiv:2310.16945.
+- Lecué, Guillaume, and Philippe Rigollet. 2014. "Optimal Learning with Q-Aggregation." *Annals of Statistics*.
+- Nie, Xinkun, and Stefan Wager. 2021. "Quasi-Oracle Estimation of Heterogeneous Treatment Effects." *Biometrika*.
+- Oprescu, Miruna, Vasilis Syrgkanis, and Zhiwei Steven Wu. 2019. "Orthogonal Random Forest for Causal Inference." *ICML*.
+- Semenova, Vira, and Victor Chernozhukov. 2021. "Debiased Machine Learning of Conditional Average Treatment Effects and Other Causal Functions." *The Econometrics Journal*.
+- Shalit, Uri, Fredrik D. Johansson, and David Sontag. 2017. "Estimating Individual Treatment Effect: Generalization Bounds and Algorithms." *ICML*.
+- Sverdrup, Erik, Ayush Kanodia, Zhengyuan Zhou, Susan Athey, and Stefan Wager. 2020. "policytree: Policy Learning via Doubly Robust Empirical Welfare Maximization over Trees." *Journal of Open Source Software*.
+- Wager, Stefan, and Susan Athey. 2018. "Estimation and Inference of Heterogeneous Treatment Effects Using Random Forests." *Journal of the American Statistical Association*.
+- Yadlowsky, Steve, Scott Fleming, Nigam Shah, Emma Brunskill, and Stefan Wager. 2021. "Evaluating Treatment Prioritization Rules via Rank-Weighted Average Treatment Effects." arXiv:2111.07966.
+- Yoganarasimhan, Hema, Ebrahim Barzegary, and Abhishek Pani. 2023. "Design and Evaluation of Optimal Free Trials." *Management Science*.
+- Zhan, Ruohan, Zhimei Ren, Susan Athey, and Zhengyuan Zhou. 2024. "Policy Learning with Adaptively Collected Data." *Management Science*.
+- Zhou, Junyi, Ying Zhang, and Wanzhu Tu. 2023. "A Reference-Free R-Learner for Treatment Recommendation." *Statistical Methods in Medical Research*.

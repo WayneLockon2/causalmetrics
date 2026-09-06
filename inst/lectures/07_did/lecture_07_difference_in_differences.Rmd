@@ -1,0 +1,1772 @@
+---
+title: "Causal Inference in Economics and Marketing"
+subtitle: "Section 07: Difference-in-Differences and Its Variants"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.2, fig.align = "center", fig.pos = "H",
+  out.width = "95%", collapse = TRUE, comment = "#>"
+)
+# Code and output in footnotesize.
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+# This lecture lives in inst/lectures/07_did/ of the package source. When
+# knitted from the source tree it loads the development version of the
+# package; when the package is installed it uses the installed helpers.
+helper_rel <- file.path("vignette_helpers", "07_Difference_in_Differences_and_Panel", "did_lecture_helpers.R")
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_path <- file.path(pkg_root, "inst", helper_rel)
+} else {
+  library(causalmetrics)
+  helper_path <- system.file(helper_rel, package = "causalmetrics")
+}
+library(fixest)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+source(helper_path)
+n_sims_staggered <- 40
+n_sims_covariates <- 200
+fmt <- function(x, digits = 2) formatC(x, digits = digits, format = "f")
+run_honest <- requireNamespace("HonestDiD", quietly = TRUE)
+```
+
+# The problem {#sec-problem}
+
+## Same question, a new source of variation
+
+Sections 03 and 04 identified treatment effects by comparing treated and
+untreated units that look alike. Selection on unobservables broke that
+strategy. Difference-in-differences (DiD) uses a second dimension: time.
+It compares the *change* in outcomes of treated units to the *change* among
+untreated units. Level differences between the groups cancel. Only the
+difference in trends must be assumed away.
+
+That assumption is **parallel trends**: absent treatment, the treated
+group's average outcome would have moved like the untreated group's. It
+allows selection on anything fixed over time. It allows common shocks. It
+does not allow selection on future trends.
+
+DiD is the right tool when three things hold.
+
+- A group is exposed to a policy at a known date and another group is not.
+- Both groups are observed before and after that date.
+- The reason for exposure is not the group's outcome trajectory.
+
+The data can be a panel (the same units over time) or repeated
+cross-sections (fresh draws from the same populations each period).
+
+## One experiment, the classic regression breaks three ways
+
+In practice DiD is run as a two-way fixed effects (TWFE) regression,
+$$
+Y_{it} = \alpha_i + \lambda_t + \beta\, D_{it} + \varepsilon_{it},
+$$
+with $D_{it} = 1$ once unit $i$ is treated. Section \@ref(sec-framework)
+shows that in the two-group, two-period case $\beta$ is exactly the DiD of
+means. Applied work then extends the regression in three ways: adoption
+dates differ across units (staggered adoption), leads and lags of treatment
+are added to trace dynamics, and covariates are added linearly. Each
+extension can fail, and the failures are large.
+
+**Design.** The staggered experiment follows Sant'Anna's lectures. There
+are 1000 units in 40 states. States adopt in one of four cohorts, 1986,
+1992, 1998, or 2004. The panel runs from 1980 to 2003, so the 2004 cohort is
+untreated within the sample and serves as the comparison group. The effect
+grows with exposure and differs across cohorts:
+$\tau_{it} = \mu_g (e + 1)$ at event time $e = t - g$, with
+$\mu = (3, 2, 1)$ for the three treated cohorts. Untreated outcomes have
+unit effects, a common trend, and cohort-specific levels.
+
+```{r staggered-experiment, cache = TRUE, cache.extra = tools::md5sum(helper_path)}
+results <- run_staggered_experiment(n_sims = n_sims_staggered, n_units = 1000, seed = 1)
+tab <- summarise_staggered_experiment(results)
+pick <- function(estimator, e, column) tab[[column]][tab$estimator == estimator & tab$event_time == e]
+```
+
+**Estimators.** Five estimators of the event-study parameters, the average
+effect $e$ periods after adoption for $e = 0, \dots, 5$.
+
+| Estimator | What it does |
+|---|---|
+| Static TWFE | one coefficient on $D_{it}$, reported at every $e$ |
+| Dynamic TWFE, binned | leads and lags of adoption, endpoints binned at $-5$ and $6+$ |
+| Sun-Abraham | cohort-by-event-time coefficients, last cohort as comparison, aggregated |
+| Callaway-Sant'Anna, not yet treated | `att_gt()` cells with not-yet-treated comparisons, aggregated by `aggregate_att()` |
+| Imputation (BJS) | `did_imputation()`: unit and time effects fitted on untreated cells, effects imputed |
+
+```{r tab-staggered, echo = FALSE}
+tab %>% filter(event_time %in% c(0, 2, 4)) %>%
+  mutate(across(c(truth, mean, bias, sd), ~ round(.x, 2))) %>%
+  arrange(event_time, estimator) %>% select(event_time, estimator, truth, mean, bias, sd) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Event time", "Estimator", "Truth", "Mean estimate", "Bias", "SD"),
+      caption = "Five estimators of the event-study parameters in the staggered design, 40 simulations.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9) %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+```
+
+```{r fig-staggered, echo = FALSE, fig.height = 4.8, fig.cap = "Mean estimate and a two-standard-deviation range across simulations. The two TWFE regressions miss the truth by a wide margin; the three estimators built from clean two-by-two comparisons track it."}
+plot_staggered_experiment(results)
+```
+
+The second failure needs only two periods. The design is the Kang-Schafer
+style example of Sant'Anna's lecture 5: four covariates drive both selection
+into treatment and the trend of untreated outcomes, and the true effect is
+zero.
+
+```{r covariate-experiment, cache = TRUE, cache.extra = tools::md5sum(helper_path)}
+cov_results <- run_covariate_experiment(n_sims = n_sims_covariates, n = 1000, seed = 1)
+cov_tab <- summarise_covariate_experiment(cov_results, truth = 0)
+pick_cov <- function(estimator, column) cov_tab[[column]][cov_tab$estimator == estimator]
+```
+
+```{r tab-covariates, echo = FALSE}
+kbl(cov_tab, booktabs = TRUE, digits = 2, linesep = "",
+    col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean SE", "95\\% coverage"), escape = FALSE,
+    caption = "Two-period design with covariate-specific trends; true effect 0; 200 simulations.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9)
+```
+
+## Reading the results
+
+- **Static TWFE** reports one number, `r fmt(pick("Static TWFE", 0, "mean"))`,
+  for every event time. It overstates the immediate effect by
+  `r fmt(pick("Static TWFE", 0, "bias"))` and understates the effect four
+  periods out by `r fmt(-pick("Static TWFE", 4, "bias"))`. Its spread across
+  simulations is ten times that of the good estimators, because the
+  weights it puts on cohorts and periods move with the realized cohort
+  sizes. The regression averages many two-by-two comparisons, and some of
+  them use already-treated units, whose effects are still growing, as
+  controls (Section \@ref(sec-staggered-problems)).
+- **Dynamic TWFE** is biased at every event time, with bias
+  `r fmt(pick("Dynamic TWFE, binned", 0, "bias"))` at $e = 0$ and
+  `r fmt(pick("Dynamic TWFE, binned", 4, "bias"))` at $e = 4$, and its
+  pre-treatment coefficients are not zero either. Each coefficient is
+  contaminated by effects from other event times and cohorts.
+- **Sun-Abraham, Callaway-Sant'Anna, and imputation** are centred on the
+  truth. They differ only in which comparisons they allow and which
+  pre-periods they use (Section \@ref(sec-staggered-solutions)).
+- **TWFE with covariates** in the two-period design has bias
+  `r fmt(pick_cov("TWFE + X", "bias"))` and coverage
+  `r fmt(pick_cov("TWFE + X", "coverage"))`. Interacting the covariates with
+  the post indicator helps only if the trend is linear in $X$. Outcome
+  regression, inverse probability weighting, and the doubly robust estimator
+  all have coverage near 0.95 (Section \@ref(sec-covariates)).
+
+None of these failures come from heterogeneity itself. They come from
+letting least squares choose the comparisons. The cure is the same
+throughout the lecture: write down the target, the assumption, and the
+comparison, and build the estimator from them.
+
+## Roadmap
+
+Section \@ref(sec-framework) sets up potential outcomes, the assumptions,
+and the identification argument. Section \@ref(sec-covariates) handles
+covariates. Section \@ref(sec-dynamics) studies dynamics with two groups.
+Sections \@ref(sec-staggered-problems) and \@ref(sec-staggered-solutions)
+diagnose and fix staggered adoption. Section \@ref(sec-assess) asks how to
+assess parallel trends, Section \@ref(sec-inference) how to do inference.
+Section \@ref(sec-beyond) covers continuous doses, treatments that switch
+off, triple differences, and nonlinear models. Section \@ref(sec-sdid)
+covers synthetic DiD. Sections \@ref(sec-practice) and \@ref(sec-extensions)
+close with replications, a checklist, and pointers.
+
+# Just enough framework {#sec-framework}
+
+## Potential outcomes indexed by adoption time
+
+Units $i = 1, \dots, n$ are observed in periods $t = 1, \dots, T$. Let
+$G_i \in \{2, \dots, T\} \cup \{\infty\}$ be the period in which unit $i$
+is first treated, with $G_i = \infty$ for units never treated in the sample.
+Treatment is absorbing: once treated, always treated (treatments that switch
+off are in Section \@ref(sec-beyond)). The potential outcome $Y_{it}(g)$ is
+the outcome in period $t$ if the unit were first treated in $g$. Observed
+outcomes are $Y_{it} = \sum_g \mathbf{1}\{G_i = g\}\, Y_{it}(g)$.
+
+The building block of everything that follows is the **group-time average
+treatment effect**
+$$
+ATT(g, t) = \mathbb{E}\bigl[Y_{it}(g) - Y_{it}(\infty) \mid G_i = g\bigr],
+\qquad t \ge g .
+$$
+It is the effect at calendar time $t$ of having started treatment at $g$,
+for the cohort that did start at $g$. The canonical two-by-two is the case
+$T = 2$, $G \in \{2, \infty\}$, and $ATT = ATT(2, 2)$. Summaries across
+$(g, t)$, by exposure length, cohort, or calendar time, come in Section
+\@ref(sec-staggered-solutions).
+
+The target is an effect on the treated. Parallel trends will let us
+impute what treated units would have done without treatment; it says
+nothing about what untreated units would have done with it. The ATE needs
+a second assumption in the other direction, which is rarely credible.
+
+## Three assumptions
+
+> **Assumption 1 (no interference).** $Y_{it} = \sum_g \mathbf{1}\{G_i = g\} Y_{it}(g)$.
+> One unit's treatment does not change another unit's outcome.
+
+> **Assumption 2 (no anticipation).** $Y_{it}(g) = Y_{it}(\infty)$ for all
+> $t < g$. Effects are zero before treatment starts.
+
+> **Assumption 3 (parallel trends).** For the two-by-two,
+> $$
+> \mathbb{E}[Y_{2}(\infty) - Y_{1}(\infty) \mid G = 2] = \mathbb{E}[Y_{2}(\infty) - Y_{1}(\infty) \mid G = \infty].
+> $$
+> With staggered adoption, for every treated cohort $g$ and every $t \ge g$,
+> either the *never-treated* version
+> $$
+> \mathbb{E}[Y_{t}(\infty) - Y_{t-1}(\infty) \mid G = g] = \mathbb{E}[Y_{t}(\infty) - Y_{t-1}(\infty) \mid G = \infty],
+> $$
+> or the *not-yet-treated* version, which replaces the right-hand side by
+> the units still untreated at $s \ge t$: $\mathbb{E}[\,\cdot \mid D_{s} = 0, G \ne g]$.
+> The *conditional* version adds "given $X$" to both sides.
+
+Three remarks.
+
+- The two-by-two assumption restricts only the untreated potential
+  outcome, and only its change. Levels may differ between groups by any
+  amount; that is what "selection on fixed unobservables" means.
+- The never-treated and not-yet-treated versions are different
+  assumptions. The second uses more comparison units, so it is more
+  precise, but it requires later cohorts to be valid controls for earlier
+  ones. Both restrict post-treatment periods only. TWFE and the imputation
+  estimator implicitly assume parallel trends in *all* periods, including
+  before treatment (Section \@ref(sec-staggered-solutions)).
+- With covariates, an overlap condition is needed: $P(G = g \mid X) < 1$,
+  so every treated unit has comparable untreated units.
+
+## Identification of the 2x2 ATT: skeleton {#sec-identification}
+
+Compare treated and untreated units after treatment:
+$$
+\mathbb{E}[Y_2 \mid G = 2] - \mathbb{E}[Y_2 \mid G = \infty]
+= \underbrace{ATT}_{\text{target}} + \underbrace{\mathbb{E}[Y_2(\infty) \mid G = 2] - \mathbb{E}[Y_2(\infty) \mid G = \infty]}_{\text{selection bias}} .
+$$
+The bias term contains the counterfactual $\mathbb{E}[Y_2(\infty) \mid G = 2]$.
+Three steps replace it by observables.
+
+1. **Parallel trends** rewrites the counterfactual as the treated group's
+   pre-period level plus the untreated group's change:
+   $\mathbb{E}[Y_2(\infty) \mid G = 2] = \mathbb{E}[Y_1(\infty) \mid G = 2] + \mathbb{E}[Y_2(\infty) - Y_1(\infty) \mid G = \infty]$.
+2. **No anticipation** turns $Y_1(\infty)$ into $Y_1(2)$ for the treated,
+   which is the observed $Y_1$.
+3. **No interference** turns every remaining potential outcome into an
+   observed one.
+
+Hence
+$$
+ATT = \bigl(\mathbb{E}[Y_2 \mid G = 2] - \mathbb{E}[Y_1 \mid G = 2]\bigr)
+- \bigl(\mathbb{E}[Y_2 \mid G = \infty] - \mathbb{E}[Y_1 \mid G = \infty]\bigr) .
+$$
+The right-hand side is a difference of two before-after differences, hence
+the name. Appendix \@ref(app-identification) writes the steps out.
+
+**Estimation.** Replace expectations by sample means. In a panel, average
+the change $\Delta Y_i = Y_{i2} - Y_{i1}$ within each group and take the
+difference. The same number is the coefficient on the interaction in the
+regression $Y_{it} = \alpha + \gamma\, \mathbf{1}\{G_i = 2\} + \lambda\, \mathbf{1}\{t = 2\} + \beta\, \mathbf{1}\{G_i = 2\}\mathbf{1}\{t = 2\} + \varepsilon_{it}$,
+the coefficient on the treated dummy in the regression of $\Delta Y$ on it,
+and the coefficient on $D_{it}$ in a TWFE regression with unit and time
+effects. All four agree to the last digit.
+
+```{r two-by-two-equivalence}
+two <- sim_did_panel(n_units = 500, n_periods = 2, groups = 2, x_trend = 0, seed = 2)
+two$treat <- as.integer(two$g == 2)
+two$post <- as.integer(two$time == 2)
+wide <- with(two, data.frame(id = id[time == 1], treat = treat[time == 1],
+                             dy = y[time == 2] - y[time == 1]))
+by_hand <- mean(wide$dy[wide$treat == 1]) - mean(wide$dy[wide$treat == 0])
+c(by_hand = by_hand,
+  interaction = coef(feols(y ~ treat * post, data = two))[["treat:post"]],
+  first_difference = coef(feols(dy ~ treat, data = wide))[["treat"]],
+  twfe = coef(feols(y ~ treat:post | id + time, data = two))[["treat:post"]],
+  att_gt = att_gt(two, id = "id", time = "time", group = "g", y = "y", n_boot = 0)$att_gt$att)
+```
+
+The regression is a device for computing means. It does not change the
+target or the assumption. Once the design has more than two groups or two
+periods, that convenience disappears: the regression starts choosing
+comparisons on its own (Section \@ref(sec-staggered-problems)).
+
+## From two periods to long differences {#sec-long-differences}
+
+With several post-treatment periods, apply the argument period by period.
+Parallel trends from $t - 1$ to $t$ for every $t \ge g$ chains into
+$$
+\mathbb{E}[Y_t(\infty) \mid G = g] = \mathbb{E}[Y_{g-1} \mid G = g] + \mathbb{E}[Y_t - Y_{g-1} \mid G = \infty],
+$$
+so
+$$
+ATT(g, t) = \mathbb{E}[Y_t - Y_{g-1} \mid G = g] - \mathbb{E}[Y_t - Y_{g-1} \mid G = \infty] .
+$$
+The comparison is a **long difference** from the last pre-treatment period
+$g - 1$ to $t$. Intermediate periods drop out; they are used only through
+the assumption. Before treatment, the same assumptions imply that the
+short difference from $t - 1$ to $t$ has zero DiD, which is the placebo
+check of Section \@ref(sec-assess).
+
+```{r long-difference}
+one <- sim_did_panel(n_units = 400, n_periods = 6, groups = 4, never_share = 0.5, seed = 3)
+long_diff <- one %>%
+  group_by(id, g) %>%
+  summarise(ld = y[time == 6] - y[time == 3], .groups = "drop") %>%
+  summarise(att = mean(ld[g == 4]) - mean(ld[g == 0])) %>% pull(att)
+cell <- att_gt(one, id = "id", time = "time", group = "g", y = "y", n_boot = 0)$att_gt
+c(long_difference_by_hand = long_diff, att_gt_4_6 = cell$att[cell$group == 4 & cell$time == 6])
+```
+
+## What parallel trends really assumes {#sec-functional-form}
+
+Parallel trends is a statement about a specific transformation of the
+outcome. If it holds for $Y$ it generally fails for $\log Y$, and the two
+DiDs answer different questions with different assumptions. Roth and
+Sant'Anna (2023) show that parallel trends holds for every monotone
+transformation only when it holds for the whole distribution of untreated
+outcomes, and that this happens only when the population is a mixture of
+two types: units for which treatment is as good as random, and units
+whose untreated outcome distribution does not change over time.
+
+A two-line example. Treated units have higher outcome levels. Nothing
+happens over time except a common additive shift, so parallel trends holds
+in levels and the true effect is zero.
+
+```{r functional-form}
+set.seed(4)
+n <- 4000
+treat <- rep(c(0, 1), each = n / 2)
+y1 <- exp(rnorm(n, mean = ifelse(treat == 1, 2, 1), sd = 0.5))
+y2 <- y1 + 3
+did <- function(v1, v2) mean((v2 - v1)[treat == 1]) - mean((v2 - v1)[treat == 0])
+c(levels = did(y1, y2), logs = did(log(y1), log(y2)))
+```
+
+The DiD in logs is far from zero. A common shift of 3 units is a smaller
+proportional change for the group with higher levels, so the log trends are
+not parallel. The choice of scale is part of the identifying assumption and
+should be argued from the economics of the outcome, not from fit. Section
+\@ref(sec-assess) shows a test that can reject the joint hypothesis that
+parallel trends holds on every scale.
+
+## Inference from influence functions {#sec-influence}
+
+Write the panel two-by-two estimator as
+$\hat\theta = \bar{\Delta Y}_{G = 2} - \bar{\Delta Y}_{G = \infty}$. A
+first-order expansion gives
+$$
+\sqrt{n}\,(\hat\theta - \theta) = \frac{1}{\sqrt n}\sum_{i=1}^n \xi_i + o_p(1),
+\qquad
+\xi_i = \frac{\mathbf{1}\{G_i = 2\}}{P(G = 2)}\bigl(\Delta Y_i - \mathbb{E}[\Delta Y \mid G = 2]\bigr)
+- \frac{\mathbf{1}\{G_i = \infty\}}{P(G = \infty)}\bigl(\Delta Y_i - \mathbb{E}[\Delta Y \mid G = \infty]\bigr).
+$$
+$\xi_i$ is the **influence function**: unit $i$'s contribution to the
+estimation error. It has mean zero, so the central limit theorem gives
+$\sqrt{n}(\hat\theta - \theta) \to N(0, \mathbb{E}[\xi^2])$, and the
+standard error is $\sqrt{\sum_i \hat\xi_i^2} / n$. Three things follow.
+
+- **Clustering** at a level above the unit sums $\xi_i$ within clusters
+  before squaring. The unit is the smallest admissible level, because the
+  two periods of a unit are one draw.
+- **Many parameters** share one machinery. Every $ATT(g, t)$ has an
+  influence function, and any weighted average of cells has the
+  corresponding weighted average of influence functions. Covariances come
+  free.
+- **The multiplier bootstrap** draws i.i.d. weights $V_i$ with mean zero
+  and variance one and forms $\hat\theta^* = \hat\theta + n^{-1}\sum_i V_i \hat\xi_i$.
+  No re-estimation is needed. The distribution of
+  $\max_k |\hat\theta_k^* - \hat\theta_k| / \hat{se}_k$ across draws gives
+  the critical value of a **simultaneous confidence band** over all cells.
+
+`att_gt()` returns the influence functions and uses them for all of this.
+On the two-period data, the influence-function standard error equals the
+heteroskedasticity-robust standard error of the first-difference
+regression up to the finite-sample factor, and the bootstrap agrees with
+both.
+
+```{r influence-se}
+fit0 <- att_gt(two, id = "id", time = "time", group = "g", y = "y", n_boot = 0)
+fitb <- att_gt(two, id = "id", time = "time", group = "g", y = "y", n_boot = 999, seed = 1)
+xi <- fit0$inffunc[, 1]
+c(influence_function = sqrt(sum(xi^2)) / nrow(wide),
+  att_gt_analytic = fit0$att_gt$std.error,
+  fixest_hc1 = se(feols(dy ~ treat, data = wide, vcov = "hetero"))[["treat"]],
+  multiplier_bootstrap = fitb$att_gt$std.error)
+```
+
+Appendix \@ref(app-influence) derives $\xi_i$ for the panel and the
+repeated cross-section cases and states the bootstrap result.
+
+# Covariates: three faces of conditional parallel trends {#sec-covariates}
+
+## Why covariates
+
+Parallel trends is often more plausible within groups of similar units than
+overall. Employment in northern and southern states, earnings of young and
+old workers, sales of large and small retailers all trend differently.
+If treated units are richer in the fast-trending type, the unconditional
+comparison confounds the effect with composition. The fix is to assume
+parallel trends **conditional on** pre-treatment covariates $X$:
+$$
+\mathbb{E}[Y_2(\infty) - Y_1(\infty) \mid G = 2, X] = \mathbb{E}[Y_2(\infty) - Y_1(\infty) \mid G = \infty, X] .
+$$
+Two rules. Covariates must be measured before treatment, or be unaffected
+by it; controlling for a post-treatment variable blocks part of the effect.
+And overlap is needed: $P(G = 2 \mid X) < 1$, so every treated unit has
+untreated units with similar $X$.
+
+A classic case is the **Ashenfelter dip**: people enter training after a bad
+year, so their pre-period earnings are transitorily low and mean-revert
+afterwards. Conditioning on a longer earnings history, or moving the base
+period back, is the remedy; a two-period DiD with the dip year as the base
+is not.
+
+## The tempting regression and why it fails {#sec-twfe-covariates}
+
+The natural move is to add $X$ to the regression,
+$$
+Y_{it} = \alpha + \gamma\, \mathbf{1}\{G_i = 2\} + \lambda\, \mathbf{1}\{t = 2\} + \beta\, \mathbf{1}\{G_i = 2\}\mathbf{1}\{t = 2\} + X_i'\delta + \varepsilon_{it}.
+$$
+Read off its four conditional means. The untreated change is
+$\lambda$ for every value of $X$: the regression assumes there are no
+covariate-specific trends, which is exactly what the covariates were
+supposed to allow. The treated change is $\lambda + \beta$ for every $X$:
+the effect is assumed homogeneous across covariate values. When either
+restriction fails, $\beta$ is not the ATT. The Section 1 table showed a
+bias of `r fmt(pick_cov("TWFE + X", "bias"))` with zero coverage.
+
+Interacting $X$ with the post indicator allows covariate-specific trends
+that are linear in $X$. That worked in Section 1 because the design was
+linear. It is a modelling assumption, not a fix.
+
+```{r covariates-one-draw}
+kd <- simulate_covariate_dgp(n = 1000, seed = 5)
+kd$treat <- as.integer(kd$g == 2); kd$post <- as.integer(kd$time == 2)
+c(twfe_plus_x = coef(feols(y ~ treat:post + x1 + x2 + x3 + x4 | id + time, data = kd))[["treat:post"]],
+  twfe_post_x = coef(feols(y ~ treat:post + post:(x1 + x2 + x3 + x4) | id + time, data = kd))[["treat:post"]],
+  dr = att_gt(kd, id = "id", time = "time", group = "g", y = "y",
+              x = c("x1", "x2", "x3", "x4"), n_boot = 0)$att_gt$att)
+```
+
+## Outcome regression, IPW, doubly robust {#sec-three-faces}
+
+Separate identification from estimation. Under conditional parallel
+trends, with $D = \mathbf{1}\{G = 2\}$, $\Delta Y = Y_2 - Y_1$,
+$p(X) = P(D = 1 \mid X)$ and $m_\Delta(X) = \mathbb{E}[\Delta Y \mid D = 0, X]$,
+the ATT has three equivalent expressions.
+
+| Face | Estimand | What must be modelled |
+|---|---|---|
+| Outcome regression (Heckman, Ichimura, Todd 1997) | $\mathbb{E}[\Delta Y \mid D = 1] - \mathbb{E}[m_\Delta(X) \mid D = 1]$ | the untreated change given $X$ |
+| Inverse probability weighting (Abadie 2005) | $\mathbb{E}[w_1 \Delta Y] - \mathbb{E}[w_0 \Delta Y]$, $w_1 = \tfrac{D}{\mathbb{E}[D]}$, $w_0 = \tfrac{p(X)(1 - D)/(1 - p(X))}{\mathbb{E}[p(X)(1 - D)/(1 - p(X))]}$ | the propensity score |
+| Doubly robust (Sant'Anna and Zhao 2020) | $\mathbb{E}\bigl[(w_1 - w_0)\,(\Delta Y - m_\Delta(X))\bigr]$ | either one correctly |
+
+The doubly robust estimand is the IPW estimand applied to the residual
+$\Delta Y - m_\Delta(X)$. If the outcome model is right, the residual has
+conditional mean zero among the untreated, so any weights work. If the
+propensity score is right, the weights balance $X$, so any outcome model
+works. When both are right it reaches the semiparametric efficiency bound.
+`att_gt(method = )` implements the three with a logit and a linear
+regression as working models, reproducing the `DRDID` package.
+
+```{r three-faces}
+sapply(c("reg", "ipw", "dr"), function(m)
+  att_gt(kd, id = "id", time = "time", group = "g", y = "y",
+         x = c("x1", "x2", "x3", "x4"), method = m, n_boot = 0)$att_gt[, c("att", "std.error")])
+```
+
+The guarantee is about *specification*, not about *fit*. When the true
+drivers are nonlinear transformations of $X$ and the analyst enters $X$
+linearly in both models, nothing is guaranteed.
+
+```{r covariate-misspecified, cache = TRUE, cache.extra = tools::md5sum(helper_path)}
+mis_results <- run_covariate_experiment(n_sims = 100, n = 1000, seed = 2, misspecify = TRUE)
+mis_tab <- summarise_covariate_experiment(mis_results, truth = 0)
+pick_mis <- function(estimator, column) mis_tab[[column]][mis_tab$estimator == estimator]
+```
+
+```{r tab-misspecified, echo = FALSE}
+kbl(mis_tab[mis_tab$estimator != "TWFE + post:X", ], booktabs = TRUE, digits = 2, linesep = "",
+    col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean SE", "95\\% coverage"), escape = FALSE,
+    caption = "Both working models misspecified (the true drivers are nonlinear in X); true effect 0; 100 simulations.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9)
+```
+
+In this design the linear outcome model happens to extrapolate well, so
+outcome regression is nearly unbiased (bias
+`r fmt(pick_mis("Outcome regression", "bias"))`). The misspecified logit
+produces extreme weights, IPW is biased
+(`r fmt(pick_mis("IPW", "bias"))`), and the doubly robust estimator, which
+applies those weights to the residuals, is the most biased of the three
+(`r fmt(pick_mis("Doubly robust", "bias"))`, coverage
+`r fmt(pick_mis("Doubly robust", "coverage"))`). Double robustness insures
+against one wrong model. With two wrong models it can be worse than either
+alone. The way out is flexible estimation of both nuisances, which is the
+next subsection.
+
+## DR-DiD is the ATT score of Section 04 on the differenced outcome {#sec-dr-dml}
+
+Compare the doubly robust estimand with the ATT score of Section 04. With
+$\Delta Y$ in place of $Y$ and $m_\Delta$ in place of $\mu_0$, they are the
+same object: the augmented inverse probability weighting score for the
+average effect on the treated. The only difference is the normalization
+of the control weights, by their own mean here and by $\mathbb{E}[D]$ in
+Section 04, which is immaterial in large samples. Everything Section 04
+established therefore carries over: the score is Neyman orthogonal, its
+remainder is the product of the two nuisance errors, and machine learners
+with cross-fitting may estimate the nuisances.
+
+```{r dr-equals-dml}
+wide_kd <- with(kd, data.frame(id = id[time == 1], d = treat[time == 1],
+                               dy = y[time == 2] - y[time == 1],
+                               x1 = x1[time == 1], x2 = x2[time == 1], x3 = x3[time == 1], x4 = x4[time == 1]))
+p_hat <- fitted(glm(d ~ x1 + x2 + x3 + x4, data = wide_kd, family = binomial))
+m_hat <- predict(lm(dy ~ x1 + x2 + x3 + x4, data = wide_kd[wide_kd$d == 0, ]), newdata = wide_kd)
+c(att_gt_dr = att_gt(kd, id = "id", time = "time", group = "g", y = "y",
+                     x = c("x1", "x2", "x3", "x4"), n_boot = 0)$att_gt$att,
+  est_dml_att = est_dml(wide_kd, y = "dy", d = "d", model = "irm", estimand = "ATT",
+                        p_hat = p_hat, mu0_hat = m_hat, mu1_hat = m_hat)$estimate)
+```
+
+## Machine-learning nuisances and cross-fitting {#sec-ml-nuisances}
+
+Supplying `mlr3` learners to `att_gt()` switches each cell to cross-fitted
+nuisances: the propensity score and the untreated change are predicted
+out of fold, and the doubly robust score is evaluated on the held-out
+units. This is the recipe of Section 04 inside each $(g, t)$ cell. It
+needs learners that converge fast enough, roughly $n^{-1/4}$ for the
+product of the two errors, and it pays off when the functional forms are
+unknown, as in the misspecified design.
+
+```{r ml-nuisances, eval = requireNamespace("mlr3", quietly = TRUE) && requireNamespace("mlr3learners", quietly = TRUE) && requireNamespace("ranger", quietly = TRUE)}
+library(mlr3); library(mlr3learners)
+mis <- simulate_covariate_dgp(n = 2000, seed = 6, misspecify = TRUE)
+rbind(
+  parametric_dr = att_gt(mis, id = "id", time = "time", group = "g", y = "y",
+                         x = c("x1", "x2", "x3", "x4"), n_boot = 0)$att_gt[, c("att", "std.error")],
+  forest_dr = att_gt(mis, id = "id", time = "time", group = "g", y = "y", x = c("x1", "x2", "x3", "x4"),
+                     learner_p = lrn("classif.ranger", predict_type = "prob", num.trees = 300),
+                     learner_or = lrn("regr.ranger", num.trees = 300),
+                     folds = 5, seed = 1, n_boot = 0)$att_gt[, c("att", "std.error")]
+)
+```
+
+## Repeated cross-sections {#sec-rcs}
+
+With repeated cross-sections the same units are not observed twice, so
+$\Delta Y$ does not exist. The estimators use four conditional means, one
+per group and period, and need one more assumption: the composition of
+each group does not change between periods (stationarity). Two doubly
+robust versions exist. The first models only the untreated outcomes in
+each period; the second also models the treated outcomes, which makes it
+efficient (Sant'Anna and Zhao 2020). `att_gt(sampling = "rcs")` uses the
+second. For a given sample size, repeated cross-sections are always less
+precise than a panel, and more so when the pre and post samples are
+unbalanced.
+
+```{r rcs}
+set.seed(7)
+rcs <- kd[sample(nrow(kd), 1500), ]
+rcs$row <- seq_len(nrow(rcs))
+rbind(
+  panel = att_gt(kd, id = "id", time = "time", group = "g", y = "y",
+                 x = c("x1", "x2", "x3", "x4"), n_boot = 0)$att_gt[, c("att", "std.error", "n_treated", "n_control")],
+  repeated_cross_section = att_gt(rcs, id = "row", time = "time", group = "g", y = "y",
+                                  x = c("x1", "x2", "x3", "x4"), sampling = "rcs", n_boot = 0)$att_gt[, c("att", "std.error", "n_treated", "n_control")]
+)
+```
+
+# Dynamics with two groups {#sec-dynamics}
+
+## ATT(g,t) as an event study {#sec-event-study}
+
+One treated cohort $g$, one comparison group, many periods. Section
+\@ref(sec-long-differences) identified $ATT(g, t)$ for $t \ge g$ by the
+long difference from $g - 1$. Indexing by event time $e = t - g$ turns the
+cells into an **event study**: the effect $e$ periods after adoption.
+Cells with $e < 0$ are placebos. Under no anticipation and parallel trends
+they equal zero, and they are what a pre-trends plot shows.
+
+Two conventions exist for the pre-treatment cells.
+
+- **Varying base period** (default): the cell at $e < 0$ compares $t - 1$
+  to $t$, a short difference. It shows period-by-period deviations from
+  parallel trends.
+- **Universal base period**: every cell is compared to $g - 1$. Post
+  cells are unchanged. Pre cells show the cumulative deviation between
+  $t$ and $g - 1$, so the plot is anchored at $e = -1$ and reads like a
+  standard event-study figure. Use it for sensitivity analysis (Section
+  \@ref(sec-assess)).
+
+```{r es-two-groups}
+esd <- sim_did_panel(n_units = 500, n_periods = 10, groups = 6, never_share = 0.5, mu = 1, seed = 8)
+es_var <- att_gt(esd, id = "id", time = "time", group = "g", y = "y", control_group = "never",
+                 base_period = "varying", n_boot = 199, seed = 1)
+es_uni <- att_gt(esd, id = "id", time = "time", group = "g", y = "y", control_group = "never",
+                 base_period = "universal", n_boot = 199, seed = 1)
+plot_event_study(event_study_frame("Varying base period" = es_var, "Universal base period" = es_uni))
+```
+
+The post-treatment cells coincide. The pre-treatment cells differ only in
+what they cumulate; both are centred at zero here because parallel trends
+holds in the design.
+
+## Anticipation {#sec-anticipation}
+
+If units respond before the official start, because the policy was
+announced or phased in, no anticipation fails for the periods just before
+$g$. The base period $g - 1$ is then already "treated", and every post
+effect is measured against a contaminated baseline. The remedy is
+**limited anticipation**: assume no effects before $g - k$ for a known $k$,
+strengthen parallel trends to hold from $g - k - 1$ on, and use $g - k - 1$
+as the base period. `att_gt(anticipation = k)` does exactly that.
+
+```{r anticipation}
+ant <- sim_did_panel(n_units = 600, n_periods = 8, groups = 5, never_share = 0.5, mu = 2,
+                     anticipation = 1, seed = 9)
+truth_ant <- attr(ant, "att_gt")
+cmp <- lapply(0:1, function(k) {
+  f <- att_gt(ant, id = "id", time = "time", group = "g", y = "y", control_group = "never",
+              anticipation = k, n_boot = 0)$att_gt
+  data.frame(anticipation = k, event_time = f$event_time, att = round(f$att, 2))
+})
+tab_ant <- merge(cmp[[1]], cmp[[2]], by = "event_time", suffixes = c("_k0", "_k1"))
+tab_ant$truth <- ifelse(tab_ant$event_time >= 0, truth_ant$att[match(tab_ant$event_time + 5, truth_ant$time)],
+                        ifelse(tab_ant$event_time == -1, 0.5 * truth_ant$att[1], 0))
+tab_ant[tab_ant$event_time >= -2 & tab_ant$event_time <= 2, c("event_time", "att_k0", "att_k1", "truth")]
+```
+
+In the design, half of the first-period effect appears one period early.
+With `anticipation = 0` every post-treatment effect is understated by that
+amount, and the cell at $e = -1$ looks like a pre-trend. With
+`anticipation = 1` the base moves to $g - 2$, the post effects are right,
+and the cell at $e = -1$ correctly measures the anticipation effect. The
+lesson is to date treatment at the announcement, or to set $k$ from
+institutional knowledge, not from the plot.
+
+## TWFE event-study regressions {#sec-twfe-es}
+
+The regression version adds leads and lags of adoption,
+$$
+Y_{it} = \alpha_i + \lambda_t + \sum_{k \ne -1} \gamma_k \mathbf{1}\{t - G_i = k\} + \varepsilon_{it},
+$$
+with the period before adoption omitted. With one cohort, a never-treated
+comparison group, and **all** leads and lags included, the model is
+saturated and $\hat\gamma_k$ equals the universal-base $ATT(g, g + k)$ of
+`att_gt()` exactly. Binning the endpoints, for example one dummy for
+$k \le -4$ and one for $k \ge 3$, is an extra restriction: it assumes the
+effect is constant inside the bin, and the other coefficients change.
+
+```{r twfe-es}
+esd$rel <- ifelse(esd$g > 0, esd$time - esd$g, -1000)
+tw_all <- feols(y ~ i(rel, ref = c(-1, -1000)) | id + time, data = esd, cluster = ~id)
+esd$rel_bin <- ifelse(esd$g == 0, -1000, pmin(pmax(esd$rel, -3), 2))
+tw_bin <- feols(y ~ i(rel_bin, ref = c(-1, -1000)) | id + time, data = esd, cluster = ~id)
+fr <- event_study_frame("att_gt" = es_uni, "TWFE_all" = tw_all, "TWFE_binned" = tw_bin)
+fr %>% filter(event_time %in% c(-3, -2, 0, 1, 2)) %>%
+  select(method, event_time, estimate) %>%
+  tidyr::pivot_wider(names_from = method, values_from = estimate) %>%
+  as.data.frame()
+```
+
+The saturated regression and `att_gt()` agree to the last digit. The
+binned regression does not, and the difference is not a bug but a
+restriction. Report all event times and let the reader choose what to
+look at.
+
+## Simultaneous confidence bands {#sec-bands}
+
+An event study is many parameters. Pointwise 95 percent intervals cover
+each cell 95 percent of the time, but the probability that *all* cells are
+covered at once is much lower, and the eye reads the curve as a whole. A
+**simultaneous band** fixes the joint coverage. `att_gt()` computes it
+from the multiplier bootstrap: draw the joint distribution of the
+studentized cells, take the maximum absolute deviation across cells, and
+use its 95th percentile as the critical value. The band is wider than the
+pointwise interval by that factor.
+
+```{r bands}
+c(pointwise = qnorm(0.975), simultaneous = es_uni$crit_val)
+es_uni$pretest
+```
+
+The pre-test is a joint Wald test that all pre-treatment cells are zero,
+computed from the covariance of their influence functions. It answers a
+narrower question than it seems to; Section \@ref(sec-assess) returns to
+it.
+
+# Staggered adoption: what goes wrong {#sec-staggered-problems}
+
+## Static TWFE as a weighted average {#sec-bacon}
+
+With several adoption dates, the static regression
+$Y_{it} = \alpha_i + \lambda_t + \beta D_{it} + \varepsilon_{it}$ still
+computes a difference-in-differences, but a weighted average of every
+two-by-two comparison the data allow (Goodman-Bacon 2021):
+$$
+\hat\beta = \sum_{k} s_{kU}\, \hat\beta_{kU} + \sum_{k < l} \bigl( s_{kl}^{k}\, \hat\beta_{kl}^{k} + s_{kl}^{l}\, \hat\beta_{kl}^{l} \bigr).
+$$
+The three types are: cohort $k$ against never-treated units; the earlier
+cohort $k$ against the later cohort $l$ before $l$ adopts, where $l$ is a
+clean control; and the later cohort $l$ against the earlier cohort $k$
+*after* $k$ has adopted. In the third type the control group is already
+treated. If its effect is still changing, its trend is not the untreated
+trend, and the comparison is biased. The weights are positive and sum to
+one, but they depend on group sizes and on how central each adoption date
+is in the panel, not on anything a researcher would choose.
+
+```{r bacon}
+sd1 <- simulate_staggered_dgp(n_units = 1000, seed = 11)
+bd <- bacon_decomp(sd1, id = "id", time = "year", y = "y", d = "treated")
+bd$by_type
+c(twfe = bd$twfe, weighted_sum = bd$check)
+```
+
+The later-versus-earlier comparisons carry a substantial weight and a
+negative estimate, although every true effect is positive. That is the
+mechanism behind the Section 1 result.
+
+## Negative weights {#sec-negative-weights}
+
+de Chaisemartin and D'Haultfoeuille (2020) give a second reading. Under
+parallel trends, the same coefficient is a weighted sum of the treatment
+effects of the treated unit-periods,
+$\beta = \sum_{(i,t):\, D_{it} = 1} w_{it}\, \tau_{it}$, with weights that
+sum to one but can be negative. The weight of a cell is the residual of
+$D_{it}$ on unit and period effects, divided by the sum of those residuals.
+Cells treated for a long time in periods when most units are treated get
+negative weights, because their treatment status is *below* what the two
+fixed effects predict.
+
+```{r negative-weights}
+tw <- twfe_weights(sd1, id = "id", time = "year", d = "treated", y = "y")
+c(share_negative = tw$share_negative, sum_negative = tw$sum_negative)
+tw$by_cell %>% group_by(g) %>%
+  summarise(first_year = min(time), last_year = max(time), min_cell_weight = min(weight),
+            n_negative = sum(weight < 0), cohort_weight = sum(weight), .groups = "drop") %>%
+  as.data.frame()
+```
+
+A negative weight on a positive effect pulls the estimate down. When
+effects grow with exposure, the negative weights fall on the largest
+effects, and the coefficient can even change sign.
+
+## Dynamic TWFE and contamination {#sec-contamination}
+
+Adding leads and lags does not help. Sun and Abraham (2021) show that
+with heterogeneous effects across cohorts, the coefficient on lag $k$ is a
+weighted average of $ATT(g, g + k)$ across cohorts, with weights that need
+not be convex, *plus* contamination terms from every other lag and lead.
+Two consequences matter in practice. Pre-treatment coefficients can be
+nonzero even when no anticipation and parallel trends hold, so a
+pre-trends plot from this regression can reject a valid design. And
+binning the endpoints, which imposes constant effects far from adoption,
+moves the contamination into the window of interest.
+
+```{r contamination}
+sd1$rel <- ifelse(sd1$g > 0, sd1$year - sd1$g, -1000)
+tw_dyn <- feols(y ~ i(rel, ref = c(-1, -1000)) | id + year, data = sd1, cluster = ~state)
+cs1 <- att_gt(sd1, id = "id", time = "year", group = "g", y = "y", control_group = "notyet", n_boot = 0)
+cs1_dyn <- aggregate_att(cs1, type = "dynamic", min_e = -5, max_e = 5, n_boot = 0)
+truth_sd1 <- attr(sd1, "truth")
+plot_event_study(event_study_frame("TWFE, all leads and lags" = tw_dyn, "Callaway-Sant'Anna" = cs1_dyn)) +
+  geom_point(data = truth_sd1, aes(x = event_time, y = att), inherit.aes = FALSE, shape = 4, size = 3) +
+  coord_cartesian(xlim = c(-5, 5)) +
+  labs(subtitle = "Crosses: true event-study parameters; no anticipation in the design")
+```
+
+```{r contamination-table}
+event_study_frame("TWFE" = tw_dyn, "CS" = cs1_dyn) %>%
+  filter(event_time %in% c(-4, -2, 0, 2, 4)) %>%
+  select(method, event_time, estimate) %>%
+  tidyr::pivot_wider(names_from = method, values_from = estimate) %>%
+  left_join(truth_sd1, by = "event_time") %>% as.data.frame()
+```
+
+The regression shows a pre-trend that does not exist and misstates the
+post-treatment effects. The cell-based estimator shows neither.
+
+## What is not the problem {#sec-not-the-problem}
+
+None of this is caused by heterogeneity as such. If effects were the same
+for every cohort and constant over time, the forbidden comparisons would
+be harmless and static TWFE would be fine.
+
+```{r homogeneous}
+sd0 <- simulate_staggered_dgp(n_units = 1000, mu = c(2, 2, 2, 2), seed = 12)
+sd0$y <- sd0$y - sd0$tau + 2 * sd0$treated   # constant effect of 2
+c(twfe = coef(feols(y ~ treated | id + year, data = sd0))[["treated"]],
+  cs = aggregate_att(att_gt(sd0, id = "id", time = "year", group = "g", y = "y", n_boot = 0),
+                     type = "simple", n_boot = 0)$overall$estimate)
+```
+
+The problem is that least squares chooses the comparisons and the weights.
+Heterogeneous dynamics are the normal case in economics and marketing,
+so the estimator must be built to survive them. That is the next section.
+
+# Staggered adoption: reliable estimators {#sec-staggered-solutions}
+
+## Identification, aggregation, inference as three steps {#sec-three-steps}
+
+Every reliable estimator in this section follows the same order, which is
+the reverse of "run the regression and interpret the coefficient".
+
+1. **Identify** each $ATT(g, t)$ from a stated parallel trends assumption
+   and a stated comparison group (Section \@ref(sec-long-differences)).
+2. **Aggregate** the cells with weights chosen for the question, by
+   exposure length, cohort, or calendar time.
+3. **Infer** from the influence functions of the cells, so that the
+   aggregate inherits valid standard errors and simultaneous bands.
+
+Least squares performs all three steps at once with weights nobody chose.
+Separating them is the whole content of Callaway and Sant'Anna (2021).
+
+## The building block ATT(g,t) {#sec-att-gt}
+
+`att_gt()` estimates every cell. The comparison group is a choice with
+consequences.
+
+- **Never treated**: one fixed comparison group. Parallel trends is
+  assumed between each cohort and the never-treated units only.
+- **Not yet treated**: every unit still untreated at the later of $t$ and
+  the base period. More units, hence more precision, at the price of
+  assuming parallel trends among all cohorts as well.
+
+```{r att-gt-both}
+cs_never <- att_gt(sd1, id = "id", time = "year", group = "g", y = "y", control_group = "never",
+                   n_boot = 199, seed = 1)
+cs_notyet <- att_gt(sd1, id = "id", time = "year", group = "g", y = "y", control_group = "notyet",
+                    n_boot = 199, seed = 1)
+tidy(cs_never) %>% filter(group == 1992, event_time %in% 0:3) %>%
+  mutate(se_notyet = tidy(cs_notyet)$std.error[match(term, tidy(cs_notyet)$term)]) %>%
+  select(group, time, event_time, estimate, se_never = std.error, se_notyet)
+```
+
+```{r fig-att-gt, fig.height = 4.5, fig.cap = "Group-time effects with not-yet-treated comparisons; error bars are pointwise intervals and ribbons are the simultaneous band."}
+tidy(cs_notyet) %>%
+  ggplot(aes(x = time, y = estimate, colour = factor(post))) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(aes(ymin = band.low, ymax = band.high, group = 1), fill = "grey70", alpha = 0.3, colour = NA) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high), size = 0.3) +
+  facet_wrap(~ group, labeller = label_both) +
+  scale_colour_manual(values = c("0" = "grey40", "1" = "#0072B2"), labels = c("pre-treatment", "post-treatment")) +
+  labs(x = "Year", y = "ATT(g, t)", colour = NULL) + did_theme()
+```
+
+## Aggregations {#sec-aggregations}
+
+With cohort shares $\pi_g = P(G = g \mid G \ne \infty)$, the four
+summaries of `aggregate_att()` are
+
+| Type | Parameter | Question |
+|---|---|---|
+| dynamic | $\theta_D(e) = \sum_g \pi_{g \mid e}\, ATT(g, g + e)$ | effect $e$ periods after adoption |
+| group | $\theta_S(g) = \frac{1}{T - g + 1}\sum_{t \ge g} ATT(g, t)$ | average effect experienced by cohort $g$ |
+| calendar | $\theta_C(t) = \sum_{g \le t} \pi_{g \mid t}\, ATT(g, t)$ | average effect in period $t$ among the treated |
+| simple | $\sum_{g \le t} \pi_{g}\, ATT(g, t) / \sum_{g \le t} \pi_g$ | one number, overweighting early cohorts |
+
+The dynamic aggregate at $e$ averages only the cohorts observed $e$
+periods after adoption. Its composition therefore changes with $e$, and
+the curve can bend for that reason alone. `balance_e = e_0` keeps only
+cohorts observed for at least $e_0$ periods, so every point averages the
+same cohorts.
+
+```{r aggregations}
+agg_dyn <- aggregate_att(cs_notyet, type = "dynamic", min_e = -4, max_e = 5)
+agg_grp <- aggregate_att(cs_notyet, type = "group")
+agg_cal <- aggregate_att(cs_notyet, type = "calendar")
+agg_simple <- aggregate_att(cs_notyet, type = "simple")
+rbind(dynamic = agg_dyn$overall, group = agg_grp$overall, calendar = agg_cal$overall, simple = agg_simple$overall)
+agg_grp$by[, c("group", "estimate", "std.error")]
+```
+
+The four overall numbers answer four questions. The group aggregate
+weights cohorts by size; the simple aggregate weights *cells* by cohort
+size, so cohorts treated early, with many post periods, dominate. Report
+the one that matches the question, and say which it is.
+
+## Sun and Abraham {#sec-sun-abraham}
+
+Sun and Abraham (2021) fix the dynamic regression rather than abandon it:
+interact the event-time dummies with cohort dummies, use the never-treated
+(or last-treated) cohort as the only comparison, estimate the saturated
+regression, and aggregate the cohort-specific coefficients with cohort
+shares. Without covariates this is numerically the Callaway-Sant'Anna
+estimator with the never-treated comparison and the universal base
+period. `fixest::sunab()` does the interaction and the aggregation.
+
+```{r sunab}
+sa1 <- feols(y ~ sunab(g, year) | id + year, data = sd1, cluster = ~id)
+cs_uni <- att_gt(sd1, id = "id", time = "year", group = "g", y = "y", control_group = "never",
+                 base_period = "universal", n_boot = 0)
+event_study_frame("Sun-Abraham" = sa1, "CS never, universal" = aggregate_att(cs_uni, type = "dynamic", n_boot = 0)) %>%
+  filter(event_time %in% c(-3, 0, 2, 4)) %>% select(method, event_time, estimate) %>%
+  tidyr::pivot_wider(names_from = method, values_from = estimate) %>% as.data.frame()
+```
+
+## Imputation estimators {#sec-imputation}
+
+Borusyak, Jaravel, and Spiess (2024) and Gardner (2022) take the model
+seriously in the untreated state only. Fit $Y_{it} = \alpha_i + \lambda_t + \varepsilon_{it}$
+on untreated observations, never-treated units and not-yet-treated
+periods, impute $\hat Y_{it}(0)$ for every treated observation, and
+average $Y_{it} - \hat Y_{it}(0)$ by event time or cohort. Wooldridge
+(2021) obtains the same estimates from one regression with cohort-by-period
+interactions.
+
+The estimator uses every pre-treatment period as the baseline, not only
+$g - 1$. That is efficient when parallel trends holds in all periods and
+the errors are homoskedastic and serially uncorrelated, and it is the
+reason its standard errors are often smaller. The price is a stronger
+assumption, parallel trends in all periods, and a separate pre-trends
+check, run on the untreated sample with lead dummies.
+
+```{r imputation}
+imp1 <- did_imputation(sd1, id = "id", time = "year", group = "g", y = "y", horizons = 0:5, pre_window = 3)
+imp1
+```
+
+## Stacked DiD and local-projections DiD {#sec-stacked}
+
+Two regression-based alternatives are common in applied work.
+
+**Stacked DiD** (Cengiz et al. 2019) builds one clean data set per cohort:
+the cohort, the never-treated units, and the units not yet treated within
+an event window, then stacks the data sets and runs a TWFE event study
+with data-set-specific unit and period effects. Every comparison is clean
+by construction. The implicit weights across cohorts are those of least
+squares on the stacked sample, roughly proportional to cohort size.
+
+```{r stacked}
+stack <- bind_rows(lapply(c(1986, 1992, 1998), function(g0) {
+  sd1 %>% filter(g == g0 | g == 0 | g > g0 + 5, year >= g0 - 5, year <= g0 + 5) %>%
+    mutate(stack_id = g0, rel = ifelse(g == g0, year - g0, -1000))
+}))
+stacked <- feols(y ~ i(rel, ref = c(-1, -1000)) | id^stack_id + year^stack_id, data = stack, cluster = ~id)
+```
+
+**Local-projections DiD** (Dube, Girardi, Jorda, and Taylor 2023) runs,
+for each horizon $h$, a regression of $Y_{i,t+h} - Y_{i,t-1}$ on an
+indicator for adopting at $t$, using only clean controls (units not yet
+treated by $t + h$). It is a sequence of long-difference two-by-twos, one
+per horizon, and delivers the same logic as the cell-based estimator in
+regression form.
+
+## Comparing estimators {#sec-compare}
+
+```{r fig-compare, fig.height = 4.5, fig.cap = "Four heterogeneity-robust estimators on one draw of the staggered design, with the truth as crosses."}
+imp1_frame <- event_study_frame("Imputation" = imp1) %>% filter(event_time >= 0)
+cmp_frame <- event_study_frame("Callaway-Sant'Anna" = agg_dyn, "Sun-Abraham" = sa1,
+                               "Stacked" = stacked, "Imputation" = imp1_frame) %>%
+  filter(event_time >= -4, event_time <= 5)
+plot_event_study(cmp_frame) +
+  geom_point(data = truth_sd1, aes(x = event_time, y = att), inherit.aes = FALSE, shape = 4, size = 3)
+```
+
+```{r compare-table}
+cmp_frame %>% filter(event_time %in% c(-2, 0, 3, 5)) %>% select(method, event_time, estimate) %>%
+  tidyr::pivot_wider(names_from = method, values_from = estimate) %>%
+  left_join(truth_sd1, by = "event_time") %>% as.data.frame()
+```
+
+| Estimator | Parallel trends used | Comparison group | Covariates | Precision |
+|---|---|---|---|---|
+| Callaway-Sant'Anna | post-treatment periods only | never or not yet treated | regression, IPW, doubly robust, per cell | baseline |
+| Sun-Abraham | post-treatment periods only | never or last treated | linear in the regression | equals CS without covariates |
+| Imputation (BJS, Gardner, Wooldridge) | all periods | all untreated observations | linear in the first stage | higher under homoskedastic, uncorrelated errors |
+| Stacked | all periods within the window | never and not yet treated in the window | linear in the regression | depends on the window |
+
+The estimators agree when their assumptions hold. They disagree when
+parallel trends holds only after treatment, when pre-periods are
+contaminated by anticipation, or when covariates matter, and then the
+choice is about assumptions, not about software.
+
+## Covariates in staggered designs {#sec-staggered-covariates}
+
+Covariates enter `att_gt()` cell by cell, with a propensity score and an
+outcome regression fitted on each cell's sample, so the conditional
+parallel trends assumption of Section \@ref(sec-covariates) is used at the
+cell level. The regression-based estimators can include covariates only
+linearly, and a time-invariant covariate must be interacted with time to
+matter at all.
+
+```{r staggered-covariates}
+sdx <- sim_did_panel(n_units = 800, n_periods = 9, groups = c(4, 7), never_share = 0.4,
+                     mu = c(2, 1), x_trend = 2, x_select = 2, seed = 13)
+sdx$x1t <- sdx$x1 * sdx$time
+cs_x <- aggregate_att(att_gt(sdx, id = "id", time = "time", group = "g", y = "y", x = "x1",
+                             control_group = "notyet", n_boot = 0), type = "dynamic", n_boot = 0)
+truth_x <- attr(sdx, "att_gt") %>% mutate(event_time = time - group) %>%
+  inner_join(cs_x$weights, by = c("event_time", "group")) %>%
+  group_by(event_time) %>% summarise(truth = sum(weight * att), .groups = "drop")
+cs_nox <- aggregate_att(att_gt(sdx, id = "id", time = "time", group = "g", y = "y",
+                               control_group = "notyet", n_boot = 0), type = "dynamic", n_boot = 0)
+sa_x <- feols(y ~ sunab(g, time) + x1t | id + time, data = sdx, cluster = ~id)
+twfe_x <- feols(y ~ treated + x1t | id + time, data = sdx, cluster = ~id)
+c(static_twfe_plus_x1t = coef(twfe_x)[["treated"]])
+event_study_frame("CS with x1" = cs_x, "CS without x1" = cs_nox, "Sun-Abraham + x1*t" = sa_x) %>%
+  filter(event_time %in% 0:2) %>% select(method, event_time, estimate) %>%
+  tidyr::pivot_wider(names_from = method, values_from = estimate) %>%
+  left_join(truth_x, by = "event_time") %>% as.data.frame()
+```
+
+The static regression with the covariate trend is far from every true
+effect. The cell estimator without the covariate is biased upward, because
+early adopters have higher `x1` and hence steeper untreated trends; with
+the covariate it is centred. Sun-Abraham with `x1 * t` also works here,
+but only because the covariate trend is linear in the design.
+
+# Assessing parallel trends {#sec-assess}
+
+## Pre-trends tests and what they cannot tell {#sec-pretrends}
+
+A pre-trends plot tests parallel trends *before* treatment. The
+identifying assumption is about trends *after* treatment. The test is
+informative only through an extra step: if trends were parallel before,
+they are probably parallel after. That step is economics, not statistics,
+and it fails when treatment is timed in response to a change in the
+outcome, which is the usual reason policies are adopted.
+
+Even on its own terms the test is weak. Roth (2022) shows that
+pre-trends tests have low power against violations large enough to
+matter. `pretrend_power()` makes this concrete: it takes the event-study
+estimates and their covariance, posits a linear violation of parallel
+trends with a given slope, and reports the probability that the standard
+pre-test (any pre-period coefficient significant at 5 percent) rejects.
+
+```{r pretrend-power}
+pp <- pretrend_power(agg_dyn, n_sim = 3000, seed = 1)
+pp$detectable
+```
+
+A violation that the test detects only half the time would bias the
+effect at $e = 4$ by five times that slope. In this design the effects are
+large relative to such slopes; in many applications they are not.
+
+## Conditioning on passing the pre-test {#sec-pretest-bias}
+
+Worse, the estimates that survive the test are not a random sample of
+the estimates. When a real violation exists, the draws that fail to reject
+are those in which the noise happened to offset the pre-trend, and the
+same noise pushes the post-treatment estimates away from the truth. The
+bias conditional on passing exceeds the unconditional bias.
+
+```{r pretest-bias}
+pp50 <- pretrend_power(agg_dyn, slope = pp$detectable$slope[1], n_sim = 3000, seed = 1)
+cbind(power = round(pp50$slopes[[1]]$power, 2), pp50$slopes[[1]]$bias)
+```
+
+The practical conclusion is not to abandon pre-trends plots, but to stop
+treating a passed test as a license. Report the plot, report the power of
+the test, and quantify how conclusions change under plausible violations.
+
+## Sensitivity analysis {#sec-honestdid}
+
+Rambachan and Roth (2023) replace "parallel trends holds" by a bound on
+how far it can fail, indexed by the pre-treatment evidence. Two families
+of bounds are common.
+
+- **Relative magnitudes** $\Delta^{RM}(\bar M)$: the post-treatment
+  violation in any period is at most $\bar M$ times the largest
+  pre-treatment violation. $\bar M = 1$ says trends after treatment
+  deviate no more than they did before.
+- **Smoothness** $\Delta^{SD}(M)$: the violation evolves smoothly; the
+  change in its slope between consecutive periods is at most $M$.
+  $M = 0$ allows a linear pre-trend to continue.
+
+For each bound the method returns a confidence set for the effect that
+is valid for every violation in the set. The **breakdown value** is the
+bound at which zero enters the set. `honestdid_inputs()` extracts the
+coefficients and their covariance from a dynamic aggregate estimated with
+the universal base period, so the reference period is exactly zero.
+
+```{r honestdid, eval = run_honest}
+csu_h <- att_gt(sd1, id = "id", time = "year", group = "g", y = "y", control_group = "notyet",
+                base_period = "universal", n_boot = 0)
+dyn_h <- aggregate_att(csu_h, type = "dynamic", min_e = -4, max_e = 3, n_boot = 0)
+hi <- honestdid_inputs(dyn_h)
+c(numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods)
+l1 <- HonestDiD::basisVector(1, hi$numPostPeriods)
+orig <- HonestDiD::constructOriginalCS(betahat = hi$betahat, sigma = hi$sigma, numPrePeriods = hi$numPrePeriods,
+                                       numPostPeriods = hi$numPostPeriods, l_vec = l1)
+rm <- HonestDiD::createSensitivityResults_relativeMagnitudes(
+  betahat = hi$betahat, sigma = hi$sigma, numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods,
+  Mbarvec = c(0.5, 1, 2), l_vec = l1, grid.lb = orig$lb - 2, grid.ub = orig$ub + 2)
+sm <- HonestDiD::createSensitivityResults(
+  betahat = hi$betahat, sigma = hi$sigma, numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods,
+  Mvec = c(0, 0.05, 0.1), l_vec = l1)
+rbind(as.data.frame(orig)[, c("lb", "ub", "method")], as.data.frame(rm)[, c("lb", "ub", "method")],
+      as.data.frame(sm)[, c("lb", "ub", "method")])
+```
+
+The grid for the relative-magnitudes set is passed explicitly, because
+the default grid is built for coefficients on the scale of the package's
+examples and can miss the estimate entirely.
+
+The rows show the effect at $e = 0$ under the original assumption, under
+relative-magnitude violations up to half, once, and twice the largest
+pre-treatment deviation, and under smoothness bounds of 0, 0.05, and 0.1
+per period. The estimated pre-trends are small here, so even $\bar M = 2$
+leaves the conclusion intact. When they are not small, this table is the
+honest statement of what the design can deliver.
+
+## Functional-form test {#sec-ff-test}
+
+Section \@ref(sec-functional-form) showed that parallel trends on one
+scale does not imply it on another. Roth and Sant'Anna (2023) give a
+test of the stronger claim that it holds on every scale, which is the
+same as parallel trends of the whole distribution. Under that claim the
+counterfactual distribution of treated outcomes after treatment is
+$F_{1,\text{pre}} + F_{0,\text{post}} - F_{0,\text{pre}}$, which must be a
+distribution function: its implied density must be non-negative
+everywhere. A negative implied mass anywhere rejects distributional
+parallel trends, and with it the hope that the scale does not matter.
+
+```{r ff-test}
+breaks <- quantile(c(y1, y2), probs = seq(0, 1, 0.1))
+mass <- function(v) as.numeric(table(cut(v, breaks, include.lowest = TRUE))) / length(v)
+implied <- mass(y1[treat == 1]) + mass(y2[treat == 0]) - mass(y1[treat == 0])
+round(implied, 3)
+```
+
+The negative entries say that no monotone transformation of this outcome
+satisfies parallel trends, so the level and log analyses cannot both be
+right, which is what Section \@ref(sec-functional-form) found.
+
+## Placebos and design checks {#sec-placebos}
+
+- **Placebo outcomes**: an outcome the policy cannot affect should show no
+  effect; if it does, the comparison group is trending differently.
+- **Placebo timing**: pretend treatment started earlier and estimate on
+  the pre-period only; the cells of `att_gt()` with `post = 0` are this
+  check, done period by period.
+- **Anticipation**: date treatment at the announcement or use
+  `anticipation = k`; a jump at $e = -1$ is a symptom (Section
+  \@ref(sec-anticipation)).
+- **Composition**: in repeated cross-sections, test that the distribution
+  of covariates within groups does not change over time.
+- **Estimator agreement**: Callaway-Sant'Anna with never and with not-yet
+  comparisons, Sun-Abraham, and imputation should agree when parallel
+  trends holds in all periods; a gap between them is evidence about the
+  pre-period assumption, not a choice of software.
+
+# Inference {#sec-inference}
+
+## What level to cluster {#sec-cluster-level}
+
+Two views justify clustering. In the **sampling** view, units are drawn
+from a population in clusters, and standard errors must reflect the
+cluster draw: at least the unit, because a unit's periods are one draw,
+and higher when units are sampled by state or firm. In the **design**
+view, treatment is assigned at some level, and the uncertainty is about
+which clusters were assigned; standard errors should then be clustered
+at the assignment level. Both views lead to the same practical rule:
+cluster at the level of treatment assignment, and never below the unit.
+
+```{r cluster-level}
+agg_unit <- aggregate_att(cs_notyet, type = "simple", n_boot = 199, seed = 1)
+cs_state <- att_gt(sd1, id = "id", time = "year", group = "g", y = "y", control_group = "notyet",
+                   cluster = "state", n_boot = 199, seed = 1)
+agg_state <- aggregate_att(cs_state, type = "simple")
+rbind(cluster_unit = agg_unit$overall, cluster_state = agg_state$overall)
+```
+
+Treatment is assigned by state, so the state-clustered standard error is
+the relevant one; it is several times larger than the unit-clustered one.
+
+## Few clusters {#sec-few-clusters}
+
+Cluster-robust standard errors rely on a central limit theorem across
+clusters. With few clusters, and especially few *treated* clusters, the
+approximation fails, standard errors are biased downward, and tests
+over-reject. The wild cluster bootstrap repairs moderate cases but not
+the case of one or two treated clusters. Randomization inference asks a
+different question: if treatment timing had been assigned at random
+across clusters, how unusual is the observed statistic? Under random
+timing this test is exact for the sharp null of no effect for any unit,
+and with a studentized statistic it is also asymptotically valid for the
+weak null of a zero average effect (Roth and Sant'Anna 2023).
+
+```{r few-clusters}
+few <- sim_did_panel(n_units = 300, n_periods = 8, groups = 5, never_share = 0.75, mu = 1, seed = 14)
+few$state <- (few$id - 1) %/% 15 + 1
+few$g <- ave(few$g, few$state, FUN = function(v) v[1])
+few$treated <- as.integer(few$g > 0 & few$time >= few$g)
+c(treated_states = length(unique(few$state[few$g > 0])), states = length(unique(few$state)))
+asy <- feols(y ~ treated | id + time, data = few, cluster = ~state)
+perm <- did_permutation_test(few, id = "id", time = "time", group = "g", y = "y",
+                             cluster = "state", n_perm = 499, seed = 1)
+c(asymptotic_p = fixest::pvalue(asy)[["treated"]], permutation_p = perm$p.value)
+```
+
+## Design-based inference and random timing {#sec-random-timing}
+
+When treatment timing really is random, as in a randomized rollout,
+parallel trends is implied but the DiD estimator is not efficient. Roth
+and Sant'Anna (2023) show that the efficient estimator in a large class
+subtracts from the simple post-treatment comparison a regression
+adjustment on pre-treatment differences, in the spirit of covariate
+adjustment in experiments, and that standard-error reductions of a
+factor of two are common. They also provide the studentized permutation
+test used above. `staggered_efficient()` implements the estimator
+(reproducing the `staggered` package): `beta = 1` is the
+Callaway-Sant'Anna comparison, `beta = 0` the difference in means, and
+the default is the plug-in efficient `beta*`. The gain is largest when
+pre-treatment outcomes predict post-treatment outcomes weakly, so that
+subtracting the pre-period difference adds noise rather than removing it.
+
+```{r random-timing}
+set.seed(19)
+n_rt <- 600; T_rt <- 8
+g_rt <- sample(c(3, 5, 7, Inf), n_rt, replace = TRUE)   # random timing
+y_rt <- matrix(rnorm(n_rt * T_rt), n_rt) + outer(rep(1, n_rt), seq_len(T_rt) / 4)   # little serial correlation
+for (i in seq_len(n_rt)) if (is.finite(g_rt[i])) y_rt[i, seq_len(T_rt) >= g_rt[i]] <- y_rt[i, seq_len(T_rt) >= g_rt[i]] + 1
+rt <- data.frame(id = rep(seq_len(n_rt), each = T_rt), time = rep(seq_len(T_rt), n_rt),
+                 g = rep(g_rt, each = T_rt), y = as.vector(t(y_rt)))
+rbind(
+  efficient = staggered_efficient(rt, id = "id", time = "time", group = "g", y = "y", estimand = "simple",
+                                  n_perm = 199, seed = 1)$estimates[, c("estimate", "std.error", "beta", "fisher_p.value")],
+  did_beta_1 = staggered_efficient(rt, id = "id", time = "time", group = "g", y = "y", estimand = "simple",
+                                   beta = 1, n_perm = 199, seed = 1)$estimates[, c("estimate", "std.error", "beta", "fisher_p.value")]
+)
+```
+
+With independent noise across periods the efficient `beta*` is near zero,
+and the DiD standard error is about 1.4 times larger, the square root of
+two that differencing costs. Random timing is a stronger assumption than
+parallel trends; under it the gain in precision is free, and without it
+the DiD comparison remains the safe choice.
+
+# Beyond binary absorbing treatments {#sec-beyond}
+
+## Continuous and multi-valued doses {#sec-dose}
+
+Many treatments come in doses: a minimum wage increase of 5 or 15
+percent, an ad budget, a tax rate. With a dose $D \ge 0$ and untreated
+units at $D = 0$, two questions arise, and Callaway, Goodman-Bacon, and
+Sant'Anna (2024) show they need different assumptions.
+
+- **Level effects** $ATT(d \mid d) = \mathbb{E}[Y_2(d) - Y_2(0) \mid D = d]$:
+  the effect of dose $d$ for units that received $d$. Parallel trends
+  between dose-$d$ units and untreated units identifies it by the usual
+  DiD, $\mathbb{E}[\Delta Y \mid D = d] - \mathbb{E}[\Delta Y \mid D = 0]$.
+- **Causal responses** $ACRT(d \mid d) = \partial \mathbb{E}[Y_2(l) \mid D = d] / \partial l$
+  at $l = d$: the effect of a marginal increase in the dose. Comparing
+  $ATT(d \mid d)$ across doses does not identify it, because units that
+  chose different doses may have different responses; the comparison
+  mixes the causal response with selection into dose. Identification
+  needs **strong parallel trends**: every dose group would have followed
+  the same average path at every dose, which rules out selection on
+  gains.
+
+The two-way fixed effects coefficient on a continuous dose is
+$\mathrm{Cov}(\Delta Y, D) / \mathrm{Var}(D)$. It has two readings. It is a
+weighted sum of level effects with weights that can be negative, and it
+is a weighted sum of causal-response increments with non-negative weights
+that integrate to one. The second reading is the appealing one and is
+the one that needs strong parallel trends. `att_dose()` reports both
+weight sets so the reader sees which assumption is being invoked.
+
+```{r dose}
+set.seed(15)
+nd <- 1500
+dose <- ifelse(runif(nd) < 0.3, 0, runif(nd, 0.5, 3))
+dd <- data.frame(id = rep(seq_len(nd), each = 2), time = rep(1:2, nd), dose = rep(dose, each = 2))
+dd$y <- rep(rnorm(nd), each = 2) + 0.5 * dd$time +
+  (dd$time == 2) * (2 * dd$dose - 0.3 * dd$dose^2) + rnorm(2 * nd, sd = 0.5)
+ad <- att_dose(dd, id = "id", time = "time", y = "y", dose = "dose", dose_type = "spline",
+               n_bins = 4, n_boot = 199, seed = 1)
+ad$by_dose[, c("bin", "dose", "att", "std.error")]
+ad$twfe_weights
+```
+
+```{r fig-dose, fig.height = 3.6, fig.cap = "Causal responses by dose bin (points) and the spline estimate with a uniform band; the true response is 2 - 0.6 d."}
+plot_att_dose(ad, "acr")
+```
+
+In the design the response curve is $2d - 0.3 d^2$, so the true causal
+response is $2 - 0.6 d$ and falls with the dose. The level weights put
+negative mass on low doses; the slope weights are positive and sum to one
+over the dose gaps. A researcher who reports the TWFE coefficient as "the
+effect of a unit of dose" is using the second reading and therefore
+strong parallel trends, whether or not they say so.
+
+## Treatments that turn on and off {#sec-on-off}
+
+When treatment can be switched off and on, a unit's history is a
+sequence $(d_1, \dots, d_T)$, and there are $2^{T-1}$ possible groups
+instead of $T$. The building block becomes $ATT(\mathbf{d}, t)$, the effect
+of sequence $\mathbf{d}$ versus never being treated. Identification works as
+in Section \@ref(sec-long-differences) once groups are defined by the
+first exposure date and parallel trends is assumed across all sequences.
+Mechanically, `att_gt()` with the first exposure period as the group
+variable computes the right cells. The difficulty is interpretation: the
+cell for a first-exposure cohort at time $t$ averages units that stayed
+treated, switched off, and switched back on. de Chaisemartin and
+D'Haultfoeuille (2024) propose normalizing the event-study aggregate by
+the average number of treated periods, which reads as an effect "per unit
+of treatment" only under no carryover. With rich switching, the honest
+conclusion is often that DiD is not the right tool, and that sequential
+methods for time-varying treatments (marginal structural models, panel
+matching) fit better.
+
+## Triple differences {#sec-ddd}
+
+A triple difference adds a third dimension: within each group and period,
+some units are eligible for the policy and others are not (Gruber 1994).
+The estimand subtracts the DiD among ineligible units from the DiD among
+eligible units. It identifies the ATT under a weaker assumption than
+either DiD alone: the *difference* in untreated trends between eligible
+and ineligible units must be the same in the treated and comparison
+groups. Without covariates the estimate is the coefficient on the triple
+interaction, or equivalently the difference of two `att_gt()` cells.
+With covariates the shortcut fails: Ortiz-Villavicencio and Sant'Anna
+(2025) show that neither the triple-interaction regression with controls
+nor the difference of two conditional DiDs recovers the ATT, and they
+give a doubly robust estimator built directly from the triple-difference
+identification. The same holds for staggered adoption.
+
+```{r ddd}
+set.seed(16)
+n3 <- 2000
+d3 <- data.frame(id = rep(seq_len(n3), each = 2), time = rep(1:2, n3),
+                 treat = rep(rbinom(n3, 1, 0.5), each = 2), elig = rep(rbinom(n3, 1, 0.5), each = 2))
+d3$post <- as.integer(d3$time == 2)
+d3$y <- rnorm(2 * n3) + 0.4 * d3$post * d3$treat + 0.3 * d3$post * d3$elig +
+  1.5 * d3$post * d3$treat * d3$elig  # effect 1.5 on eligible units in the treated group
+ddd <- feols(y ~ treat:post:elig + treat:post + post:elig | id + time, data = d3, cluster = ~id)
+did_two <- function(e) coef(feols(y ~ treat:post | id + time, data = subset(d3, elig == e)))[["treat:post"]]
+c(triple_interaction = coef(ddd)[["treat:post:elig"]], difference_of_dids = did_two(1) - did_two(0))
+```
+
+## Nonlinear and distributional DiD {#sec-nonlinear}
+
+Section \@ref(sec-functional-form) showed that the scale is part of the
+assumption. Three situations call for models beyond the linear DiD.
+
+- **Counts and positive outcomes with zeros.** Logs are undefined at
+  zero and the log DiD has no clean interpretation. Wooldridge (2023)
+  proposes a Poisson quasi-likelihood with unit and period effects, whose
+  identifying assumption is parallel trends in *ratios*: the proportional
+  change in untreated means is the same across groups. The coefficient
+  gives the proportional ATT as $\exp(\beta) - 1$, and `fixest::fepois()`
+  estimates it with the same syntax as the linear model. This is the
+  workhorse of the gravity literature (Section \@ref(sec-practice)).
+- **Distributional effects.** Changes-in-changes (Athey and Imbens 2006)
+  assumes that the untreated outcome distribution changes over time
+  through one monotone map common to both groups, estimates the map from
+  the comparison group's pre and post quantiles, and applies it to the
+  treated group's pre-period distribution. It identifies the entire
+  counterfactual distribution, so quantile effects follow, and it is
+  invariant to monotone transformations by construction. Callaway and Li
+  (2019) give quantile treatment effects on the treated under a
+  copula-type assumption on the joint distribution of changes.
+
+```{r poisson}
+set.seed(17)
+np <- 3000
+pd <- data.frame(id = rep(seq_len(np), each = 2), time = rep(1:2, np), treat = rep(rbinom(np, 1, 0.5), each = 2))
+pd$post <- as.integer(pd$time == 2)
+mu <- exp(rep(rnorm(np, sd = 0.5), each = 2) + 0.2 * pd$post + 0.3 * pd$post * pd$treat)
+pd$y <- rpois(2 * np, mu)
+c(proportional_att_poisson = exp(coef(fepois(y ~ treat:post | id + time, data = pd))[["treat:post"]]) - 1,
+  truth = exp(0.3) - 1,
+  level_did_over_baseline = coef(feols(y ~ treat:post | id + time, data = pd))[["treat:post"]] /
+    mean(pd$y[pd$treat == 1 & pd$post == 0]))
+```
+
+# Synthetic difference-in-differences {#sec-sdid}
+
+## When the comparison group is not credible {#sec-sdid-problem}
+
+DiD averages all untreated units into one comparison group. With a
+handful of aggregate units, say one treated state and forty others, that
+average has no reason to trend like the treated state. Synthetic control
+(Abadie, Diamond, and Hainmueller 2010) replaces the average by a
+weighted combination of untreated units chosen to reproduce the treated
+unit's pre-treatment path. Synthetic DiD (Arkhangelsky et al. 2021)
+combines the two ideas: it keeps the unit and period effects of DiD, so
+levels need not match, and it adds unit weights that align the untreated
+*trends* with the treated trend and period weights that make the
+pre-treatment periods predictive of the post-treatment ones. The estimator
+solves
+$$
+(\hat\tau, \hat\alpha, \hat\beta) = \arg\min \sum_i \sum_t \bigl(Y_{it} - \alpha_i - \beta_t - \tau D_{it}\bigr)^2 \hat\omega_i \hat\lambda_t ,
+$$
+a weighted two-way fixed effects regression. Plain DiD is the case of
+uniform weights; synthetic control is the case of fitted unit weights,
+no period weights, and no unit effects.
+
+## Unit and time weights {#sec-sdid-weights}
+
+The unit weights solve a regularized constrained regression of the
+treated pre-treatment average on the untreated units' pre-treatment
+paths, with an intercept, so only trends must match. The period weights
+solve the analogous problem in the other direction, predicting untreated
+post-treatment averages from their pre-treatment periods. The
+regularization $\zeta$ is set from the noise in first differences, and
+the weights are sparse in practice. `sdid_weights()` returns them, with a
+cell-weight column for the regression step in `fixest`.
+
+The design below has a latent factor: units load differently on a common
+time trend, and treated units load more. Plain DiD compares treated units
+to an average that trends differently; synthetic DiD reweights the
+untreated units to match.
+
+```{r sdid-sim}
+set.seed(18)
+n0 <- 30; n1 <- 5; t0 <- 10; t1 <- 5
+nn <- n0 + n1; TT <- t0 + t1
+f <- cumsum(rnorm(TT)) + seq_len(TT) / 2
+load <- c(runif(n0, 0, 2), runif(n1, 1.5, 2.5))
+Y <- outer(rnorm(nn), rep(1, TT)) + outer(load, f) + matrix(rnorm(nn * TT, sd = 0.3), nn)
+Y[(n0 + 1):nn, (t0 + 1):TT] <- Y[(n0 + 1):nn, (t0 + 1):TT] + 2
+blk <- data.frame(id = rep(seq_len(nn), each = TT), time = rep(seq_len(TT), nn), y = as.vector(t(Y)),
+                  d = as.integer(rep(seq_len(nn) > n0, each = TT) & rep(seq_len(TT) > t0, nn)))
+ests <- sapply(c("did", "sc", "difp", "sdid"), function(m)
+  sdid_weights(blk, id = "id", time = "time", y = "y", d = "d", estimator = m)$estimate)
+round(ests, 3)
+sw <- sdid_weights(blk, id = "id", time = "time", y = "y", d = "d")
+fit_w <- feols(y ~ d | id + time, data = merge(blk, sw$cell_weights, by = c("id", "time")), weights = ~weight)
+c(closed_form = sw$estimate, weighted_fixest = coef(fit_w)[["d"]])
+```
+
+The true effect is 2. DiD is far off because the untreated average has a
+flatter trend than the treated units. Synthetic control reduces the bias
+but does not remove it, because without unit effects its weights must
+match levels as well as trends. Synthetic DiD matches trends only and
+recovers the effect, and its closed form equals the weighted regression.
+
+## Inference {#sec-sdid-inference}
+
+Three resampling schemes are available. The **placebo** scheme draws
+untreated units, treats them as if treated, and re-estimates; it is the
+choice when treated units are few, because it uses the untreated units'
+variability. The **bootstrap** resamples units with replacement and needs
+several treated units. The **jackknife** leaves one unit out. All three
+re-solve the weights on each draw, so the standard error includes the
+uncertainty from weight estimation.
+
+```{r sdid-se}
+sapply(c("placebo", "bootstrap", "jackknife"), function(m)
+  sdid_se(sw, method = m, n_reps = 100, seed = 1)$std.error)
+```
+
+## Diagnostics {#sec-sdid-diagnostics}
+
+```{r fig-sdid, fig.height = 3.8, fig.cap = "Treated average and the weighted untreated average; bars show the period weights."}
+plot_sdid(sw)
+```
+
+Read three things from the fit. The pre-treatment paths should coincide
+after the unit effects are removed; a gap there is a failure of the
+weights, not evidence of an effect. The unit weights should not
+concentrate on one or two donors, which makes the estimate fragile to
+those units. And the period weights show which pre-treatment periods are
+doing the work; weights on distant periods with different dynamics are a
+warning. With staggered adoption, run the estimator cohort by cohort and
+average the results with cohort weights. The companion synthetic control
+note in this series covers the Abadie method, its placebo tests, and the
+`synthdid` package in depth.
+
+# Practice {#sec-practice}
+
+## Replications and anchors {#sec-replications}
+
+The replication notebooks for this section live in the notes folder and
+are planned for the package's replication directory for Section 07; they
+are not yet part of the package. Each anchors one part of the lecture.
+
+| Paper | What it anchors |
+|---|---|
+| de Chaisemartin and D'Haultfoeuille (2020), newspapers and turnout; union wages | negative weights and the switchers-versus-stayers estimator (Section \@ref(sec-staggered-problems)) |
+| Freyaldenhoven, Hansen, and Shapiro (2019); Roth (2022) | pre-trends, power, and the pre-test bias (Section \@ref(sec-assess)) |
+| Roth and Sant'Anna (2023), functional form; Cengiz et al. (2019) minimum wage bins | scale dependence and the distributional test (Sections \@ref(sec-functional-form), \@ref(sec-ff-test)) |
+| Elenev et al. (2024), staggered health policy with spillovers | staggered estimators and the interference assumption (Sections \@ref(sec-staggered-solutions), \@ref(sec-extensions)) |
+| Nagengast and Yotov (2025), trade agreements in gravity models | nonlinear DiD with Poisson fixed effects (Section \@ref(sec-nonlinear)) |
+| Arkhangelsky et al. (2021), California Proposition 99; Li (2024), forward DiD | synthetic DiD (Section \@ref(sec-sdid)) |
+| Planned: Callaway and Sant'Anna (2021) minimum wage; Sant'Anna and Zhao (2020); Goodman-Bacon (2021); Rambachan and Roth (2023) | `att_gt()` validation, the three faces of covariates, the decomposition, sensitivity analysis |
+
+## A DiD checklist {#sec-checklist}
+
+Adapted from Sant'Anna's course.
+
+1. Plot the treatment rollout: who is treated when, and who never.
+2. Count units per cohort and per comparison group; small cohorts have
+   noisy cells and small comparison groups have overlap problems.
+3. Plot raw average outcomes by cohort over calendar time before any
+   estimation.
+4. State the comparison group and the parallel trends assumption in
+   words: who decides treatment, what do they know, what selection is
+   allowed. Date treatment at the announcement if units can anticipate.
+5. Estimate the event study with `att_gt()` and no covariates, universal
+   base period, uniform bands. Read the pre-treatment cells, then the
+   post-treatment ones.
+6. If unconditional parallel trends is implausible, add pre-treatment
+   covariates with the doubly robust cells, and check overlap. Do not add
+   them linearly to a TWFE regression.
+7. Compare never-treated and not-yet-treated comparisons, Sun-Abraham,
+   and imputation. Disagreement is information about the pre-period
+   assumption.
+8. Report the power of the pre-test (`pretrend_power()`) and a sensitivity
+   analysis (HonestDiD) rather than a passed test.
+9. Cluster at the level of treatment assignment; with few treated
+   clusters, use `did_permutation_test()`.
+10. If parallel trends is not credible with any comparison group,
+    consider synthetic DiD, or a different design.
+
+# Extensions {#sec-extensions}
+
+- **Efficient DiD under parallel trends in all periods.** Chen,
+  Sant'Anna, and Xie (2024) show that when the assumption holds before
+  and after treatment, the model is overidentified, and derive the
+  estimator that weights the pre-treatment periods optimally given the
+  serial correlation of outcomes. It nests Callaway-Sant'Anna and the
+  imputation estimator as special cases and dominates both.
+- **Heterogeneous effects.** The doubly robust cell score is a pseudo
+  outcome with conditional mean equal to the conditional ATT given
+  covariates. Regressing it on a subset of covariates gives the best
+  linear approximation of $CATT(g, t, Z)$ (Callaway, Chen, and Sant'Anna
+  2024), and a meta-learner built on it estimates it flexibly (the DiD
+  analogue of Section 08's DR-learner).
+- **Selection and parallel trends.** Ghanem, Sant'Anna, and Wuthrich
+  (2022) derive the selection mechanisms under which parallel trends
+  holds, and Marx, Tamer, and Tang (2024) show that forward-looking
+  adoption decisions generally violate it. Both give the vocabulary for
+  step 4 of the checklist.
+- **Compositional changes.** In repeated cross-sections the stationarity
+  assumption can fail; Sant'Anna and Xu (2023) give estimators that allow
+  the covariate distribution to change over time and a test for it.
+- **Spillovers.** When treated units affect their neighbours, the
+  no-interference assumption fails and the comparison group is
+  contaminated. Elenev et al. (2024) and Butts (2023) estimate direct and
+  spillover effects by defining exposure through distance to treated
+  units.
+- **Interactive fixed effects and matrix completion.** Parallel trends is
+  the one-factor case of a model with unit loadings on common factors.
+  Interactive fixed effects (Bai 2009; Xu 2017) and matrix completion
+  (Athey et al. 2021) impute untreated outcomes under a low-rank factor
+  structure; synthetic DiD is a weighted special case. Liu, Wang, and Xu
+  (2024) unify these as counterfactual estimators with placebo and
+  equivalence tests.
+- **Dynamic treatment regimes.** With treatments chosen sequentially in
+  response to past outcomes, the target becomes the effect of a
+  treatment path, identified by the g-formula and estimated by sequential
+  regression or dynamic DML rather than DiD (Section 08).
+
+# Appendix {#sec-appendix}
+
+## Influence functions for the two-by-two {#app-influence}
+
+**Panel.** With $D_i = \mathbf{1}\{G_i = 2\}$, $\pi = P(D = 1)$, and
+$\Delta Y_i = Y_{i2} - Y_{i1}$, the estimator is
+$$
+\hat\theta = \frac{\mathbb{E}_n[D\,\Delta Y]}{\mathbb{E}_n[D]} - \frac{\mathbb{E}_n[(1 - D)\,\Delta Y]}{\mathbb{E}_n[1 - D]} .
+$$
+Each ratio is a smooth function of two sample means. A first-order
+expansion of $a_n / b_n$ around $(a, b)$ gives
+$a_n / b_n - a / b = (a_n - a)/b - a (b_n - b)/b^2 + o_p(n^{-1/2})$.
+Applied to the first ratio with $a = \mathbb{E}[D \Delta Y]$ and $b = \pi$,
+$$
+\frac{\mathbb{E}_n[D\,\Delta Y]}{\mathbb{E}_n[D]} - \mathbb{E}[\Delta Y \mid D = 1]
+= \mathbb{E}_n\Bigl[\frac{D}{\pi}\bigl(\Delta Y - \mathbb{E}[\Delta Y \mid D = 1]\bigr)\Bigr] + o_p(n^{-1/2}),
+$$
+and likewise for the second ratio. Subtracting,
+$\hat\theta - \theta = \mathbb{E}_n[\xi_i] + o_p(n^{-1/2})$ with
+$$
+\xi_i = \frac{D_i}{\pi}\bigl(\Delta Y_i - \mathbb{E}[\Delta Y \mid D = 1]\bigr) - \frac{1 - D_i}{1 - \pi}\bigl(\Delta Y_i - \mathbb{E}[\Delta Y \mid D = 0]\bigr).
+$$
+$\xi_i$ has mean zero and variance $\mathbb{E}[\xi^2] = \mathrm{Var}(\Delta Y \mid D = 1)/\pi + \mathrm{Var}(\Delta Y \mid D = 0)/(1 - \pi)$,
+so $\sqrt n(\hat\theta - \theta) \to N(0, \mathbb{E}[\xi^2])$ by the
+central limit theorem, and the plug-in $\hat\xi_i$ gives the standard
+error $\sqrt{\sum_i \hat\xi_i^2}/n$.
+
+**Repeated cross-sections.** With $T_i \in \{1, 2\}$ the period of
+observation and four cells $(t, d)$, the estimator is the DiD of four
+cell means, and the same expansion gives
+$$
+\xi_i = \xi_{i}^{(2,1)} - \xi_{i}^{(1,1)} - \xi_{i}^{(2,0)} + \xi_{i}^{(1,0)},
+\qquad
+\xi_{i}^{(t,d)} = \frac{\mathbf{1}\{T_i = t, D_i = d\}}{P(T = t, D = d)}\bigl(Y_i - \mathbb{E}[Y \mid T = t, D = d]\bigr).
+$$
+
+**Clusters.** If observations are sampled in clusters, replace
+$\hat\xi_i$ by cluster sums $\hat\xi_c = \sum_{i \in c}\hat\xi_i$; the
+variance is $\sum_c \hat\xi_c^2 / n^2$.
+
+**Covariates.** With parametric first steps the influence function of
+the regression, IPW, and doubly robust estimators includes correction
+terms for the estimated logit and regression coefficients (Sant'Anna
+and Zhao 2020, Appendix). `att_gt()` reports these exact influence
+functions. With cross-fitted learners it reports the plain orthogonal
+score, whose first-order corrections vanish by the argument of the next
+subsection.
+
+## Orthogonality and remainder of the DR-DiD score {#app-orthogonality}
+
+Write the panel doubly robust score with $\pi = \mathbb{E}[D]$ and
+nuisances $\eta = (p, m)$:
+$$
+\psi(W; \theta, \eta) = \frac{1}{\pi}\Bigl(D - \frac{p(X)(1 - D)}{1 - p(X)}\Bigr)\bigl(\Delta Y - m(X)\bigr) - \frac{D}{\pi}\,\theta .
+$$
+Two facts: $\mathbb{E}[D \mid X] = p_0(X)$, so
+$\mathbb{E}[p_0(X)(1 - D)/(1 - p_0(X)) \mid X] = p_0(X)$; and
+$\mathbb{E}[\Delta Y - m_0(X) \mid D = 0, X] = 0$.
+
+*Direction in $m$.* Replacing $m_0$ by $m_0 + t\Delta_m$ changes the
+moment by $-t\,\mathbb{E}[(D - p_0(1 - D)/(1 - p_0))\Delta_m(X)]/\pi$.
+Conditioning on $X$, the bracket has mean $p_0 - p_0 = 0$. The derivative
+is zero.
+
+*Direction in $p$.* Only the weight $p(1 - D)/(1 - p)$ depends on $p$,
+with derivative $(1 - D)\Delta_p(X)/(1 - p_0(X))^2$. It multiplies
+$\Delta Y - m_0(X)$ on untreated units, whose conditional mean is zero.
+The derivative is zero. The score is Neyman orthogonal.
+
+*Exact remainder.* With fixed $\hat p, \hat m$, write
+$\Delta_p = \hat p - p_0$ and $\Delta_m = \hat m - m_0$. Conditioning on
+$X$ and using the two facts, every term involving $\Delta Y - m_0(X)$ on
+untreated units vanishes, and what remains is a product of the two
+nuisance errors:
+$$
+\mathbb{E}[\psi(W; \theta_0, \hat\eta)] = \frac{1}{\pi}\,\mathbb{E}\Bigl[\frac{\hat p(X) - p_0(X)}{1 - \hat p(X)}\,\bigl(m_0(X) - \hat m(X)\bigr)\Bigr].
+$$
+It is zero when either nuisance is correct (double robustness), and it
+is $o(n^{-1/2})$ when the product of the $L^2$ errors is, which is the
+rate condition of Section 04. The Hajek normalization used in
+`att_gt()` divides the control term by its own mean instead of $\pi$;
+the difference is $O_p(n^{-1/2})$ times the remainder and does not affect
+the argument.
+
+## The Bacon decomposition {#app-bacon}
+
+> **Theorem (Goodman-Bacon 2021).** In a balanced panel with $K$ timing
+> groups and possibly a never-treated group $U$, the static TWFE
+> coefficient satisfies
+> $\hat\beta = \sum_{k} s_{kU}\hat\beta_{kU} + \sum_{k < l}\bigl(s_{kl}^{k}\hat\beta_{kl}^{k} + s_{kl}^{l}\hat\beta_{kl}^{l}\bigr)$,
+> where each $\hat\beta$ is a two-by-two DiD estimate and the weights are
+> non-negative and sum to one. With $n_k$ the population share of group
+> $k$, $\bar D_k$ the share of periods it spends treated, and $\hat V^D$
+> the variance of the doubly demeaned treatment indicator,
+> $s_{kU} = (n_k + n_U)^2\, n_{kU}(1 - n_{kU})\,\bar D_k(1 - \bar D_k)/\hat V^D$
+> with $n_{kU} = n_k/(n_k + n_U)$, and the two timing weights are given in
+> the paper's Theorem 1.
+
+*Sketch.* By the Frisch-Waugh-Lovell theorem, $\hat\beta = \mathrm{Cov}(\tilde D, Y)/\mathrm{Var}(\tilde D)$
+where $\tilde D$ is $D$ with unit and period means removed. Restricting
+the sample to any pair of groups and applying the same formula gives that
+pair's two-by-two estimate. The full-sample covariance is a sum over
+pairs of the within-pair covariances, because $\tilde D$ is piecewise
+constant across groups and periods; dividing each by $\mathrm{Var}(\tilde D)$
+yields the weights, which are each pair's share of the treatment
+variance. `bacon_decomp()` computes the pieces on group-by-period means,
+and its `check` component verifies the identity numerically.
+
+## Identification of ATT(g,t) {#app-identification}
+
+**Never-treated comparison.** Fix $g$ and $t \ge g$. Parallel trends for
+each period $s = g, \dots, t$,
+$\mathbb{E}[Y_s(\infty) - Y_{s-1}(\infty) \mid G = g] = \mathbb{E}[Y_s(\infty) - Y_{s-1}(\infty) \mid G = \infty]$,
+summed over $s$ gives
+$\mathbb{E}[Y_t(\infty) - Y_{g-1}(\infty) \mid G = g] = \mathbb{E}[Y_t(\infty) - Y_{g-1}(\infty) \mid G = \infty]$.
+No anticipation replaces $Y_{g-1}(\infty)$ by the observed $Y_{g-1}$ for
+group $g$, and no interference replaces the remaining potential outcomes
+by observed ones. Hence
+$ATT(g, t) = \mathbb{E}[Y_t - Y_{g-1} \mid G = g] - \mathbb{E}[Y_t - Y_{g-1} \mid G = \infty]$.
+
+**Not-yet-treated comparison.** Replace $G = \infty$ by the event
+$D_t = 0, G \ne g$ in every step; the assumption must then hold for that
+changing set, which is the not-yet-treated version of Assumption 3.
+
+**Covariates.** With conditional parallel trends and overlap, the same
+argument conditional on $X$ identifies $ATT(g, t \mid X)$, and averaging
+over the distribution of $X$ in group $g$ gives the outcome regression,
+IPW, and doubly robust estimands of Section \@ref(sec-three-faces) with
+$\Delta Y$ replaced by $Y_t - Y_{g-1}$ and $D$ by $\mathbf{1}\{G = g\}$
+within the cell sample (Callaway and Sant'Anna 2021, Theorem 1).
+
+## Multiplier bootstrap and simultaneous bands {#app-bootstrap}
+
+Let $\hat\theta = (\hat\theta_1, \dots, \hat\theta_K)$ be the cell
+estimates with $\sqrt n(\hat\theta - \theta) = n^{-1/2}\sum_i \xi_i + o_p(1)$
+jointly, and let $V_1, \dots, V_n$ be i.i.d. draws, independent of the
+data, with mean zero and variance one (Mammen's two-point distribution or
+Rademacher). Define $\hat\theta^* = \hat\theta + n^{-1}\sum_i V_i \hat\xi_i$.
+By the conditional multiplier central limit theorem,
+$\sqrt n(\hat\theta^* - \hat\theta)$ converges conditionally on the data
+to the same Gaussian limit as $\sqrt n(\hat\theta - \theta)$
+(Callaway and Sant'Anna 2021, Theorem 3). Therefore:
+
+- the bootstrap standard error, taken as the interquartile range of
+  $\hat\theta_k^* - \hat\theta_k$ divided by that of a standard normal, is
+  consistent and robust to outlying draws;
+- with $\hat c_{1-\alpha}$ the $(1 - \alpha)$ quantile across draws of
+  $\max_k |\hat\theta_k^* - \hat\theta_k| / \hat{se}_k$, the band
+  $\hat\theta_k \pm \hat c_{1-\alpha}\,\hat{se}_k$ covers all $K$ cells
+  jointly with asymptotic probability $1 - \alpha$.
+
+With clusters, sum $\hat\xi_i$ within clusters and draw one $V$ per
+cluster. Aggregations inherit the result because their influence
+functions are linear combinations of the cell influence functions plus
+the estimation error of the aggregation weights, which is itself a
+mean-zero average.
+
+## References
+
+- Abadie, Alberto. 2005. "Semiparametric Difference-in-Differences Estimators." *Review of Economic Studies*.
+- Abadie, Alberto, Alexis Diamond, and Jens Hainmueller. 2010. "Synthetic Control Methods for Comparative Case Studies." *Journal of the American Statistical Association*.
+- Arkhangelsky, Dmitry, Susan Athey, David A. Hirshberg, Guido W. Imbens, and Stefan Wager. 2021. "Synthetic Difference-in-Differences." *American Economic Review*.
+- Athey, Susan, and Guido W. Imbens. 2006. "Identification and Inference in Nonlinear Difference-in-Differences Models." *Econometrica*.
+- Athey, Susan, and Guido W. Imbens. 2022. "Design-Based Analysis in Difference-in-Differences Settings with Staggered Adoption." *Journal of Econometrics*.
+- Athey, Susan, Mohsen Bayati, Nikolay Doudchenko, Guido Imbens, and Khashayar Khosravi. 2021. "Matrix Completion Methods for Causal Panel Data Models." *Journal of the American Statistical Association*.
+- Borusyak, Kirill, Xavier Jaravel, and Jann Spiess. 2024. "Revisiting Event-Study Designs: Robust and Efficient Estimation." *Review of Economic Studies*.
+- Butts, Kyle. 2023. "Difference-in-Differences Estimation with Spatial Spillovers." Working paper.
+- Callaway, Brantly, Andrew Goodman-Bacon, and Pedro H. C. Sant'Anna. 2024. "Difference-in-Differences with a Continuous Treatment." Working paper, arXiv:2107.02637.
+- Callaway, Brantly, and Tong Li. 2019. "Quantile Treatment Effects in Difference in Differences Models with Panel Data." *Quantitative Economics*.
+- Callaway, Brantly, and Pedro H. C. Sant'Anna. 2021. "Difference-in-Differences with Multiple Time Periods." *Journal of Econometrics*.
+- Cengiz, Doruk, Arindrajit Dube, Attila Lindner, and Ben Zipperer. 2019. "The Effect of Minimum Wages on Low-Wage Jobs." *Quarterly Journal of Economics*.
+- Chang, Neng-Chieh. 2020. "Double/Debiased Machine Learning for Difference-in-Differences Models." *The Econometrics Journal*.
+- Chen, Xiaohong, Pedro H. C. Sant'Anna, and Haitian Xie. 2024. "Efficient Difference-in-Differences and Event Study Estimators." Working paper.
+- Chernozhukov, Victor, Christian Hansen, Nathan Kallus, Martin Spindler, and Vasilis Syrgkanis. 2026. *Applied Causal Inference Powered by ML and AI*, chapter 16. Online, version 0.1.2.
+- de Chaisemartin, Clement, and Xavier D'Haultfoeuille. 2020. "Two-Way Fixed Effects Estimators with Heterogeneous Treatment Effects." *American Economic Review*.
+- de Chaisemartin, Clement, and Xavier D'Haultfoeuille. 2024. "Difference-in-Differences Estimators of Intertemporal Treatment Effects." *Review of Economics and Statistics*.
+- Dube, Arindrajit, Daniele Girardi, Oscar Jorda, and Alan M. Taylor. 2023. "A Local Projections Approach to Difference-in-Differences Event Studies." NBER Working Paper 31184.
+- Freyaldenhoven, Simon, Christian Hansen, and Jesse M. Shapiro. 2019. "Pre-Event Trends in the Panel Event-Study Design." *American Economic Review*.
+- Gardner, John. 2022. "Two-Stage Differences in Differences." Working paper.
+- Ghanem, Dalia, Pedro H. C. Sant'Anna, and Kaspar Wuthrich. 2022. "Selection and Parallel Trends." Working paper, arXiv:2203.09001.
+- Goodman-Bacon, Andrew. 2021. "Difference-in-Differences with Variation in Treatment Timing." *Journal of Econometrics*.
+- Gruber, Jonathan. 1994. "The Incidence of Mandated Maternity Benefits." *American Economic Review*.
+- Heckman, James J., Hidehiko Ichimura, and Petra E. Todd. 1997. "Matching as an Econometric Evaluation Estimator." *Review of Economic Studies*.
+- Liu, Licheng, Ye Wang, and Yiqing Xu. 2024. "A Practical Guide to Counterfactual Estimators for Causal Inference with Time-Series Cross-Sectional Data." *American Journal of Political Science*.
+- Marx, Philip, Elie Tamer, and Xun Tang. 2024. "Parallel Trends and Dynamic Choices." *Journal of Political Economy: Microeconomics*.
+- Ortiz-Villavicencio, Marcelo, and Pedro H. C. Sant'Anna. 2025. "Better Understanding Triple Differences Estimators." Working paper.
+- Rambachan, Ashesh, and Jonathan Roth. 2023. "A More Credible Approach to Parallel Trends." *Review of Economic Studies*.
+- Roth, Jonathan. 2022. "Pretest with Caution: Event-Study Estimates after Testing for Parallel Trends." *American Economic Review: Insights*.
+- Roth, Jonathan, and Pedro H. C. Sant'Anna. 2023. "When Is Parallel Trends Sensitive to Functional Form?" *Econometrica*.
+- Roth, Jonathan, and Pedro H. C. Sant'Anna. 2023. "Efficient Estimation for Staggered Rollout Designs." *Journal of Political Economy: Microeconomics*.
+- Roth, Jonathan, Pedro H. C. Sant'Anna, Alyssa Bilinski, and John Poe. 2023. "What's Trending in Difference-in-Differences? A Synthesis of the Recent Econometrics Literature." *Journal of Econometrics*.
+- Sant'Anna, Pedro H. C. 2025. *Causal Inference Using Difference-in-Differences*. Lecture slides, Emory University.
+- Sant'Anna, Pedro H. C., and Qi Xu. 2023. "Difference-in-Differences with Compositional Changes." Working paper, arXiv:2304.13925.
+- Sant'Anna, Pedro H. C., and Jun Zhao. 2020. "Doubly Robust Difference-in-Differences Estimators." *Journal of Econometrics*.
+- Sun, Liyang, and Sarah Abraham. 2021. "Estimating Dynamic Treatment Effects in Event Studies with Heterogeneous Treatment Effects." *Journal of Econometrics*.
+- Wooldridge, Jeffrey M. 2021. "Two-Way Fixed Effects, the Two-Way Mundlak Regression, and Difference-in-Differences Estimators." Working paper.
+- Wooldridge, Jeffrey M. 2023. "Simple Approaches to Nonlinear Difference-in-Differences with Panel Data." *The Econometrics Journal*.

@@ -7,8 +7,9 @@ Authors@R:
 Description: Data cleaning utilities, descriptive table functions, diagnostics,
     and from-scratch causal estimators for applied empirical research in
     economics and marketing. The current estimator is augmented inverse
-    propensity weighting ('est_aipw()') and double/debiased machine learning
-    ('est_dml()'); synthetic difference-in-differences is planned. Lecture-note vignettes and paper
+    propensity weighting ('est_aipw()'), double/debiased machine learning
+    ('est_dml()'), a difference-in-differences toolkit, and heterogeneous
+    treatment effect and policy learning tools built on doubly robust scores. Lecture notes (knitted PDFs under inst/lectures) and paper
     replications document each identification strategy. Attaching the package
     also attaches the standard empirical analysis toolkit (tidyverse,
     data.table, fixest, estimatr, broom, modelsummary, kableExtra).
@@ -29,13 +30,17 @@ Imports:
     generics,
     ggplot2,
     knitr,
+    Matrix,
     rlang,
     stats,
     utils
 Suggests:
     bookdown,
     car,
+    did,
     dplyr,
+    DRDID,
+    HonestDiD,
     ggthemes,
     glmnet,
     grf,
@@ -43,13 +48,17 @@ Suggests:
     mlr3,
     mlr3learners,
     patchwork,
+    policytree,
+    quadprog,
     randomizr,
     ranger,
     ri2,
     rmarkdown,
     sandwich,
+    staggered,
     testthat (>= 3.0.0),
-    tibble
+    tibble,
+    tidyr
 Config/testthat/edition: 3
 VignetteBuilder: knitr
 Config/roxygen2/version: 8.0.0

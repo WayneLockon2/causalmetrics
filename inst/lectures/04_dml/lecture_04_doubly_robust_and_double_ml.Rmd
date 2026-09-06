@@ -10,15 +10,10 @@ output:
     toc_depth: 4
     keep_tex: false
     latex_engine: xelatex
-  rmarkdown::html_vignette:
-    toc: true
-    toc_depth: 3
-    number_sections: true
-    fig_caption: true
-vignette: >
-  %\VignetteIndexEntry{causalmetrics: Doubly Robust Estimation and Double Machine Learning}
-  %\VignetteEngine{knitr::rmarkdown}
-  %\VignetteEncoding{UTF-8}
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
 link-citations: true
 ---
 
@@ -32,18 +27,34 @@ knitr::opts_chunk$set(
   out.width = "80%",
   dpi       = 150,
   message   = FALSE,
-  warning   = FALSE
+  warning   = FALSE,
+  fig.pos   = "H"
 )
+# Code and output in footnotesize.
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+
+# This lecture lives in inst/lectures/ of the package source. Knitted from the
+# source tree it loads the development version of the package; when the
+# package is installed it uses the installed copy and its helpers.
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_dir <- file.path(pkg_root, "inst", "vignette_helpers")
+} else {
+    helper_dir <- system.file("vignette_helpers", package = "causalmetrics")
+}
 
 library(causalmetrics)
 library(mlr3)
 library(mlr3learners)
+library(kableExtra)
 
 # Simulation helpers for this lecture (live in inst/vignette_helpers/)
-helper_path <- system.file("vignette_helpers",
-                           "04_Doubly_Robust_and_Double_ML",
-                           "dml_simulation_helpers.R",
-                           package = "causalmetrics")
+helper_path <- file.path(helper_dir, "04_Doubly_Robust_and_Double_ML", "dml_simulation_helpers.R")
 source(helper_path)
 
 # Monte Carlo size for the opening experiment. 100 replications take about
@@ -189,14 +200,19 @@ units; there are `r n_sims` replications.
 
 ### The estimators
 
-| Estimator | Nuisances | Fitted on | What it stands for |
-|---|---|---|---|
-| OLS with linear controls | none | full sample | Section 03's regression adjustment |
-| Naive plug-in forest | $\hat g(D, X)$ | full sample | "replace the linear model by a forest" |
-| Naive plug-in forest, cross-fitted | $\hat g(D, X)$ | held-out folds | the wrong score with the right sample splitting |
-| Orthogonal score, full-sample forests | $\hat\ell(X), \hat m(X)$ | full sample | the right score with the wrong sample use |
-| Orthogonal score, cross-fitted | $\hat\ell(X), \hat m(X)$ | held-out folds | DML with the partially linear score |
-| AIPW, cross-fitted | $\hat m(X), \hat g(0, X), \hat g(1, X)$ | held-out folds | Section 03's AIPW with forests: DML in the interactive model |
+```{r pipe-table-1, echo = FALSE}
+tibble::tibble(
+  c1 = c("OLS with linear controls", "Naive plug-in forest", "Naive plug-in forest, cross-fitted", "Orthogonal score, full-sample forests", "Orthogonal score, cross-fitted", "AIPW, cross-fitted"),
+  c2 = c("none", "$\\hat g(D, X)$", "$\\hat g(D, X)$", "$\\hat\\ell(X), \\hat m(X)$", "$\\hat\\ell(X), \\hat m(X)$", "$\\hat m(X), \\hat g(0, X), \\hat g(1, X)$"),
+  c3 = c("full sample", "full sample", "held-out folds", "full sample", "held-out folds", "held-out folds"),
+  c4 = c("Section 03's regression adjustment", "\"replace the linear model by a forest\"", "the wrong score with the right sample splitting", "the right score with the wrong sample use", "DML with the partially linear score", "Section 03's AIPW with forests: DML in the interactive model")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Estimator", "Nuisances", "Fitted on", "What it stands for")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9) %>%
+  column_spec(1, width = "4.3cm") %>%
+  column_spec(2, width = "3.6cm") %>%
+  column_spec(4, width = "5.6cm")
+```
 
 The last three are `est_dml()` calls.
 The cross-fitted plug-in is there to separate two ideas that are easy to
@@ -220,12 +236,10 @@ pick <- function(estimator, column) tab[[column]][tab$estimator == estimator]
 ```
 
 ```{r tab-experiment, echo = FALSE}
-knitr::kable(
-  tab,
-  digits = 3,
-  col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean reported SE", "95% coverage"),
-  caption = "Monte Carlo comparison, true effect 1, n = 500. Coverage is the share of replications whose nominal 95 percent interval contains the truth."
-)
+kbl(tab, booktabs = TRUE, digits = 3, linesep = "", escape = FALSE,
+    col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean reported SE", "95\\% coverage"),
+    caption = "Monte Carlo comparison, true effect 1, n = 500. Coverage is the share of replications whose nominal 95 percent interval contains the truth.") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
 ```
 
 ```{r fig-experiment, fig.height = 8, fig.cap = "Sampling distributions of the estimators, centred at the truth. The curve in each panel is the normal approximation implied by the estimator's own average reported standard error: a histogram that is shifted relative to its curve is biased, one that is wider than its curve under-reports uncertainty."}
@@ -414,11 +428,15 @@ how the error $\hat\eta - \eta_0$ enters $\hat\theta$.
 
 Three scores from Sections 1 and 03, with $H(D, X) = D/m(X) - (1 - D)/(1 - m(X))$:
 
-| Score | Nuisance $\eta$ | $\psi(W; \theta, \eta)$ |
-|---|---|---|
-| Plug-in (regression imputation) | $g$ | $g(1, X) - g(0, X) - \theta$ |
-| Partialling out (PLM) | $(\ell, m)$ | $\bigl(Y - \ell(X) - \theta\,(D - m(X))\bigr)\,(D - m(X))$ |
-| AIPW (IRM) | $(g, m)$ | $g(1, X) - g(0, X) + H(D, X)\,\bigl(Y - g(D, X)\bigr) - \theta$ |
+```{r pipe-table-2, echo = FALSE}
+tibble::tibble(
+  c1 = c("Plug-in (regression imputation)", "Partialling out (PLM)", "AIPW (IRM)"),
+  c2 = c("$g$", "$(\\ell, m)$", "$(g, m)$"),
+  c3 = c("$g(1, X) - g(0, X) - \\theta$", "$\\bigl(Y - \\ell(X) - \\theta\\,(D - m(X))\\bigr)\\,(D - m(X))$", "$g(1, X) - g(0, X) + H(D, X)\\,\\bigl(Y - g(D, X)\\bigr) - \\theta$")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Score", "Nuisance $\\eta$", "$\\psi(W; \\theta, \\eta)$")) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+```
 
 ## Neyman orthogonality {#sec-orthogonality}
 
@@ -724,11 +742,17 @@ $\mathbb{E}[g(1, X) - g(0, X) \mid D = 1]$.
 **Three representations, one orthogonal.** Section 03 wrote the ATE three
 ways. Only one of them can carry a machine learner.
 
-| Representation | $\theta = $ | Nuisance | Derivative at the truth | Orthogonal? |
-|---|---|---|---|---|
-| Regression adjustment | $\mathbb{E}[g(1, X) - g(0, X)]$ | $g$ | $\mathbb{E}[\Delta(1, X) - \Delta(0, X)]$ | no |
-| Inverse propensity weighting | $\mathbb{E}[Y\, H(D, X)]$ | $m$ | $-\mathbb{E}\bigl[Y\,\Delta(X)\,\bigl(\tfrac{D}{m^2} + \tfrac{1 - D}{(1 - m)^2}\bigr)\bigr]$ | no |
-| AIPW | $\mathbb{E}\bigl[g(1, X) - g(0, X) + H(D, X)(Y - g(D, X))\bigr]$ | $(g, m)$ | $0$ in both directions | yes |
+```{r pipe-table-3, echo = FALSE}
+tibble::tibble(
+  c1 = c("Regression adjustment", "Inverse propensity weighting", "AIPW"),
+  c2 = c("$\\mathbb{E}[g(1, X) - g(0, X)]$", "$\\mathbb{E}[Y\\, H(D, X)]$", "$\\mathbb{E}\\bigl[g(1, X) - g(0, X) + H(D, X)(Y - g(D, X))\\bigr]$"),
+  c3 = c("$g$", "$m$", "$(g, m)$"),
+  c4 = c("$\\mathbb{E}[\\Delta(1, X) - \\Delta(0, X)]$", "$-\\mathbb{E}\\bigl[Y\\,\\Delta(X)\\,\\bigl(\\tfrac{D}{m^2} + \\tfrac{1 - D}{(1 - m)^2}\\bigr)\\bigr]$", "$0$ in both directions"),
+  c5 = c("no", "no", "yes")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Representation", "$\\theta = $", "Nuisance", "Derivative at the truth", "Orthogonal?")) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+```
 
 The AIPW representation is the other two glued together so that their
 first-order errors cancel (Section \@ref(sec-orthogonality) and Appendix
@@ -739,11 +763,15 @@ nuisance errors (Section \@ref(sec-rates)): double robustness.
 $\psi = \psi^b - \psi^a \theta$, with $\bar p = \mathbb{P}(D = 1)$ and
 $p_G = \mathbb{P}(G = 1)$ for a group indicator $G$:
 
-| Target | $\psi^b(W; \eta)$ | $\psi^a$ |
-|---|---|---|
-| ATE | $g(1, X) - g(0, X) + H(D, X)\,(Y - g(D, X))$ | $1$ |
-| ATT | $\bigl(D - (1 - D)\,\tfrac{m(X)}{1 - m(X)}\bigr)\,\bigl(Y - g(0, X)\bigr) / \bar p$ | $D / \bar p$ |
-| GATE | $\tfrac{G}{p_G}\,\psi^b_{\text{ATE}}$ | $\tfrac{G}{p_G}$ |
+```{r pipe-table-4, echo = FALSE}
+tibble::tibble(
+  c1 = c("ATE", "ATT", "GATE"),
+  c2 = c("$g(1, X) - g(0, X) + H(D, X)\\,(Y - g(D, X))$", "$\\bigl(D - (1 - D)\\,\\tfrac{m(X)}{1 - m(X)}\\bigr)\\,\\bigl(Y - g(0, X)\\bigr) / \\bar p$", "$\\tfrac{G}{p_G}\\,\\psi^b_{\\text{ATE}}$"),
+  c3 = c("$1$", "$D / \\bar p$", "$\\tfrac{G}{p_G}$")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Target", "$\\psi^b(W; \\eta)$", "$\\psi^a$")) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+```
 
 The ATT score needs only $m$ and $g(0, \cdot)$: the treated arm is never
 imputed. The group score reweights the ATE score by group membership.
@@ -845,11 +873,15 @@ $\hat m$ does not. The simulation shows both effects.
 $\beta_j = \gamma_j = 1/j^2$, $W \sim N(0, I_p)$, $v \sim N(0, 0.25^2)$,
 $\alpha = 1$. Three estimators.
 
-| Estimator | Steps |
-|---|---|
-| Single selection | lasso $Y$ on $(D, W)$; least squares on $D$ and the selected $W$ |
-| Post-double-selection | lasso $Y$ on $W$ and $D$ on $W$; least squares on $D$ and the union of the selections |
-| CV lasso, cross-fitted | `est_dml()` with cross-validated lasso *predictions* as $\hat\ell$ and $\hat m$ |
+```{r pipe-table-5, echo = FALSE}
+tibble::tibble(
+  c1 = c("Single selection", "Post-double-selection", "CV lasso, cross-fitted"),
+  c2 = c("lasso $Y$ on $(D, W)$; least squares on $D$ and the selected $W$", "lasso $Y$ on $W$ and $D$ on $W$; least squares on $D$ and the union of the selections", "\\texttt{est\\_dml()} with cross-validated lasso \\emph{predictions} as $\\hat\\ell$ and $\\hat m$")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Estimator", "Steps")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9) %>%
+  column_spec(2, width = "11.5cm")
+```
 
 ```{r double-lasso-experiment, cache = TRUE, cache.extra = tools::md5sum(helper_path)}
 lasso_results <- run_double_lasso_experiment(
@@ -862,12 +894,10 @@ msq_m_err  <- mean(lasso_results$msq_m_error, na.rm = TRUE)
 ```
 
 ```{r tab-double-lasso, echo = FALSE}
-knitr::kable(
-  lasso_tab,
-  digits = 3,
-  col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean reported SE", "95% coverage"),
-  caption = "Lasso-based estimators, true effect 1, p = n = 100, residual treatment standard deviation 0.25."
-)
+kbl(lasso_tab, booktabs = TRUE, digits = 3, linesep = "", escape = FALSE,
+    col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean reported SE", "95\\% coverage"),
+    caption = "Lasso-based estimators, true effect 1, p = n = 100, residual treatment standard deviation 0.25.") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
 ```
 
 ```{r fig-double-lasso, fig.height = 3, fig.cap = "Single selection loses the confounders that predict the treatment. Post-double-selection keeps them and refits without shrinkage. Shrunken cross-validated lasso predictions fail here because the residual treatment variance is tiny."}
@@ -1071,11 +1101,16 @@ $$
 \widehat{\mathrm{SE}} = \hat\sigma / \sqrt{n}.
 $$
 
-| Score | $\psi^a$ | $\psi^b$ | $\hat J$ estimates |
-|---|---|---|---|
-| Partialling out | $\tilde D^2$ | $\tilde Y \tilde D$ | $\mathbb{E}[\tilde D^2]$, the residual treatment variance |
-| ATE (AIPW) | $1$ | $g(1, X) - g(0, X) + H(D, X)(Y - g(D, X))$ | $1$ |
-| ATT | $D / \bar p$ | $\bigl(D - (1 - D)\tfrac{m}{1 - m}\bigr)(Y - g(0, X)) / \bar p$ | $1$ |
+```{r pipe-table-6, echo = FALSE}
+tibble::tibble(
+  c1 = c("Partialling out", "ATE (AIPW)", "ATT"),
+  c2 = c("$\\tilde D^2$", "$1$", "$D / \\bar p$"),
+  c3 = c("$\\tilde Y \\tilde D$", "$g(1, X) - g(0, X) + H(D, X)(Y - g(D, X))$", "$\\bigl(D - (1 - D)\\tfrac{m}{1 - m}\\bigr)(Y - g(0, X)) / \\bar p$"),
+  c4 = c("$\\mathbb{E}[\\tilde D^2]$, the residual treatment variance", "$1$", "$1$")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Score", "$\\psi^a$", "$\\psi^b$", "$\\hat J$ estimates")) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+```
 
 The Jacobian is where identification strength lives. For the ATE and ATT
 it is one by construction. For the partially linear model it is the
@@ -1233,16 +1268,16 @@ candidate, with the largest errors, is the outlier.
 A DML estimate is only as credible as the nuisances behind it. Report
 the quantities below with every estimate; `est_dml()` returns all of them.
 
-| Diagnostic | What it checks | Where |
-|---|---|---|
-| Cross-fitted RMSE and $R^2$ of each nuisance | rate condition; learner choice | `diagnostics$nuisance` |
-| Residual treatment variance $\mathbb{E}_n[\tilde D^2]$ | identification strength (partially linear) | `diagnostics$identification` |
-| Propensity range, clipped share, effective sample sizes | overlap (interactive) | `diagnostics$propensity`, `diagnostics$weights` |
-| Fold-level estimates | dependence on one partition | `fold_estimates` |
-| Repetition estimates | dependence across partitions | `repetitions` |
-| Estimates across two or three learners | model dependence | rerun; Section \@ref(sec-learners) |
-| In-sample versus cross-fitted residuals | overfitting of external predictions | `cross_fit = FALSE`; Section \@ref(sec-crossfit) |
-| Placebo outcomes, sensitivity analysis | identification | outside the estimator; Section 03 |
+```{r pipe-table-7, echo = FALSE}
+tibble::tibble(
+  c1 = c("Cross-fitted RMSE and $R^2$ of each nuisance", "Residual treatment variance $\\mathbb{E}_n[\\tilde D^2]$", "Propensity range, clipped share, effective sample sizes", "Fold-level estimates", "Repetition estimates", "Estimates across two or three learners", "In-sample versus cross-fitted residuals", "Placebo outcomes, sensitivity analysis"),
+  c2 = c("rate condition; learner choice", "identification strength (partially linear)", "overlap (interactive)", "dependence on one partition", "dependence across partitions", "model dependence", "overfitting of external predictions", "identification"),
+  c3 = c("\\texttt{diagnostics\\$nuisance}", "\\texttt{diagnostics\\$identification}", "\\texttt{diagnostics\\$propensity}, \\texttt{diagnostics\\$weights}", "\\texttt{fold\\_estimates}", "\\texttt{repetitions}", "rerun; Section \\@ref(sec-learners)", "\\texttt{cross\\_fit = FALSE}; Section \\@ref(sec-crossfit)", "outside the estimator; Section 03")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Diagnostic", "What it checks", "Where")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9) %>%
+  column_spec(c(1, 3), width = "5.2cm")
+```
 
 ```{r diagnostics-print}
 fit_plm$diagnostics$nuisance

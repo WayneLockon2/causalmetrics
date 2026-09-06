@@ -1,0 +1,244 @@
+---
+title: "Using causalmetrics for difference-in-differences: from two-by-two to staggered, continuous, and synthetic designs"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using causalmetrics for difference-in-differences: from two-by-two to staggered, continuous, and synthetic designs}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4,
+                      message = FALSE, warning = FALSE)
+library(causalmetrics)
+library(fixest)
+set.seed(1)
+run_honest <- requireNamespace("HonestDiD", quietly = TRUE)
+run_mlr3 <- requireNamespace("mlr3", quietly = TRUE) && requireNamespace("mlr3learners", quietly = TRUE) &&
+  requireNamespace("ranger", quietly = TRUE)
+```
+
+## What the package adds to fixest
+
+`fixest` already estimates every regression a difference-in-differences (DiD)
+analysis needs: the two-by-two, two-way fixed effects (TWFE), event-study
+dummies with `i()`, Sun and Abraham with `sunab()`, and clustered standard
+errors. `causalmetrics` adds the pieces that are not regressions:
+
+| Task | Function |
+|---|---|
+| Group-time effects `ATT(g, t)` with never- or not-yet-treated comparisons, covariates by regression, IPW, or doubly robust scores, influence functions, uniform bands | `att_gt()` |
+| Event-study, cohort, calendar, and overall aggregates with valid inference | `aggregate_att()` |
+| Imputation estimator (Borusyak, Jaravel, Spiess; Gardner) | `did_imputation()` |
+| Why static TWFE fails: Goodman-Bacon decomposition and negative weights | `bacon_decomp()`, `twfe_weights()` |
+| One frame and one plot for all estimators | `event_study_frame()`, `plot_event_study()` |
+| Pre-test power and conditional bias (Roth 2022); HonestDiD inputs | `pretrend_power()`, `honestdid_inputs()` |
+| Randomization inference with few clusters | `did_permutation_test()` |
+| Efficient estimator under random treatment timing (Roth-Sant'Anna) | `staggered_efficient()` |
+| Continuous or multi-valued doses | `att_dose()` |
+| Synthetic DiD weights for a weighted fixest regression | `sdid_weights()`, `sdid_se()`, `plot_sdid()` |
+| A staggered-adoption simulator | `sim_did_panel()` |
+
+All examples use simulated data, so the truth is known.
+
+```{r data}
+dat <- sim_did_panel(n_units = 400, n_periods = 10, groups = c(4, 7), never_share = 0.4,
+                     mu = c(3, 1), x_trend = 0.3, seed = 1)
+head(dat)
+truth <- attr(dat, "att_gt")
+head(truth)
+```
+
+Units in cohort 4 have effects `3 * (e + 1)` at event time `e`, cohort 7 has
+`1 * (e + 1)`, and untreated outcomes trend with `x1`, so parallel trends
+holds only conditional on `x1`.
+
+## The two-by-two in fixest and in att_gt
+
+Take cohort 4 against the never treated in periods 3 and 4. The regression
+coefficient on the interaction and `att_gt()` on that single cell coincide.
+
+```{r two-by-two}
+two <- subset(dat, (g == 4 | g == 0) & time %in% c(3, 4))
+two$post <- as.integer(two$time == 4)
+two$treat <- as.integer(two$g == 4)
+c(fixest = coef(feols(y ~ treat:post | id + time, data = two, cluster = ~id))[["treat:post"]],
+  att_gt = att_gt(two, id = "id", time = "time", group = "g", y = "y", n_boot = 0)$att_gt$att)
+```
+
+## Covariates: regression, IPW, doubly robust
+
+Adding `x1` linearly to the TWFE regression does not recover the effect when
+trends depend on `x1`. The three conditional estimators do. On panel data the
+doubly robust cell equals the ATT score of `est_dml()` on the differenced
+outcome.
+
+```{r covariates}
+truth_44 <- truth$att[truth$group == 4 & truth$time == 4]
+twfe_x <- feols(y ~ treat:post + x1 | id + time, data = two, cluster = ~id)
+fits <- sapply(c("reg", "ipw", "dr"), function(m) {
+  att_gt(two, id = "id", time = "time", group = "g", y = "y", x = "x1", method = m, n_boot = 0)$att_gt$att
+})
+round(c(truth = truth_44, twfe_plus_x = coef(twfe_x)[["treat:post"]], fits), 3)
+```
+
+## Two groups, many periods: event studies
+
+With one cohort, `att_gt()` returns the event-study cells directly. The TWFE
+event-study regression with all leads and lags gives the same numbers when
+the never treated are the only comparison group.
+
+```{r two-group-es}
+one <- subset(dat, g %in% c(0, 7))
+es <- att_gt(one, id = "id", time = "time", group = "g", y = "y", control_group = "never",
+             base_period = "universal", n_boot = 199, seed = 1)
+one$rel <- ifelse(one$g > 0, one$time - one$g, -1000)
+tw <- feols(y ~ i(rel, ref = c(-1, -1000)) | id + time, data = one, cluster = ~id)
+frame <- event_study_frame("att_gt (universal base)" = es, "fixest i()" = tw)
+plot_event_study(frame)
+```
+
+## Staggered adoption: why static TWFE fails
+
+```{r staggered-twfe}
+static <- feols(y ~ treated | id + time, data = dat, cluster = ~id)
+coef(static)[["treated"]]
+bacon <- bacon_decomp(dat, id = "id", time = "time", y = "y", d = "treated")
+bacon$by_type
+w <- twfe_weights(dat, id = "id", time = "time", d = "treated", y = "y")
+c(share_negative = w$share_negative, sum_negative = w$sum_negative)
+```
+
+The "later vs earlier treated" comparisons use already-treated units, whose
+outcomes are still rising, as controls. Their weight is not small.
+
+## Staggered adoption: Callaway-Sant'Anna, Sun-Abraham, imputation
+
+```{r staggered-cs}
+cs <- att_gt(dat, id = "id", time = "time", group = "g", y = "y", x = "x1",
+             control_group = "notyet", n_boot = 199, seed = 1)
+cs
+dyn <- aggregate_att(cs, type = "dynamic", min_e = -4, max_e = 4)
+dyn
+aggregate_att(cs, type = "group")$by
+```
+
+A time-invariant covariate is collinear with the unit effects, so the
+regression-based estimators need it interacted with time; `att_gt()` uses it
+in the cells directly.
+
+```{r staggered-compare}
+dat$x1t <- dat$x1 * dat$time
+sa <- feols(y ~ sunab(g, time) + x1t | id + time, data = dat, cluster = ~id)
+imp <- did_imputation(dat, id = "id", time = "time", group = "g", y = "y", x = "x1t", pre_window = 4)
+dat$rel <- ifelse(dat$g > 0, dat$time - dat$g, -1000)
+tw_all <- feols(y ~ i(rel, ref = c(-1, -1000)) + x1t | id + time, data = dat, cluster = ~id)
+frame <- event_study_frame("Callaway-Sant'Anna" = dyn, "Sun-Abraham" = sa,
+                           "Imputation" = imp, "TWFE event study" = tw_all)
+plot_event_study(subset(frame, event_time >= -4 & event_time <= 4))
+```
+
+The Callaway-Sant'Anna, Sun-Abraham, and imputation curves track the true
+dynamic effects; the TWFE event study does not, because its leads and lags
+are contaminated by the other cohort.
+
+## Assessing parallel trends
+
+`pretrend_power()` asks what linear violation the pre-test would detect and
+what bias survives when the test passes.
+
+```{r pretrends}
+pp <- pretrend_power(dyn, slope = 0.1, n_sim = 2000, seed = 1)
+pp
+```
+
+With HonestDiD installed, `honestdid_inputs()` supplies the coefficients and
+covariance for the sensitivity analysis.
+
+```{r honest, eval = run_honest}
+csu <- att_gt(dat, id = "id", time = "time", group = "g", y = "y", x = "x1",
+              control_group = "notyet", base_period = "universal", n_boot = 0)
+dyn_u <- aggregate_att(csu, type = "dynamic", min_e = -3, max_e = 2, n_boot = 0)
+hi <- honestdid_inputs(dyn_u)
+rm <- HonestDiD::createSensitivityResults_relativeMagnitudes(
+  betahat = hi$betahat, sigma = hi$sigma,
+  numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods,
+  Mbarvec = c(0.5, 1, 1.5), l_vec = HonestDiD::basisVector(1, hi$numPostPeriods)
+)
+rm
+```
+
+## Few treated clusters: randomization inference
+
+```{r permutation}
+small <- sim_did_panel(n_units = 40, n_periods = 8, groups = 5, never_share = 0.6, mu = 2, seed = 2)
+small$state <- small$id
+did_permutation_test(small, id = "id", time = "time", group = "g", y = "y",
+                     cluster = "state", n_perm = 299, seed = 1)
+```
+
+## Random treatment timing
+
+When timing is randomly assigned, `staggered_efficient()` estimates the
+Roth-Sant'Anna efficient estimator; `beta = 1` recovers the
+Callaway-Sant'Anna weighting for comparison.
+
+```{r staggered-efficient}
+rt <- sim_did_panel(n_units = 400, n_periods = 8, groups = c(3, 5, 7), never_share = 0.3, x_select = 0, seed = 5)
+rbind(efficient = staggered_efficient(rt, id = "id", time = "time", group = "g", y = "y",
+                                      estimand = "eventstudy", event_time = 0:2)$estimates[, 1:4],
+      did = staggered_efficient(rt, id = "id", time = "time", group = "g", y = "y",
+                                estimand = "eventstudy", event_time = 0:2, beta = 1)$estimates[, 1:4])
+```
+
+## Continuous treatment
+
+```{r dose}
+n <- 800
+dose <- ifelse(runif(n) < 0.3, 0, runif(n, 0.5, 3))
+dd <- data.frame(id = rep(1:n, each = 2), time = rep(1:2, n), dose = rep(dose, each = 2))
+dd$y <- rep(rnorm(n), each = 2) + 0.5 * dd$time + (dd$time == 2) * (2 * dd$dose - 0.3 * dd$dose^2) + rnorm(2 * n, sd = 0.5)
+ad <- att_dose(dd, id = "id", time = "time", y = "y", dose = "dose", dose_type = "spline", n_bins = 4, n_boot = 99, seed = 1)
+ad
+plot_att_dose(ad, "acr")
+```
+
+The level effects need only parallel trends against the untreated; the
+causal responses need strong parallel trends. The TWFE weights show that the
+same regression coefficient can be read as a non-convex average of level
+effects or a convex average of slopes.
+
+## Synthetic difference-in-differences
+
+`sdid_weights()` solves for the unit and time weights; the estimate is the
+coefficient of a weighted fixest regression.
+
+```{r sdid}
+block <- sim_did_panel(n_units = 40, n_periods = 12, groups = 9, never_share = 0.85, mu = 2, seed = 3)
+sw <- sdid_weights(block, id = "id", time = "time", y = "y", d = "treated")
+sw
+fit_sdid <- feols(y ~ treated | id + time, data = merge(block, sw$cell_weights, by = c("id", "time")), weights = ~weight)
+c(closed_form = sw$estimate, fixest = coef(fit_sdid)[["treated"]])
+sdid_se(sw, method = "placebo", n_reps = 100, seed = 1)[c("estimate", "std.error")]
+plot_sdid(sw)
+```
+
+## Repeated cross-sections and machine-learning nuisances
+
+```{r rcs}
+rcs <- dat[sample(nrow(dat), 2000), ]
+rcs$row <- seq_len(nrow(rcs))
+att_gt(rcs, id = "row", time = "time", group = "g", y = "y", x = "x1", sampling = "rcs",
+       control_group = "never", n_boot = 0)$att_gt[1:4, c("group", "time", "att", "std.error")]
+```
+
+```{r learners, eval = run_mlr3}
+library(mlr3); library(mlr3learners)
+ml <- att_gt(subset(dat, g %in% c(0, 4) & time <= 5), id = "id", time = "time", group = "g", y = "y",
+             x = c("x1", "x2"), learner_p = lrn("classif.ranger", predict_type = "prob", num.trees = 200),
+             learner_or = lrn("regr.ranger", num.trees = 200), folds = 3, seed = 1, n_boot = 0)
+ml$att_gt[, c("group", "time", "att", "std.error")]
+```

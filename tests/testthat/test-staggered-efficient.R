@@ -1,0 +1,53 @@
+sim_random_timing <- function(n = 400, T = 8, groups = c(3, 5, 7), seed = 1, rho = 0.3) {
+  set.seed(seed)
+  g <- sample(c(groups, Inf), n, replace = TRUE)
+  alpha <- rnorm(n, sd = sqrt(rho))
+  y <- outer(alpha, rep(1, T)) + matrix(rnorm(n * T, sd = sqrt(1 - rho)), n) + outer(rep(1, n), seq_len(T) / 4)
+  for (i in seq_len(n)) if (is.finite(g[i])) y[i, seq_len(T) >= g[i]] <- y[i, seq_len(T) >= g[i]] + 1 + 0.5 * (seq_len(T)[seq_len(T) >= g[i]] - g[i])
+  data.frame(id = rep(seq_len(n), each = T), time = rep(seq_len(T), n), g = rep(g, each = T), y = as.vector(t(y)))
+}
+
+test_that("staggered_efficient reproduces staggered::staggered for every estimand", {
+  skip_if_not_installed("staggered")
+  dat <- sim_random_timing()
+  for (est in c("simple", "cohort", "calendar")) {
+    ours <- staggered_efficient(dat, id = "id", time = "time", group = "g", y = "y", estimand = est)
+    ref <- staggered::staggered(dat, i = "id", t = "time", g = "g", y = "y", estimand = est)
+    expect_equal(ours$estimates$estimate, ref$estimate, tolerance = 1e-8, info = est)
+    expect_equal(ours$estimates$std.error, ref$se, tolerance = 1e-6, info = est)
+    expect_equal(ours$estimates$se_neyman, ref$se_neyman, tolerance = 1e-6, info = est)
+  }
+  ours <- staggered_efficient(dat, id = "id", time = "time", group = "g", y = "y", estimand = "eventstudy", event_time = 0:2)
+  ref <- staggered::staggered(dat, i = "id", t = "time", g = "g", y = "y", estimand = "eventstudy", eventTime = 0:2)
+  expect_equal(ours$estimates$estimate, ref$estimate, tolerance = 1e-8)
+  expect_equal(ours$estimates$std.error, ref$se, tolerance = 1e-6)
+  # beta = 1 is the Callaway-Sant'Anna weighting (staggered_cs); beta = 0 the difference in means
+  cs <- staggered_efficient(dat, id = "id", time = "time", group = "g", y = "y", estimand = "simple", beta = 1)
+  ref_cs <- staggered::staggered_cs(dat, i = "id", t = "time", g = "g", y = "y", estimand = "simple")
+  expect_equal(cs$estimates$estimate, ref_cs$estimate, tolerance = 1e-8)
+  expect_equal(cs$estimates$std.error, ref_cs$se, tolerance = 1e-6)
+  dim0 <- staggered_efficient(dat, id = "id", time = "time", group = "g", y = "y", estimand = "simple", beta = 0)
+  expect_equal(dim0$estimates$estimate, dim0$estimates$theta0)
+  expect_equal(dim0$estimates$theta0, cs$estimates$theta0)
+  last <- staggered_efficient(dat, id = "id", time = "time", group = "g", y = "y", estimand = "simple", control = "last")
+  ref_last <- staggered::staggered(dat, i = "id", t = "time", g = "g", y = "y", estimand = "simple", use_last_treated_only = TRUE)
+  expect_equal(last$estimates$estimate, ref_last$estimate, tolerance = 1e-8)
+  expect_equal(last$estimates$std.error, ref_last$se, tolerance = 1e-6)
+})
+
+test_that("efficient estimator is more precise than DiD under weak serial correlation and the FRT runs", {
+  dat <- sim_random_timing(n = 600, rho = 0.05, seed = 2)
+  eff <- staggered_efficient(dat, id = "id", time = "time", group = "g", y = "y", estimand = "simple", n_perm = 99, seed = 1)
+  cs <- staggered_efficient(dat, id = "id", time = "time", group = "g", y = "y", estimand = "simple", beta = 1)
+  expect_lt(eff$estimates$std.error, cs$estimates$std.error)
+  expect_lt(abs(eff$estimates$beta), 0.5)
+  expect_true(eff$estimates$fisher_p.value >= 0 && eff$estimates$fisher_p.value <= 1)
+  expect_lt(eff$estimates$fisher_p.value, 0.05)
+  expect_output(print(eff), "Efficient staggered-rollout")
+  expect_s3_class(tidy(eff), "data.frame")
+  dat0 <- sim_random_timing(n = 300, rho = 0.05, seed = 3)
+  dat0$y <- dat0$y - ifelse(is.finite(dat0$g) & dat0$time >= dat0$g, 1 + 0.5 * (dat0$time - dat0$g), 0)
+  null <- staggered_efficient(dat0, id = "id", time = "time", group = "g", y = "y", estimand = "simple", n_perm = 199, seed = 1)
+  expect_lt(abs(null$estimates$estimate / null$estimates$std.error), 3)
+  expect_gt(null$estimates$fisher_p.value, 0.005)
+})

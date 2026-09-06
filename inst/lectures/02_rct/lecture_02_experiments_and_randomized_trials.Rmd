@@ -10,15 +10,6 @@ output:
     toc_depth: 4
     keep_tex: false
     latex_engine: xelatex
-  rmarkdown::html_vignette:
-    toc: true
-    toc_depth: 3
-    number_sections: true
-    fig_caption: true
-vignette: >
-  %\VignetteIndexEntry{causalmetrics: Experiments and Randomized Trials}
-  %\VignetteEncoding{UTF-8}
-  %\VignetteEngine{knitr::rmarkdown}
 link-citations: true
 ---
 
@@ -33,6 +24,18 @@ knitr::opts_chunk$set(
   message   = FALSE,
   warning   = FALSE
 )
+
+# This lecture lives in inst/lectures/ of the package source. Knitted from the
+# source tree it loads the development version of the package; when the
+# package is installed it uses the installed copy and its helpers.
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_dir <- file.path(pkg_root, "inst", "vignette_helpers")
+} else {
+  library(causalmetrics)
+  helper_dir <- system.file("vignette_helpers", package = "causalmetrics")
+}
 
 optional_packages <- c(
   "dplyr", "ggplot2", "broom", "estimatr", "fixest", "sandwich",

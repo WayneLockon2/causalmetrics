@@ -21,3 +21,6 @@ vignettes/*_cache/
 
 # Stray device output from ad-hoc R runs
 Rplots.pdf
+inst/lectures/**/*_cache/
+inst/lectures/**/*_files/
+inst/lectures/**/*.log

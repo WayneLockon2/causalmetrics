@@ -10,15 +10,6 @@ output:
     toc_depth: 4
     keep_tex: false
     latex_engine: xelatex
-  rmarkdown::html_vignette:
-    toc: true
-    toc_depth: 3
-    number_sections: true
-    fig_caption: true
-vignette: >
-  %\VignetteIndexEntry{causalmetrics: Selection on Observables}
-  %\VignetteEngine{knitr::rmarkdown}
-  %\VignetteEncoding{UTF-8}
 link-citations: true
 ---
 
@@ -35,20 +26,25 @@ knitr::opts_chunk$set(
   warning   = FALSE
 )
 
+# This lecture lives in inst/lectures/ of the package source. Knitted from the
+# source tree it loads the development version of the package; when the
+# package is installed it uses the installed copy and its helpers.
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_dir <- file.path(pkg_root, "inst", "vignette_helpers")
+} else {
+    helper_dir <- system.file("vignette_helpers", package = "causalmetrics")
+}
+
 library(patchwork)
 library(causalmetrics)
 
 # Visualization helpers (live in inst/vignette_helpers/)
-source(system.file("vignette_helpers", 
-                   "03_Selection_on_Observables", 
-                   "causal_estimators_ggplot_template.R", 
-                   package = "causalmetrics"))
+source(file.path(helper_dir, "03_Selection_on_Observables", "causal_estimators_ggplot_template.R"))
 
 # Source the other helper
-source(system.file("vignette_helpers", 
-                   "03_Selection_on_Observables", 
-                   "vignette_helpers_soo.R", 
-                   package = "causalmetrics"))
+source(file.path(helper_dir, "03_Selection_on_Observables", "vignette_helpers_soo.R"))
 ```
 
 # The problem
@@ -481,7 +477,8 @@ enough for consistency. That is the **double robustness** property.
 
 We tell this story two ways. **Series R** (Robinson's view) is more
 geometrically intuitive — it's what the partially-linear DML estimator
-in vignette `04_double_ml` actually computes. **Series A** is the
+in Section 04 (*Doubly Robust Estimation and Double Machine Learning*)
+actually computes. **Series A** is the
 literal AIPW score, which is what `causalmetrics::est_aipw()` runs.
 
 ### Series R: residualize, then regress
@@ -569,7 +566,7 @@ whatever.
 
 ```{r aipw-est}
 # Fit nuisance functions (simple polynomials here; in practice
-# use cross-fitted ML — see vignette 04_double_ml).
+# use cross-fitted ML; see Section 04 on double machine learning).
 ps_model <- glm(treat ~ poly(x, 2), data = df, family = binomial())
 fit_c    <- lm(y ~ poly(x, 2), data = filter(df, treat == 0))
 fit_t    <- lm(y ~ poly(x, 2), data = filter(df, treat == 1))
@@ -598,7 +595,8 @@ ML, the same data points should not be used both to fit a nuisance
 function and to evaluate the score — that re-introduces overfitting bias.
 Cross-fitting splits the sample into folds and uses out-of-fold
 predictions in the score. The full DML workflow lives in
-vignette `04_double_ml`; a brief recipe is in Appendix C of this note.
+Section 04 (*Doubly Robust Estimation and Double Machine Learning*); a
+brief recipe is in Appendix C of this note.
 
 ### When it works, when it breaks
 
@@ -859,8 +857,8 @@ A minimal design pattern for AIPW with flexible nuisance models:
 
 Cross-fitting reduces sensitivity to first-stage overfitting; it does
 *not* create overlap, validate the adjustment set, or remove
-unobserved confounding. The full DML pipeline lives in vignette
-`04_double_ml`.
+unobserved confounding. The full DML pipeline lives in Section 04
+(*Doubly Robust Estimation and Double Machine Learning*).
 
 ---
 
