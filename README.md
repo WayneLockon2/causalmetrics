@@ -64,17 +64,189 @@ plot_event_study(event_study_frame(CS = dyn))       # event study with uniform b
 
 ## Methods in the package
 
-| Area | Main functions |
-|---|---|
-| AIPW / doubly robust (Sec. 03) | `est_aipw()` (ATE/ATT; internal `mlr3` or external out-of-fold nuisances) |
-| Double machine learning (Sec. 04) | `est_dml()` (PLR, IRM; repeated cross-fitting, DML1/DML2), `dml_sensitivity()`, `est_dml_structured()` (Farrell–Liang–Misra structured outcomes, e.g. deep-learning first stages), `bind_scores()` |
-| Instrumental variables (Sec. 05) | `est_dml(model = "pliv"/"iivm")`, `iv_first_stage()` (effective F), `iv_ar_confidence_set()`, `iv_plausibly_exogenous()`, `iv_ate_bounds()`, `complier_profile()`, `late_scores()`/`late_blp()`, `iv_late_weights()`, `leniency_instrument()`, `mte_curve()`, control functions `cf_residuals()`/`cf_bootstrap()`/`cf_ape()`, shift-share `ssiv_rotemberg()`/`ssiv_shock_level()` |
-| Regression discontinuity (Sec. 06) | built on the `rdrobust` family: `rd_plot()`, `rd_bins()`, `rd_checks()` (density, balance + joint test, placebo cutoffs, bandwidth sensitivity, donut), `rd_adjust()` (cross-fitted covariate adjustment), `rd_weak_iv()` (fuzzy + weak), `rd_extrapolate()`, `rd_kink()`, `rd_frame()` |
-| Difference-in-differences (Sec. 07) | `att_gt()` (Callaway–Sant'Anna, DR/reg/IPW, panel/RCS), `aggregate_att()` (dynamic/group/calendar/simple, uniform bands), `did_imputation()`, `staggered_efficient()`, `bacon_decomp()`, `twfe_weights()`, `event_study_frame()`/`plot_event_study()`, `pretrend_power()`, `honestdid_inputs()` (Rambachan–Roth), `did_permutation_test()`, `att_dose()`, synthetic DiD `sdid_weights()`/`sdid_se()` |
-| Heterogeneous effects & policy (Sec. 08) | `dr_scores()` (the shared DR pseudo-outcome, multi-arm via `arms`/`contrast_scores()`), `cate_blp()`/`cate_gate()` (sup-t bands), `cate_learner()` (S/T/X/DR/R), `cate_score()`/`cate_ensemble()` (Q-aggregation), `cate_validate()` (calibration, TOC/QINI/AUTOC matching `grf`), `policy_learn()`/`policy_value()`/`policy_frontier()` |
-| Synthetic control (Sec. 09) | `synth_control()` (levels/demeaned/ridge-augmented, covariates, staggered `treated_units = "separate"`), `synth_placebo()` (space/time), `synth_conformal()`, `synth_spec_test()` (Ferman–Pinto vs DiD), `synth_loo()`, `plot_synth()` |
-| Mediation & mechanisms (Sec. 10) | `mediate_reg()` (g-computation; delta/bootstrap/quasi-Bayesian; parallel mediators; Wheeler S1/S2 shares), `mediate_dml()` (efficient influence function), `mediate_cde()` (sequential g-estimation), `mediate_iv()`, `front_door()`, `gelbach_decomp()`, `mediate_sensitivity()` |
-| Simulators & reporting | `sim_hte()`, `sim_iv()`, `sim_rd()`, `sim_did_panel()`, `sim_synth_panel()`, `sim_mediation()` (known truths in attributes); `table_task()`, `kable_notes()`, `wrap_latex_table()`/`wrap_latex_figure()` |
+Organized by the empirical logic of each design: how the effect is
+estimated, how the identifying assumption is checked, how fragility is
+quantified, and how the estimate is interpreted or decomposed.
+
+### Randomized experiments (Section 02)
+
+By design the package adds little here: estimation and randomization
+inference stay in `estimatr`, `fixest`, `randomizr`, and `ri2`, used
+directly. The package's contribution is downstream, once the ITT stands:
+doubly robust scores with the known propensity for heterogeneity analysis
+(`dr_scores(p_hat = )`), compliance bounds and complier description for
+encouragement designs (`iv_ate_bounds()`, `complier_profile()`), and the
+reporting helpers.
+
+### Selection on observables (Section 03)
+
+- **Estimation.** AIPW for the ATE and ATT (`est_aipw()`), with nuisances
+  fit internally by `mlr3` learners or supplied as out-of-fold predictions
+  from any external stack (including Python).
+- **Design checks before estimates.** The returned object carries the
+  propensity distribution, common support, clipped and trimmed counts, IPW
+  weight tails, and effective sample sizes, so the overlap discussion and
+  the change in target population under trimming are part of the output,
+  not an afterthought.
+- **Sensitivity.** Hidden-confounding bounds by partial R-squared
+  benchmarking (`dml_sensitivity()` on a companion partially linear fit),
+  reporting the confounder strength that would erase the estimate.
+
+### Double machine learning (Section 04)
+
+- **Estimation.** Neyman-orthogonal scores for the partially linear and
+  interactive models (`est_dml()`, PLR/IRM, ATE/ATT), with K-fold
+  cross-fitting, repeated partitions, and both DML1 and DML2 solutions.
+- **Nuisance quality as a first-class output.** Per-nuisance cross-fitted
+  RMSE and fold-level estimate spread are returned, so learners are chosen
+  by fit, never by the estimate they produce.
+- **Structured outcome models.** Debiased contrasts when a flexible first
+  stage (for example a PyTorch network, script included) estimates the
+  unit-level parameters of a known parametric outcome model
+  (`est_dml_structured()`, with the ridge stabilization the saturated-link
+  case requires).
+- **Sensitivity and reuse.** `dml_sensitivity()` for robustness values;
+  `bind_scores()` to carry scores into the heterogeneity toolkit.
+
+### Instrumental variables (Section 05)
+
+- **Estimation.** 2SLS itself stays in `fixest`; the package adds the
+  orthogonal IV scores for many or nonlinear controls
+  (`est_dml(model = "pliv")`) and the doubly robust LATE
+  (`model = "iivm"`), plus control functions for nonlinear second stages
+  (`cf_residuals()`, `cf_bootstrap()`, `cf_ape()`).
+- **Instrument strength.** Conventional, robust, and effective first-stage
+  F (`iv_first_stage()`), and weak-instrument-robust Anderson-Rubin
+  confidence sets that remain valid at any strength
+  (`iv_ar_confidence_set()`, or `weak_iv = TRUE` inside the DML scores).
+- **Exclusion sensitivity.** Bounds under a direct instrument effect
+  (`iv_plausibly_exogenous()`) and bounds from LATE toward the ATE under
+  one-sided compliance (`iv_ate_bounds()`).
+- **Whose effect it is.** Complier shares and characteristics via kappa
+  weighting (`complier_profile()`), per-instrument LATEs with the 2SLS
+  weights that combine them (`iv_late_weights()`), complier-level
+  heterogeneity (`late_scores()`/`late_blp()`), and the marginal treatment
+  effect curve when the policy question sits off the LATE margin
+  (`mte_curve()`).
+- **Constructed instruments.** Leave-one-out judge/examiner leniency
+  (`leniency_instrument()`) and shift-share diagnostics: Rotemberg weights
+  and shock-level equivalence (`ssiv_rotemberg()`, `ssiv_shock_level()`).
+
+### Regression discontinuity (Section 06)
+
+- **Estimation.** The `rdrobust` family is used directly; the package
+  builds the surrounding workflow.
+- **Seeing the design.** Binned RD plots with the estimator's own local
+  fits rather than global polynomials (`rd_plot()`, `rd_bins()`).
+- **Validity battery.** Manipulation (via `rddensity`), covariate balance
+  with a joint test, placebo cutoffs, bandwidth sensitivity, and
+  donut-hole estimates, bundled in one object (`rd_checks()`, or
+  individually: `rd_balance()`, `rd_placebo_cutoffs()`,
+  `rd_sensitivity()`, `rd_donut()`).
+- **Precision and fuzzy designs.** Cross-fitted covariate adjustment that
+  must move the standard error, not the estimate (`rd_adjust()`); for
+  fuzzy designs, the first-stage effective F with an Anderson-Rubin
+  interval when it is weak (`rd_weak_iv()`).
+- **Beyond the sharp jump.** Regression kink designs with the standard
+  four-panel evidence (`rd_kink()`), extrapolation away from the cutoff
+  under an explicit conditional-independence assumption
+  (`rd_extrapolate()`), and a tidy cross-package comparison table
+  (`rd_frame()`).
+
+### Difference-in-differences (Section 07)
+
+- **Estimation.** Group-time effects `ATT(g,t)` with doubly robust,
+  regression, or IPW scores, not-yet-treated or never-treated comparisons,
+  covariates in both nuisances, panels or repeated cross-sections
+  (`att_gt()`); aggregated to event studies, cohort, calendar, or overall
+  effects with simultaneous confidence bands (`aggregate_att()`).
+- **Why not TWFE.** The Goodman-Bacon decomposition of the pooled
+  coefficient into its two-by-two comparisons (`bacon_decomp()`) and the
+  de Chaisemartin-d'Haultfoeuille weights with their negative share
+  (`twfe_weights()`) show what a naive regression would actually average.
+- **Parallel trends, assessed rather than assumed.** Pre-treatment cells
+  with a joint pre-test (inside `att_gt()`); the power of that pre-test
+  against linear violations and the bias an undetected trend would leave
+  (`pretrend_power()`); honest sensitivity intervals and breakdown values
+  under bounded violations (`honestdid_inputs()` feeding the
+  Rambachan-Roth `HonestDiD` machinery); anticipation windows as an
+  explicit option (`anticipation = `).
+- **Placebo and design-based inference.** Permutation tests of adoption
+  timing (`did_permutation_test()`), multiplier-bootstrap bands
+  throughout.
+- **Alternative estimators, one comparison frame.** Imputation
+  (`did_imputation()`), the efficient estimator under random timing
+  (`staggered_efficient()`), synthetic DiD (`sdid_weights()`,
+  `sdid_se()`), continuous doses (`att_dose()`), and Sun-Abraham via
+  `fixest`, all overlaid with `event_study_frame()` and
+  `plot_event_study()`.
+
+### Heterogeneous effects and policy learning (Section 08)
+
+- **One input for everything.** The cross-fitted doubly robust
+  pseudo-outcome (`dr_scores()`), whose conditional mean is the CATE;
+  multi-arm designs via per-arm scores and contrasts
+  (`contrast_scores()`).
+- **Honest summaries first.** Best linear predictor of the CATE and group
+  average effects with simultaneous sup-t bands (`cate_blp()`,
+  `cate_gate()`).
+- **Flexible models, disciplined.** S/T/X/DR/R meta-learners on any
+  `mlr3` learner (`cate_learner()`), compared out of sample by DR loss
+  (`cate_score()`) and combined by Q-aggregation (`cate_ensemble()`).
+- **Validation.** Calibration by predicted-effect groups, targeting
+  curves, and rank-weighted average effects that match `grf` exactly
+  (`cate_validate()`: TOC, QINI, AUTOC).
+- **From effects to decisions.** Empirical-welfare policy trees, linear
+  and budget rules with held-out values against blanket policies
+  (`policy_learn()`, `policy_value()`), and impact-versus-need frontiers
+  for planners with distributional preferences (`policy_frontier()`).
+
+### Synthetic control (Section 09)
+
+- **Estimation.** Donor weights from outcome lags and covariates with
+  equal, regression, or MSPE-optimized predictor weighting; demeaned and
+  ridge-augmented variants; separate fits per treated unit under
+  staggered adoption (`synth_control()`).
+- **Fit quality as identification evidence.** Pre-treatment balance,
+  demeaned-path fit, and weight concentration (effective donors) reported
+  by the object; the Ferman-Pinto specification test against DiD
+  (`synth_spec_test()`).
+- **Inference with one treated unit.** In-space and in-time placebos with
+  MSPE-ratio rank p-values (`synth_placebo()`) and conformal p-values and
+  intervals (`synth_conformal()`).
+- **Fragility.** Leave-one-donor-out refits (`synth_loo()`); the
+  synthetic DiD bridge for panel audiences (`sdid_weights()`,
+  `sdid_se()`).
+
+### Mediation and mechanisms (Section 10)
+
+- **Estimands mapped to assumptions.** Natural direct and indirect
+  effects under sequential ignorability, by parametric g-computation with
+  delta-method, bootstrap, or quasi-Bayesian inference and parallel
+  mediators (`mediate_reg()`, including the Wheeler-style mediated
+  shares), or by the efficient influence function with cross-fitted ML
+  nuisances (`mediate_dml()`).
+- **Sensitivity is part of the estimate.** The indirect effect as a
+  function of the mediator-outcome error correlation, with the value that
+  erases it (`mediate_sensitivity()`).
+- **When sequential ignorability fails.** Controlled direct effects by
+  sequential g-estimation under treatment-induced confounding
+  (`mediate_cde()`); direct/indirect decompositions with an instrumented
+  mediator and its homogeneity check (`mediate_iv()`); front-door
+  identification when treatment-outcome confounding is unobserved
+  (`front_door()`).
+- **Accounting, labelled as accounting.** Order-invariant Gelbach
+  decompositions of coefficient changes (`gelbach_decomp()`), kept
+  distinct from causal mediation.
+
+### Simulators and reporting
+
+Every section has a simulator with known truths stored in attributes
+(`sim_hte()`, `sim_iv()`, `sim_rd()`, `sim_did_panel()`,
+`sim_synth_panel()`, `sim_mediation()`), used by the tests, the lectures'
+Monte Carlos, and the skills' self-checks. Reporting helpers
+(`table_task()`, `kable_notes()`, `wrap_latex_table()`,
+`wrap_latex_figure()`) produce the papers' table conventions.
 
 Every function has a usage vignette; see `browseVignettes("causalmetrics")` or
 [`vignettes/`](vignettes/).
