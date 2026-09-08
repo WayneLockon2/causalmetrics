@@ -190,11 +190,11 @@ The estimators are `estimatr::lm_robust`, `estimatr::iv_robust`,
 dr_scores(data, y, d, x = NULL, p_hat = NULL, learner_mu = NULL,
           type = c("dr","ipw","reg"), folds = 5, seed = NULL, p_clip = c(0.01, 0.99))
 # cross-fitted doubly robust pseudo-outcomes; entry point to hte-policy
-iv_ate_bounds(data, y, d, z, n_boot = 199)     # one-sided compliance bounds
+iv_ate_bounds(data, y, d, z, n_boot = 199)          # one-sided compliance bounds
 complier_profile(data, d, z, covariates, x = NULL)  # who complies (kappa weights)
-table_task(...), kable_notes(...)              # reporting helpers
-sim_hte(n, dgp = "smooth", p_treat = NULL, seed = NULL)
-# columns: y, d, x1..x5, tau_true, p_true; d randomized given p_true
+# table_task(), kable_notes(): reporting helpers
+# Note: sim_hte() draws OBSERVATIONAL assignment (p_true depends on x);
+# for an RCT self-check, randomize d by hand as below.
 ```
 
 ## 7. Self-check
@@ -202,16 +202,20 @@ sim_hte(n, dgp = "smooth", p_treat = NULL, seed = NULL)
 ```r
 library(causalmetrics)
 set.seed(7)
-d <- sim_hte(n = 2000, dgp = "smooth", p_treat = 0.5, seed = 7)
-fit0 <- estimatr::lm_robust(y ~ d, data = d, se_type = "HC2")
-fitx <- estimatr::lm_robust(y ~ d + x1 + x2 + x3, data = d, se_type = "HC2")
-ate_true <- mean(d$tau_true)
-stopifnot(abs(fit0$coefficients["d"] - ate_true) < 3 * fit0$std.error["d"])
-stopifnot(fitx$std.error["d"] <= fit0$std.error["d"] * 1.02)  # adjustment helps or is neutral
-bal <- estimatr::lm_robust(x1 ~ d, data = d, se_type = "HC2")
+n <- 4000
+x1 <- rnorm(n); x2 <- rnorm(n); x3 <- rnorm(n)
+d <- rbinom(n, 1, 0.5)                       # truly randomized
+tau <- 1
+y <- tau * d + x1 + 0.5 * x2^2 + rnorm(n)
+dat <- data.frame(y, d, x1, x2, x3)
+fit0 <- estimatr::lm_robust(y ~ d, data = dat, se_type = "HC2")
+fitx <- estimatr::lm_robust(y ~ d + x1 + x2, data = dat, se_type = "HC2")
+stopifnot(abs(fit0$coefficients["d"] - tau) < 3 * fit0$std.error["d"])
+stopifnot(fitx$std.error["d"] < fit0$std.error["d"])          # adjustment buys precision
+bal <- estimatr::lm_robust(x1 ~ d, data = dat, se_type = "HC2")
 stopifnot(bal$p.value["d"] > 0.001)                            # randomization balanced
-sc <- dr_scores(d, y = "y", d = "d", x = paste0("x", 1:5),
-                p_hat = rep(0.5, nrow(d)), seed = 1)
-stopifnot(abs(mean(sc$scores) - ate_true) < 0.15)
+sc <- dr_scores(dat, y = "y", d = "d", x = c("x1", "x2", "x3"),
+                p_hat = rep(0.5, n), seed = 1)
+stopifnot(abs(mean(sc$score) - tau) < 0.15)
 cat("rct-analysis self-check passed\n")
 ```

@@ -1,5 +1,18 @@
 # causalmetrics (development version)
 
+* Analysis skills in `inst/skills/`: one LLM-loadable workflow per lecture
+  (`rct-analysis`, `selection-on-observables`, `double-ml`, `iv-analysis`,
+  `rd-analysis`, `did-analysis`, `hte-policy`, `synthetic-control`,
+  `mediation-analysis`), a `causalmetrics-router` entry skill mapping question
+  and data shape to a design, and a `package-registry` development-policy
+  skill. Each design skill carries entry checks, a variant decision table, a
+  Do/Look/Judge/Fail workflow, reporting minimums, pitfalls from the
+  replications, inline signatures, and a runnable self-check on simulated
+  data. `dev/check_skills.R` executes every self-check and audits every call
+  in every skill against the package's signatures; blind-test scenarios in
+  `dev/skill_scenarios.md`. The former `empirical-r-analysis` rule lists were
+  replaced (archived under `dev/archive/`).
+
 * Synthetic control: `synth_control()` (outcome lags and covariate
   predictors with equal, regression-based, or MSPE-optimized `V` weights;
   demeaned synthetic control of Ferman and Pinto; simplex, nonnegative, or

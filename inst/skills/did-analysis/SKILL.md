@@ -15,11 +15,14 @@ in parallel, possibly only conditional on covariates.
 
 Data requirements, and the checks to run before anything else:
 
+Templates in this skill use generic names `id`, `time`, `g` (first treated
+period; 0 for never), `d` (0/1 treated-now), `y`; substitute your columns
+(in `sim_did_panel()` output, `d` is the column `treated`).
+
 ```r
-table(table(dat$id))                      # panel balance: rows per unit
-with(dat[!duplicated(dat$id), ], table(g))  # adoption cohorts; g = 0 or NA or Inf for never treated
-with(dat, tapply(d, list(id_treated_once = ave(d, id, FUN = max)), mean))
-any(with(dat, ave(d, id, FUN = function(v) any(diff(v) < 0))))  # reversals must be FALSE
+table(table(dat$id))                        # panel balance: rows per unit
+table(dat$g[!duplicated(dat$id)])           # adoption cohorts; g = 0/NA/Inf = never
+stopifnot(!any(tapply(dat$d, dat$id, function(v) any(diff(v) < 0))))  # no reversals
 ```
 
 - One row per unit and period (or repeated cross-sections; then
@@ -148,8 +151,7 @@ orig <- HonestDiD::constructOriginalCS(betahat = hi$betahat, sigma = hi$sigma,
   numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods, l_vec = l1)
 rm <- HonestDiD::createSensitivityResults_relativeMagnitudes(
   betahat = hi$betahat, sigma = hi$sigma, numPrePeriods = hi$numPrePeriods,
-  numPostPeriods = hi$numPostPeriods, Mbarvec = seq(0.5, 2, 0.25), l_vec = l1,
-  grid.lb = orig$lb - 2 * abs(orig$lb), grid.ub = orig$ub + 2 * abs(orig$ub))
+  numPostPeriods = hi$numPostPeriods, Mbarvec = seq(0.5, 2, 0.25), l_vec = l1)
 ```
 Look: the detectable slope against the effect size; the smallest Mbar at
 which zero enters the interval (breakdown value).
@@ -228,8 +230,10 @@ Never headline a pooled TWFE coefficient.
 
 - Cohorts without a pre-period silently poison everything; drop them first.
 - `honestdid_inputs()` requires `base_period = "universal"` in `att_gt()`.
-- HonestDiD's relative-magnitudes default grid can miss the estimate; pass
-  `grid.lb`/`grid.ub` explicitly.
+- If HonestDiD's relative-magnitudes interval comes back empty or
+  degenerate (older versions with an auto-grid that misses the estimate),
+  pass `grid.lb`/`grid.ub` bracketing the original CI; newer versions
+  auto-grid and emit harmless deprecation warnings if you do.
 - `event_study_frame()` reads fixest coefficients only in `name::value`
   form (use `i()` or `sunab()`, not hand-built dummies).
 - Never-treated units for `fixest::sunab()` need a cohort value beyond the
@@ -251,7 +255,9 @@ att_gt(data, id, time, group, y, x = NULL, method = c("dr","reg","ipw"),
 # returns: $att_gt (cell table), $pretest, $groups; feed to aggregate_att()
 
 aggregate_att(x, type = c("dynamic","group","calendar","simple"),
-              balance_e = NULL, min_e = -Inf, max_e = Inf, na.rm = FALSE)
+              balance_e = NULL, min_e = -Inf, max_e = Inf,
+              n_boot = NULL, boot_weights = NULL, conf_level = NULL,
+              seed = NULL, na.rm = FALSE)   # bootstrap settings default to x's
 # returns: $overall (estimate, std.error, conf.*), $by (per event/group/period,
 # with band.low/band.high uniform bands), $inffunc
 

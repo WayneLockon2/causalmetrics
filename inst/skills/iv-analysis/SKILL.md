@@ -192,6 +192,9 @@ plausibly-exogenous bounds; APEs for nonlinear outcomes.
 - Judge designs: leniency must exclude the own case (`leniency_instrument()`
   does leave-one-out) and balance must be shown across examiners.
 - LATE weights can be negative with multiple instruments; report them.
+- `sim_iv("linear")` excludes the instrument only conditional on nonlinear
+  terms in x1, x2; linear-controls 2SLS is biased there by design (the
+  lecture's flexible-controls teaching point).
 
 ## 6. Function reference
 
@@ -212,10 +215,11 @@ mte_curve(data, y, d, z, x = NULL, method = c("polynomial","local"), degree = 3,
 cf_residuals(data, d, z, x = NULL, family = c("gaussian","probit","logit"), name = "v_hat")
 cf_bootstrap(data, first, second, n_boot = 499, cluster = NULL, ape = NULL)
 cf_ape(fit, data, d, delta = NULL)
-est_dml(..., model = "pliv" or "iivm", z = "z", weak_iv = TRUE)   # see double-ml skill
+# est_dml(model = "pliv") and est_dml(model = "iivm", weak_iv = TRUE): see double-ml skill
 sim_iv(n, dgp = c("linear","weak","late","mte","probit_cf","shift_share","judge"),
        pi = 1, concentration = 10, seed = NULL)
-# linear: y,d,z,x1..x5, attr theta = true coefficient; late: + type, tau_true
+# linear: y,d,z,x1..x5 (attr theta = true coef; exclusion conditional on x1^2, sin(2*x2));
+# weak: x1..x3; late: + type, tau_true; shift_share: s1..s20 shares + b; judge: judge id
 ```
 
 ## 7. Self-check
@@ -224,13 +228,16 @@ sim_iv(n, dgp = c("linear","weak","late","mte","probit_cf","shift_share","judge"
 library(causalmetrics)
 d <- sim_iv(n = 2000, dgp = "linear", seed = 11)
 theta <- attr(d, "theta")
-fs <- iv_first_stage(d, d = "d", z = "z", x = paste0("x", 1:5))
-iv <- fixest::feols(y ~ x1 + x2 + x3 + x4 + x5 | d ~ z, data = d, vcov = "hetero")
+# the design's exclusion holds conditional on nonlinear controls (by construction):
+iv <- fixest::feols(y ~ x1 + x2 + x3 + x4 + x5 + I(x1^2) + I(sin(2 * x2)) | d ~ z,
+                    data = d, vcov = "hetero")
 ct <- fixest::coeftable(iv)["fit_d", ]
 stopifnot(abs(ct["Estimate"] - theta) < 3 * ct["Std. Error"])
+fs <- iv_first_stage(d, d = "d", z = "z", x = paste0("x", 1:5))
 ar <- iv_ar_confidence_set(d, y = "y", d = "d", z = "z", x = paste0("x", 1:5))
-dw <- sim_iv(n = 600, dgp = "weak", concentration = 2, seed = 2)
-arw <- iv_ar_confidence_set(dw, y = "y", d = "d", z = "z", x = paste0("x", 1:5))
-fsw <- iv_first_stage(dw, d = "d", z = "z", x = paste0("x", 1:5))
+stopifnot(!is.null(fs), !is.null(ar))
+dw <- sim_iv(n = 600, dgp = "weak", concentration = 2, seed = 2)   # columns x1..x3 only
+arw <- iv_ar_confidence_set(dw, y = "y", d = "d", z = "z", x = paste0("x", 1:3))
+stopifnot(!is.null(arw))
 cat("strong-F ok, weak design flagged; iv-analysis self-check passed\n")
 ```
