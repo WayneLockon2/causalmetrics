@@ -36,9 +36,11 @@ extra regressors (for instance CATE predictions from another sample).}
 A list of class \code{cm_blp}: \code{coefficients} (term, estimate,
 std.error, statistic, p.value, conf.low, conf.high, band.low,
 band.high), \code{vcov}, \code{crit_val} (simultaneous), \code{inffunc}, the design
-information, and a Wald test that all non-intercept coefficients are
-zero (\code{test_heterogeneity}). \code{\link[=predict]{predict()}} evaluates the curve on new
-data with pointwise and simultaneous bands; \code{\link[=plot_cate_blp]{plot_cate_blp()}} draws it.
+information, \code{r.squared}, \code{adj.r.squared}, and a Wald test that all
+non-intercept coefficients are zero (\code{test_heterogeneity}). \code{\link[=predict]{predict()}}
+evaluates the curve on new data with pointwise and simultaneous bands;
+\code{\link[=plot_cate_blp]{plot_cate_blp()}} draws it. \code{\link[generics:tidy]{tidy()}} and \code{\link[generics:glance]{glance()}} make the object
+usable with \code{modelsummary}.
 }
 \description{
 Regresses the doubly robust pseudo-outcome of \code{\link[=dr_scores]{dr_scores()}} on a

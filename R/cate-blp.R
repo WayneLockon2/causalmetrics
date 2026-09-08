@@ -30,9 +30,11 @@
 #' @return A list of class `cm_blp`: `coefficients` (term, estimate,
 #'   std.error, statistic, p.value, conf.low, conf.high, band.low,
 #'   band.high), `vcov`, `crit_val` (simultaneous), `inffunc`, the design
-#'   information, and a Wald test that all non-intercept coefficients are
-#'   zero (`test_heterogeneity`). [predict()] evaluates the curve on new
-#'   data with pointwise and simultaneous bands; [plot_cate_blp()] draws it.
+#'   information, `r.squared`, `adj.r.squared`, and a Wald test that all
+#'   non-intercept coefficients are zero (`test_heterogeneity`). [predict()]
+#'   evaluates the curve on new data with pointwise and simultaneous bands;
+#'   [plot_cate_blp()] draws it. [tidy()] and [glance()] make the object
+#'   usable with `modelsummary`.
 #'
 #' @references
 #' Semenova, V. and Chernozhukov, V. (2021). Debiased machine learning of
@@ -88,7 +90,11 @@ cate_blp <- function(scores, formula = NULL, data = NULL, conf_level = 0.95,
     Qinv = fit$Qinv, crit_val = cu, crit_pointwise = crit, conf_level = conf_level,
     formula = formula, terms = stats::terms(formula), xlevels = .cm_xlevels(formula, df),
     test_heterogeneity = test, n = fit$n, n_boot = n_boot, seed = seed,
-    residual_sd = stats::sd(fit$residuals), call = match.call()
+    residual_sd = stats::sd(fit$residuals),
+    r.squared = 1 - sum(fit$residuals^2) / sum((scores$score - mean(scores$score))^2),
+    adj.r.squared = 1 - (sum(fit$residuals^2) / max(fit$n - ncol(X), 1)) /
+      (sum((scores$score - mean(scores$score))^2) / (fit$n - 1)),
+    df = ncol(X), call = match.call()
   ), class = "cm_blp")
 }
 

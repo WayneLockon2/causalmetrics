@@ -1,0 +1,1465 @@
+---
+title: "Causal Inference in Economics and Marketing"
+subtitle: "Section 05: Instrumental Variables and Unobserved Confounding"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.2, fig.align = "center", fig.pos = "H",
+  out.width = "95%", collapse = TRUE, comment = "#>"
+)
+# Code and output in footnotesize.
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+# This lecture lives in inst/lectures/05_iv/ of the package source. When
+# knitted from the source tree it loads the development version of the
+# package; when the package is installed it uses the installed helpers.
+helper_rel <- file.path("vignette_helpers", "05_iv", "iv_lecture_helpers.R")
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_path <- file.path(pkg_root, "inst", helper_rel)
+} else {
+  library(causalmetrics)
+  helper_path <- system.file(helper_rel, package = "causalmetrics")
+}
+library(estimatr)
+library(fixest)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(mlr3)
+library(mlr3learners)
+source(helper_path)
+helper_md5 <- tools::md5sum(helper_path)
+sim_md5 <- if (file.exists(file.path(pkg_root, "R", "sim-iv.R"))) tools::md5sum(file.path(pkg_root, "R", "sim-iv.R")) else "installed"
+n_sims_pliv <- 100
+n_sims_late <- 100
+n_sims_weak <- 400
+n_sims_cf <- 200
+fmt <- function(x, digits = 2) formatC(x, digits = digits, format = "f")
+run_mlogit <- requireNamespace("mlogit", quietly = TRUE) && requireNamespace("dfidx", quietly = TRUE)
+x5 <- paste0("x", 1:5)
+```
+
+# When conditioning fails {#sec-problem}
+
+## Two graphs we cannot tell apart
+
+Sections 03 and 04 assumed that, given observed controls, treatment is as
+good as random. Every estimator there, from regression to double machine
+learning, was a way to condition well. None of them helps when a variable
+that drives both the treatment and the outcome is not observed.
+
+The classic example is schooling and earnings. Ability raises schooling and
+raises earnings. Suppose we observe schooling $D$, earnings $Y$, and
+background $X$, but not ability $A$. Two structural models are consistent
+with any joint distribution of $(Y, D, X)$: one in which $D$ causes $Y$, and
+one in which $A$ causes both and $D$ has no effect. No amount of data
+separates them (Chernozhukov et al. 2026, ch. 12). Conditioning on $X$ is
+not enough because $A$ is not in $X$.
+
+The same problem has other names: demand estimation (a demand shock moves
+both price and quantity), program evaluation with self-selection (those who
+expect to gain enroll), and any marketing setting where the firm targets
+the customers it expects to respond.
+
+## What can be said without an instrument {#sec-sensitivity}
+
+In the partially linear model
+$$
+Y = \theta D + \delta A + f_Y(X) + \epsilon_Y, \qquad D = \gamma A + f_D(X) + \epsilon_D,
+$$
+partialling out $X$ and regressing $\tilde Y$ on $\tilde D$ gives
+$\theta + \phi$ with $\phi = \delta\gamma / E[\tilde D^2]$. The bias is
+bounded in terms of two partial $R^2$: how much of the residual variation in
+$\tilde D$ the confounder explains ($R^2_{D \sim A}$), and how much of the
+residual variation in $\tilde Y$ it explains after $\tilde D$
+($R^2_{Y \sim A \mid D}$):
+$$
+\phi^2 = \frac{R^2_{Y\sim A\mid D}\, R^2_{D\sim A}}{1 - R^2_{D\sim A}}
+        \cdot \frac{E[(\tilde Y - \beta \tilde D)^2]}{E[\tilde D^2]}
+$$
+(Chernozhukov et al. 2026, Theorem 12.2.1; Cinelli and Hazlett 2020;
+appendix \@ref(app-ovb)). The second factor is estimated from the DML
+residuals. The first is the analyst's belief about the confounder, often
+benchmarked against the observed controls.
+
+`dml_sensitivity()` applies the bound to a `cm_dml` fit. The running
+"linear" design of this lecture has an unobserved $A$ with $\delta = 1$ and
+$\gamma = 0.8$, so the partialling-out estimate is biased upward.
+
+```{r sensitivity}
+dat <- sim_iv(n = 2000, dgp = "linear", seed = 1)
+rf <- iv_forest()
+fit_plr <- est_dml(dat, "y", "d", x5, learner_l = rf, learner_m = rf, seed = 1)
+sens <- dml_sensitivity(fit_plr, r2_y = 0.10, r2_d = 0.10)
+sens
+```
+
+The estimate is `r fmt(fit_plr$estimate)` for a true effect of 1. A
+confounder that explains 10 percent of the residual variation in both
+variables would move it by `r fmt(sens$bias)`, so the interval of estimates
+consistent with that scenario is
+[`r fmt(sens$bounds[1])`, `r fmt(sens$bounds[2])`]. The robustness value
+says a confounder would need partial $R^2$ of about
+`r fmt(sens$robustness_value[1])` on both sides to bring the estimate to
+zero. In this design the true confounder is that strong. Figure
+\@ref(fig:sensitivity-plot) shows the contours.
+
+```{r sensitivity-plot, echo = FALSE, fig.height = 3.8, fig.cap = "Contours of the omitted-confounder bias bound as a function of the two partial R-squareds. The red contour marks confounders strong enough to bring the estimate to zero."}
+plot_dml_sensitivity(sens, benchmarks = data.frame(r2_d = 0.10, r2_y = 0.10, label = "benchmark"))
+```
+
+Sensitivity analysis tells us how wrong we could be. It does not tell us the
+answer. For that we need a second source of variation.
+
+## Instruments and Wright's path diagram {#sec-wright}
+
+An instrument $Z$ is a variable that moves the treatment but affects the
+outcome only through the treatment. Philip Wright (1928) drew the first
+causal path diagram to make the point: if $Z \to D \to Y$ and $Z$ has no
+other path to $Y$, then the effect of $Z$ on $Y$ equals the effect of $Z$ on
+$D$ times the effect of $D$ on $Y$. Two regressions we can run give the
+product and one factor; the ratio is the effect we want.
+
+Examples that appear in this lecture: an offer to participate (a nudge) as
+an instrument for participation; a supply shifter (weather where the
+product is grown) for price; distance to college for schooling; random
+assignment of judges for incarceration; national industry shocks
+apportioned by local industry shares for local exposure to trade.
+
+The price is a new assumption. Conditional exogeneity said "no unobserved
+confounder of $D$". The exclusion restriction says "no unobserved path from
+$Z$ to $Y$ except through $D$". Whether that is more or less credible
+depends entirely on where $Z$ comes from. When $Z$ is randomized, it is
+credible by design.
+
+## Roadmap
+
+Section \@ref(sec-linear) sets up instrumental variables in the linear
+model and the reporting conventions. Section \@ref(sec-late) asks what IV
+estimates when effects are heterogeneous. Section \@ref(sec-cf) develops
+the control-function approach, which equals two-stage least squares in the
+linear model and extends to nonlinear ones. Section \@ref(sec-orthogonal)
+gives the orthogonal scores that let machine learning handle the controls.
+Section \@ref(sec-weak) treats weak instruments. Section \@ref(sec-many)
+covers several instruments, judges, marginal treatment effects, and
+constructed instruments. Section \@ref(sec-platforms) turns to
+experiments and platforms, Section \@ref(sec-traps) to traps, Section
+\@ref(sec-practice) to the replications. The appendix holds the proofs.
+
+# Instrumental variables in the linear model {#sec-linear}
+
+## Relevance, exclusion, and the Wald ratio
+
+Take the structural equation $Y = \alpha + \theta D + e$ with
+$\mathrm{Cov}(D, e) \neq 0$. An instrument $Z$ satisfies
+
+- **relevance**: $\mathrm{Cov}(Z, D) \neq 0$, and
+- **exogeneity with exclusion**: $\mathrm{Cov}(Z, e) = 0$.
+
+Then $\mathrm{Cov}(Z, Y) = \theta\,\mathrm{Cov}(Z, D)$, so
+$$
+\theta = \frac{\mathrm{Cov}(Z, Y)}{\mathrm{Cov}(Z, D)}
+       = \frac{E[Y \mid Z = 1] - E[Y \mid Z = 0]}{E[D \mid Z = 1] - E[D \mid Z = 0]}
+$$
+for a binary instrument: the Wald ratio, reduced form over first stage. In
+an encouragement design the numerator is the intention-to-treat effect and
+the denominator is the compliance rate; the ratio rescales the ITT to the
+effect of the treatment itself.
+
+## Two-stage least squares {#sec-2sls}
+
+With controls $X$ and one or more instruments, two-stage least squares
+(2SLS) regresses $D$ on $(Z, X)$, forms $\hat D$, and regresses $Y$ on
+$(\hat D, X)$. Equivalently, it solves the moment condition
+$E[(Y - \alpha - \theta D - X'\beta)\,(Z, X)] = 0$. Three facts to keep in
+mind.
+
+- The second-stage OLS standard errors are wrong, because they use
+  residuals computed with $\hat D$ rather than $D$. Software reports the
+  correct ones; hand-rolled two stages do not.
+- With more instruments than endogenous regressors the model is
+  overidentified and 2SLS combines the instruments with weights from the
+  first stage (Section \@ref(sec-many-weights)).
+- "Endogenous" is a statement about a structural error, not about
+  correlation in the data. It is meaningful only once the structural
+  equation is written down.
+
+The running design has one instrument, five covariates, and a true effect of
+1. The instrument is excluded conditional on $h(x) = 0.5 x_1^2 + 0.5\sin(2x_2)$,
+which also enters the outcome; in this section we include the two terms as
+controls, as an analyst who knew the functional form would. Section
+\@ref(sec-orthogonal) drops that knowledge. Every regression an applied
+paper reports appears in one table.
+
+```{r tsls}
+dat$x1sq <- dat$x1^2
+dat$s2x2 <- sin(2 * dat$x2)
+xc <- c("x1sq", "s2x2", "x3", "x4", "x5")
+ols <- lm_robust(y ~ d + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+first <- lm_robust(d ~ z + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+reduced <- lm_robust(y ~ z + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+tsls <- iv_robust(y ~ d + x1sq + s2x2 + x3 + x4 + x5 | z + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+```
+
+```{r tab-tsls, echo = FALSE}
+tibble(
+  Regression = c("OLS: y on d, X", "First stage: d on z, X", "Reduced form: y on z, X", "2SLS: y on d, X (z instrument)"),
+  Coefficient = c("d", "z", "z", "d"),
+  Estimate = c(coef(ols)[["d"]], coef(first)[["z"]], coef(reduced)[["z"]], coef(tsls)[["d"]]),
+  SE = c(ols$std.error[["d"]], first$std.error[["z"]], reduced$std.error[["z"]], tsls$std.error[["d"]])
+) %>%
+  mutate(across(c(Estimate, SE), ~ fmt(.x, 3))) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "The four regressions to report. True effect 1. The Wald ratio of the two middle rows equals the 2SLS row.") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+OLS is biased upward by the confounder, as Section \@ref(sec-sensitivity)
+anticipated. The 2SLS estimate is close to 1 with a standard error about
+`r fmt(tsls$std.error[["d"]] / ols$std.error[["d"]], 1)` times the OLS one:
+the price of using only the variation the instrument induces.
+
+## Standard errors {#sec-se}
+
+Report heteroskedasticity-robust standard errors by default and cluster at
+the level at which the instrument varies (a policy that varies by state,
+weather that varies by market-day, a judge assigned to a court-year cell).
+`iv_robust()` and `feols()` do both. With `fixest`:
+
+```{r fixest}
+fe <- feols(y ~ x1sq + s2x2 + x3 + x4 + x5 | d ~ z, data = dat, vcov = "hetero")
+coeftable(fe)["fit_d", ]
+fitstat(fe, type = c("ivf", "ivwald"))
+```
+
+## Overidentification and endogeneity tests {#sec-tests}
+
+With more instruments than endogenous regressors, the Sargan-Hansen test
+asks whether the instruments give compatible estimates. A rejection means
+that at least one instrument violates exclusion, *or* that the instruments
+identify different effects for different people (Section
+\@ref(sec-late)). A non-rejection with instruments that share a bias is
+uninformative. Treat it as a test of the homogeneous-effect functional form
+rather than as a license.
+
+The Wu-Hausman test compares OLS and 2SLS. It tests whether endogeneity
+matters, not whether the instrument is valid, and has low power when the
+instrument is weak (2SLS then drifts toward OLS). Section \@ref(sec-cf)
+shows it is the t test on the control function.
+
+## Reporting {#sec-reporting}
+
+A first stage, a reduced form, and the IV estimate, always together, with
+the same controls and the same sample. The reader needs the first stage to
+judge relevance and the reduced form to see the raw effect of the
+instrument; a paper whose abstract does not say what the instrument is and
+why it is excluded has usually not thought hard about either.
+
+Wayne's earlier note on Oreopoulos (2006) is the template: a change in the
+minimum school-leaving age in Britain (1947) and Northern Ireland (1957)
+instruments years of schooling in a regression of log earnings, with a
+quartic in birth cohort as controls. Its Table 1 reports the first stage
+(the jump in years of schooling at the reform cohort), the reduced form
+(the jump in earnings), and the IV ratio side by side, for each country and
+pooled with a country fixed effect. That table structure is what to imitate.
+
+# Heterogeneous effects: what IV estimates {#sec-late}
+
+## Potential outcomes indexed by the instrument
+
+Let $D(z)$ be the treatment a unit would take under instrument value $z$
+and $Y(d)$ the outcome under treatment $d$. With a binary instrument and a
+binary treatment, each unit is one of four types (Imbens and Angrist 1994):
+
+| $D(0)$ | $D(1)$ | Type |
+|---|---|---|
+| 0 | 1 | complier |
+| 1 | 1 | always-taker |
+| 0 | 0 | never-taker |
+| 1 | 0 | defier |
+
+The LATE assumptions are: (i) independence, $Z \perp (Y(0), Y(1), D(0), D(1))$
+(conditionally on $X$ if needed); (ii) exclusion, $Y$ depends on $Z$ only
+through $D$; (iii) relevance, $P(D(1) = 1) \neq P(D(0) = 1)$; (iv)
+monotonicity, no defiers. Monotonicity is natural when the instrument is an
+offer of something people want, and much less natural when the instrument is
+an assigned decision maker, since two judges need not order every defendant
+the same way (Section \@ref(sec-judges)).
+
+## The LATE theorem {#sec-late-theorem}
+
+Under (i)-(iv),
+$$
+\frac{E[Y \mid Z = 1] - E[Y \mid Z = 0]}{E[D \mid Z = 1] - E[D \mid Z = 0]}
+= E\big[Y(1) - Y(0) \mid D(1) > D(0)\big],
+$$
+the average effect among compliers. *Skeleton.* By independence and
+exclusion the numerator is $E[Y(D(1)) - Y(D(0))] = E[(Y(1) - Y(0))(D(1) - D(0))]$.
+The difference $D(1) - D(0)$ is $1$ for compliers, $0$ for always- and
+never-takers, and $-1$ for defiers; without defiers the numerator is the
+complier effect times the complier share. The denominator is the complier
+share. Divide (appendix \@ref(app-late)).
+
+Three consequences.
+
+- The IV estimand is not the ATE. It is the effect for the units the
+  instrument moves. Different instruments move different people and
+  estimate different LATEs; overidentification tests can reject for that
+  reason alone.
+- The complier share is estimable (the first stage), and so are the
+  compliers' characteristics (Section \@ref(sec-compliers)), even though no
+  individual complier can be named.
+- With a continuous or multi-valued instrument, IV is a weighted average of
+  effects for the units moved at each margin (Sections \@ref(sec-many-weights)
+  and \@ref(sec-mte)).
+
+## IV as a compliance-weighted average {#sec-weighted}
+
+With heterogeneous effects $\beta_i$ and individual compliance
+$\pi_i = P(D_i = 1 \mid Z_i = 1) - P(D_i = 1 \mid Z_i = 0)$, the Wald ratio
+converges to $E[\pi_i \beta_i] / E[\pi_i]$: units the instrument moves more
+get more weight. It equals the ATE if effects are homogeneous or if
+$\beta_i$ is uncorrelated with $\pi_i$. When treatment is only available
+through the instrument ($\pi_i = p_{1i}$), the units most likely to take it
+up when offered carry the weight; if those are the units with the largest
+gains, IV exceeds the ATE. When treatment is compulsory under $Z = 1$ and
+voluntary otherwise ($\pi_i = 1 - p_{0i}$), the sign reverses.
+
+The running "late" design makes this concrete: compliers have effect
+$2 + x_1$, always-takers $3 + x_1$, never-takers $0.5 + x_1$. The population
+ATE and the LATE differ.
+
+```{r late-design}
+dl <- sim_iv(n = 4000, dgp = "late", seed = 2)
+c(late = attr(dl, "late"), ate = attr(dl, "ate"), complier_share = attr(dl, "complier_share"))
+wald <- iv_robust(y ~ d | z, data = dl)
+c(wald = coef(wald)[["d"]], se = wald$std.error[["d"]])
+```
+
+The Wald estimate is the LATE, not the ATE, and nothing in the data would
+reveal the always-takers' larger effect.
+
+## Who the compliers are {#sec-compliers}
+
+Abadie (2003) shows that the weights
+$$
+\kappa_i = 1 - \frac{D_i (1 - Z_i)}{1 - \pi(X_i)} - \frac{(1 - D_i) Z_i}{\pi(X_i)},
+\qquad \pi(X) = P(Z = 1 \mid X),
+$$
+average to the complier share and that $E[\kappa\, g(X)] / E[\kappa]$ is the
+complier mean of any function of $X$. The intuition: units with $D = 1,
+Z = 0$ are always-takers and units with $D = 0, Z = 1$ are never-takers;
+subtracting them (with inverse-propensity weights that undo the assignment
+of $Z$) leaves compliers. The same logic gives the always-taker and
+never-taker means. `complier_profile()` reports the table.
+
+```{r compliers}
+cp <- complier_profile(dl, d = "d", z = "z", covariates = c("x1", "x2"), x = "x1", n_boot = 199, seed = 1)
+cp
+```
+
+```{r compliers-truth, echo = FALSE}
+truth_cp <- c(mean(dl$x1[dl$type == "complier"]), mean(dl$x2[dl$type == "complier"]))
+```
+
+The complier means of $x_1$ and $x_2$ are `r fmt(cp$table$compliers[1])`
+and `r fmt(cp$table$compliers[2])`; the true values in the simulation are
+`r fmt(truth_cp[1])` and `r fmt(truth_cp[2])`. This is the table to report
+whenever a LATE is the headline: it tells the reader for whom the effect was
+estimated, which is the first step in arguing whether it extrapolates.
+
+## Conditional LATE with covariates {#sec-conditional-late}
+
+When independence holds only conditionally on $X$, the conditional Wald
+ratio identifies the conditional LATE at each $x$, and the unconditional
+LATE is the ratio of averages (Frölich 2007; Chernozhukov et al. 2026,
+Theorem 12.4.1):
+$$
+\theta = \frac{E\{E[Y \mid Z = 1, X] - E[Y \mid Z = 0, X]\}}{E\{E[D \mid Z = 1, X] - E[D \mid Z = 0, X]\}},
+$$
+the ATE of $Z$ on $Y$ over the ATE of $Z$ on $D$. Two-stage least squares
+with linear controls is *not* this estimand: it is the linear projection
+version, which coincides only when both the reduced form and the first stage
+are linear and additively separable in $X$ and the compliance does not vary
+with $X$. Section \@ref(sec-late-score) estimates the ratio of averages with
+doubly robust scores for each ATE and shows the difference in a Monte Carlo.
+
+## Testing the assumptions and bounding the ATE {#sec-tests-bounds}
+
+Independence and monotonicity together imply inequalities on the observed
+distribution (Kitagawa 2015; Mourifié and Wan 2017): for any set $A$,
+$P(Y \in A, D = 1 \mid Z = 1) \ge P(Y \in A, D = 1 \mid Z = 0)$ and
+$P(Y \in A, D = 0 \mid Z = 0) \ge P(Y \in A, D = 0 \mid Z = 1)$. A
+violation refutes the model; the absence of a violation does not confirm
+it. Report the test when the instrument is not randomized.
+
+The LATE assumptions point-identify only the complier effect. For a binary
+outcome, independence alone bounds the ATE for everyone: the instrument
+gives two sets of no-assumption bounds on $E[Y(1)]$ and $E[Y(0)]$, one per
+instrument value, and their intersection is valid (Manski 1990; Balke and
+Pearl 1997 give the sharp version). `iv_ate_bounds()` computes the
+intersection bounds.
+
+```{r bounds}
+dl$y_binary <- as.integer(dl$y > 1)
+iv_ate_bounds(dl, "y_binary", "d", "z", n_boot = 199, seed = 1)
+```
+
+The bounds without the instrument have width one; the instrument narrows
+them without any monotonicity assumption. When the policy question is
+"treat everyone", this is the honest answer, and the LATE is a point
+inside it.
+
+# Control functions {#sec-cf}
+
+## The idea
+
+Two-stage least squares removes endogeneity by projection: it keeps only
+the part of $D$ that the instrument predicts. A control function removes it
+by conditioning: it adds to the outcome equation the part of $D$ the
+instrument does *not* predict. Write the first stage as
+$D = g(Z, X) + V$. If the dependence between $D$ and the structural error
+$U$ runs entirely through $V$,
+$$
+E[U \mid D, Z, X] = E[U \mid V],
+$$
+then conditioning on $V$ makes $D$ exogenous. $V$ is not observed, but its
+estimate, the first-stage residual $\hat V$, is. Put $\hat V$ in the second
+stage as an extra regressor. That regressor is the control function
+(Heckman and Robb 1985; Wooldridge 2015).
+
+The condition is stronger than what 2SLS needs. 2SLS needs
+$E[U Z] = 0$; the control function needs $V$ independent of $(Z, X)$, or at
+least $E[U \mid V, Z, X] = E[U \mid V]$ with a known (usually linear) form.
+In exchange it identifies the structural function and works in models where
+"plug in the fitted value" has no meaning.
+
+## Linear model: the same number as 2SLS {#sec-cf-linear}
+
+In the linear model, OLS of $Y$ on $(D, X, \hat V)$ gives exactly the 2SLS
+coefficient on $D$, just- or over-identified. *Skeleton.* $D = \hat D + \hat V$
+where $\hat D$ is the first-stage fitted value. Including $\hat V$ as a
+regressor is the same as including $\hat D$ and $\hat V$ (a reparameterization).
+By Frisch-Waugh-Lovell, the coefficient on $D$ in that regression is the
+coefficient on $\hat D$ after partialling out $\hat V$ and $X$; $\hat D$ is
+orthogonal to $\hat V$ by construction, so this is the regression of $Y$ on
+$\hat D$ and $X$, which is 2SLS (appendix \@ref(app-cf)).
+
+```{r cf-linear}
+cf <- cf_residuals(dat, d = "d", z = "z", x = xc)
+cf_ols <- lm_robust(y ~ d + x1sq + s2x2 + x3 + x4 + x5 + v_hat, data = cf)
+c(control_function = coef(cf_ols)[["d"]], tsls = coef(tsls)[["d"]])
+tidy(cf_ols)[tidy(cf_ols)$term == "v_hat", c("estimate", "std.error", "statistic", "p.value")]
+```
+
+The coefficient on $\hat V$ is the endogeneity parameter, and its t test is
+the Wu-Hausman test of Section \@ref(sec-tests). The standard error on
+$D$ printed by the second-stage regression is *not* the 2SLS standard error:
+$\hat V$ is a generated regressor, and the naive formula ignores its
+sampling variation. It is correct under the null of no endogeneity, which
+is why the t test on $\hat V$ is fine, and wrong otherwise. Use the 2SLS
+standard errors, or bootstrap both stages (Section \@ref(sec-cf-inference)).
+
+## Nonlinear outcomes {#sec-cf-nonlinear}
+
+Now let the outcome be binary, $Y = \mathbb{1}\{\alpha + \theta D + X'\beta + U > 0\}$,
+with $U$ correlated with $D$. Two temptations and one fix.
+
+- **Naive probit** of $Y$ on $(D, X)$ ignores the endogeneity.
+- **The forbidden regression** runs the probit on $(\hat D, X)$. It is wrong
+  because $E[\Phi(\alpha + \theta D + \cdots) \mid Z, X] \neq \Phi(\alpha + \theta \hat D + \cdots)$:
+  the nonlinearity does not pass through the expectation.
+- **The control function** (Rivers and Vuong 1988) runs the probit on
+  $(D, X, \hat V)$. Under joint normality of $(U, V)$, $U = \rho V + \varepsilon$
+  with $\varepsilon$ independent of everything, so conditioning on $V$
+  restores a probit with a rescaled index.
+
+The coefficients of the control-function probit are scaled by
+$\sigma_{U \mid V}$, so they are not comparable to the naive ones. The object
+to report is the average partial effect (APE), computed from the average
+structural function $\mathrm{ASF}(d, x) = E_V[\Phi(\alpha + \theta d + x'\beta + \rho V)]$,
+averaging over the empirical distribution of $\hat V$ (Blundell and Powell
+2004). `cf_ape()` does the averaging; Poisson, tobit, and fractional
+responses use the same recipe.
+
+```{r cf-probit-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, sim_md5, n_sims_cf)}
+cf_mc <- run_cf_experiment(n_sims = n_sims_cf, n = 2000, rho = 0.6, seed = 3)
+cf_tab <- cf_mc %>% group_by(estimator) %>%
+  summarise(bias = mean(ape - truth), sd = sd(ape), rmse = sqrt(mean((ape - truth)^2)), .groups = "drop") %>%
+  mutate(estimator = factor(estimator, levels = c("Naive probit", "Forbidden regression", "Control function"))) %>%
+  arrange(estimator)
+```
+
+```{r tab-cf, echo = FALSE}
+cf_tab %>% mutate(across(c(bias, sd, rmse), ~ fmt(.x, 4))) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Estimator", "Bias", "SD", "RMSE"),
+      caption = paste0("Average partial effect of an endogenous continuous regressor in a probit model, ",
+                       n_sims_cf, " simulations, n = 2000, error correlation 0.6. The truth is the average derivative of the structural probability.")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+```{r cf-probit-numbers, echo = FALSE}
+pick_cf <- function(e, col) cf_tab[[col]][cf_tab$estimator == e]
+```
+
+The naive probit's APE is biased by `r fmt(pick_cf("Naive probit", "bias"), 3)`
+on a truth of about 0.15, half again too large. The forbidden regression
+has bias `r fmt(pick_cf("Forbidden regression", "bias"), 3)` here, which
+is small because the design is close to linear in the index; it is not a
+consistent estimator and can be far off when the nonlinearity matters. The
+control function has bias `r fmt(pick_cf("Control function", "bias"), 3)`.
+
+## Binary endogenous regressor {#sec-cf-binary}
+
+When $D$ is binary, a linear first stage is not a structural equation and
+its residual is not the right control: $D - \hat p$ is a function of the
+same threshold-crossing error for two different reasons. Three options.
+
+- A **bivariate probit** models $(D, Y)$ jointly with normal errors. It
+  identifies the ATE, but the normality does all the work.
+- A **generalized residual** from a probit first stage,
+  $D \lambda(z'\hat\gamma) - (1 - D)\lambda(-z'\hat\gamma)$ with $\lambda$
+  the inverse Mills ratio, is the control function under the
+  threshold-crossing model (Wooldridge 2015, Section 5);
+  `cf_residuals(family = "probit")` returns it.
+- **Give up the ATE** and report the LATE (Section \@ref(sec-late)) or
+  the marginal treatment effect curve (Section \@ref(sec-mte)), which is
+  the control-function method with the propensity score as the control and
+  no functional-form assumption on how $U$ depends on it.
+
+```{r cf-generalized}
+dp <- sim_iv(3000, dgp = "probit_cf", rho = 0.6, seed = 4)
+dp$d_binary <- as.integer(dp$d > 0)
+gr <- cf_residuals(dp, d = "d_binary", z = "z", x = "x1", family = "probit")
+summary(gr$v_hat)
+```
+
+## Heterogeneous effects {#sec-cf-heterogeneous}
+
+With a random coefficient, $Y = \alpha + \beta_i D + X'\gamma + U$, the
+control function needs an extra term. If $E[\beta_i \mid V] = \bar\beta + \psi V$,
+then $E[Y \mid D, X, V] = \alpha + \bar\beta D + \psi D V + X'\gamma + \rho V$:
+include $\hat V$ and $D \hat V$ (Garen 1984; the correlated random
+coefficient model). The coefficient on $D$ is the average effect. Heckman's
+(1979) selection correction is the same idea for a binary selection
+equation: the inverse Mills ratio is the control function. And the marginal
+treatment effect of Section \@ref(sec-mte) is what remains when the
+dependence of $U$ on the control is left unrestricted.
+
+```{r cf-garen}
+cf_g <- lm_robust(y ~ d + x1sq + s2x2 + x3 + x4 + x5 + v_hat + d:v_hat, data = cf)
+tidy(cf_g)[tidy(cf_g)$term %in% c("d", "v_hat", "d:v_hat"), c("term", "estimate", "std.error")]
+```
+
+In the running design the effect is homogeneous, so the interaction is
+zero within sampling error and the coefficient on $D$ does not move.
+
+## Dynamics and demand {#sec-cf-demand}
+
+Two applications from the replications show the reach of the method.
+
+- **Accumulated exposure.** Hsieh et al. (2026) estimate the effect of
+  television advertising on purchases with an ad stock
+  $AS_{it} = \sum_l \lambda^l A_{i,t-l}$. Their instrument is realized minus
+  expected exposure (Section \@ref(sec-exposure)); the first-stage residuals
+  are accumulated into a control-function stock
+  $CFS_{it} = \sum_l \lambda_{CF}^l \hat\varepsilon_{i,t-l}$ that enters the
+  purchase model. The endogenous variable accumulates, so the control does
+  too.
+- **Price in discrete choice.** Petrin and Train (2010) put the residual
+  of a regression of price on cost shifters into the utility of a
+  multinomial logit. The vignette `usage_iv` simulates markets with an
+  unobserved quality shock that raises both price and demand and shows the
+  naive logit halving the price coefficient while the control function
+  recovers it. This is the workhorse for price endogeneity in marketing
+  when instruments exist at the product-market level but the demand model
+  is nonlinear.
+
+## Inference for two-step estimators {#sec-cf-inference}
+
+Every control-function estimator has a generated regressor. Second-stage
+standard errors that treat $\hat V$ as data understate uncertainty unless
+the endogeneity parameter is zero. Two fixes: the Murphy-Topel correction,
+which needs the two scores, or a bootstrap of both stages, which needs
+nothing. `cf_bootstrap()` re-runs a user-supplied first and second stage on
+pairs (or clusters) of observations and reports standard errors and
+percentile intervals for coefficients and APEs.
+
+```{r cf-bootstrap}
+first_stage <- function(df) cf_residuals(df, d = "d", z = "z", x = "x1")
+second_stage <- function(df) glm(y ~ d + x1 + v_hat, data = df, family = binomial("probit"))
+cf_bootstrap(dp, first_stage, second_stage, n_boot = 199, seed = 1,
+             ape = function(fit, df) cf_ape(fit, df, d = "d"))
+c(true_ape = attr(dp, "ape"))
+```
+
+Cluster the bootstrap at the level at which the instrument varies. When the
+first stage is estimated at a coarser level than the second (prices at the
+product-market level, choices at the consumer level), resample at the
+coarser level, as the vignette's demand example does.
+
+# Orthogonal scores for IV {#sec-orthogonal}
+
+## Partially linear IV {#sec-pliv}
+
+Return to the partially linear model with an instrument,
+$$
+Y = \theta D + f_Y(X) + U, \qquad E[U Z \mid X] = 0,
+$$
+where the controls $X$ enter through an unknown function. Partial out $X$
+from everything: $\tilde Y = Y - E[Y \mid X]$, $\tilde D = D - E[D \mid X]$,
+$\tilde Z = Z - E[Z \mid X]$. Then $E[(\tilde Y - \theta \tilde D)\tilde Z] = 0$
+and
+$$
+\theta = \frac{E[\tilde Y \tilde Z]}{E[\tilde D \tilde Z]},
+$$
+Wright's ratio on residualized variables (Chernozhukov et al. 2026,
+Theorem 12.3.1). The moment $\psi(W; \theta, \eta) = (Y - \ell(X) - \theta(D - r(X)))(Z - m(X))$
+with nuisances $\eta = (\ell, r, m)$ is Neyman orthogonal: its derivative
+with respect to each nuisance vanishes at the truth (appendix
+\@ref(app-orthogonal-iv)). So the recipe of Section 04 applies: cross-fit
+the three regressions with any learner, form the residuals, and run IV on
+them. Standard errors are those of IV on the residuals. The score needs all
+three nuisances to converge at $n^{-1/4}$; there is no pair of nuisances
+that protects against the failure of the third, so this is orthogonal but
+not doubly robust.
+
+What does $\theta$ mean when the outcome model is nonlinear? Chernozhukov
+et al. (2026, Theorems 12.3.2-12.3.3) show the ratio identifies the average
+marginal effect $E[\partial_d Y(d)]$ if either the effect of $D$ or the
+effect of $Z$ on $D$ is homogeneous in the unobservable. When both vary
+with the unobservable, the ratio is a weighted average of effects, as in
+Section \@ref(sec-weighted), and the LATE machinery of Section
+\@ref(sec-late-score) is the right description.
+
+## Code and a Monte Carlo {#sec-pliv-code}
+
+In the running design the instrument is excluded only conditional on
+$h(x) = 0.5 x_1^2 + 0.5 \sin(2 x_2)$, which also enters the outcome. Linear
+controls leave part of $h$ in the error, and the residualized instrument is
+correlated with it.
+
+```{r pliv-fit}
+pliv_lin <- est_dml(dat, "y", "d", x5, z = "z", model = "pliv", seed = 1)
+pliv_rf <- est_dml(dat, "y", "d", x5, z = "z", model = "pliv",
+                   learner_l = rf, learner_m = rf, learner_z = rf, seed = 1, weak_iv = TRUE)
+pliv_rf
+rbind(linear = tidy(pliv_lin)[, c("estimate", "std.error")], forests = tidy(pliv_rf)[, c("estimate", "std.error")])
+```
+
+```{r pliv-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, sim_md5, n_sims_pliv)}
+pliv_mc <- run_pliv_experiment(n_sims = n_sims_pliv, n = 2000, seed = 2)
+pliv_tab <- summarise_experiment(pliv_mc, truth = 1) %>%
+  mutate(estimator = factor(estimator, levels = c("OLS", "2SLS, linear controls", "DML-IV, forests"))) %>%
+  arrange(estimator)
+```
+
+```{r tab-pliv, echo = FALSE}
+pliv_tab %>% mutate(across(c(bias, sd, rmse, mean_se, coverage), ~ fmt(.x, 3))) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean SE", "95\\% coverage"),
+      caption = paste0("Partially linear IV design with a nonlinear confounder path; true effect 1; n = 2000; ",
+                       n_sims_pliv, " simulations.")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+```{r fig-pliv, echo = FALSE, fig.height = 3.2, fig.cap = "Sampling distributions of the three estimators in the partially linear IV design. OLS is biased by the unobserved confounder; 2SLS with linear controls is biased because the instrument is excluded only conditional on nonlinear functions of the covariates; DML-IV with forests removes most of that bias."}
+plot_sampling(pliv_mc, truth = 1)
+```
+
+```{r pliv-numbers, echo = FALSE}
+pick_pliv <- function(e, col) pliv_tab[[col]][pliv_tab$estimator == e]
+```
+
+OLS carries the confounder bias (`r fmt(pick_pliv("OLS", "bias"))`). 2SLS
+with linear controls removes it and adds a different one
+(`r fmt(pick_pliv("2SLS, linear controls", "bias"))`): the instrument is
+not excluded given linear $X$. DML-IV with forests has bias
+`r fmt(pick_pliv("DML-IV, forests", "bias"))` and coverage
+`r fmt(pick_pliv("DML-IV, forests", "coverage"))`; what remains is the
+forests' error in learning $h$, which shrinks with $n$ as Section 04
+discussed. The instrument is an assumption about conditioning as much as an
+assumption about exclusion, and the conditioning is where machine learning
+enters.
+
+## The LATE score: apply the AIPW construction twice {#sec-late-score}
+
+With a binary $Z$ and binary $D$, the conditional LATE of Section
+\@ref(sec-conditional-late) is a ratio of two average treatment effects of
+$Z$: on $Y$ and on $D$. Each is identified by conditioning on $X$ and has
+the doubly robust score of Section 04 with the instrument propensity
+$p(X) = P(Z = 1 \mid X)$ in the weights (Chernozhukov et al. 2026, Section
+13.2):
+$$
+\psi(W; \theta, \eta) = \underbrace{\mu_1(X) - \mu_0(X) + H(p)(Y - \mu_Z(X))}_{\text{effect of } Z \text{ on } Y}
+ - \theta\,\underbrace{\big[m_1(X) - m_0(X) + H(p)(D - m_Z(X))\big]}_{\text{effect of } Z \text{ on } D},
+$$
+with $\mu_z(X) = E[Y \mid Z = z, X]$, $m_z(X) = E[D \mid Z = z, X]$, and
+$H(p) = Z/p - (1 - Z)/(1 - p)$. The score is linear in $\theta$, so
+$\hat\theta$ is the ratio of the two sample means and the influence function
+is the score divided by the mean of the second bracket, the complier share.
+Each bracket is doubly robust in the sense of Section 04, and the ratio is
+Neyman orthogonal (appendix \@ref(app-orthogonal-iv)). This is the doubly
+robust IV estimator that Section 04's extension list promised.
+
+```{r iivm}
+late_dml <- est_dml(dl, "y", "d", c("x1", "x2"), z = "z", model = "iivm",
+                    learner_mu0 = rf, learner_mu1 = rf, seed = 1, weak_iv = TRUE)
+late_dml
+c(true_late = attr(dl, "late"))
+```
+
+```{r late-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, sim_md5, n_sims_late)}
+late_mc <- run_late_experiment(n_sims = n_sims_late, n = 2000, seed = 4)
+late_tab <- late_mc %>% group_by(estimator) %>%
+  summarise(bias = mean(estimate - truth), sd = sd(estimate), rmse = sqrt(mean((estimate - truth)^2)),
+            mean_se = mean(std.error), coverage = mean(abs(estimate - truth) <= 1.96 * std.error), .groups = "drop")
+```
+
+```{r tab-late, echo = FALSE}
+late_tab %>% mutate(across(c(bias, sd, rmse, mean_se, coverage), ~ fmt(.x, 3))) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean SE", "95\\% coverage"),
+      caption = paste0("LATE design with compliance and effects that vary with the covariates; n = 2000; ",
+                       n_sims_late, " simulations. Bias is relative to each sample's population LATE.")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+```{r late-numbers, echo = FALSE}
+pick_late <- function(e, col) late_tab[[col]][late_tab$estimator == e]
+```
+
+In this design the compliance probability and the complier effect both
+vary with $x_1$, and the untreated outcome is quadratic in $x_2$. Both
+estimators are close to the population LATE on average (biases
+`r fmt(pick_late("2SLS, linear controls", "bias"), 3)` and
+`r fmt(pick_late("DML-LATE", "bias"), 3)`). The doubly robust score is more
+precise, with root mean squared error `r fmt(pick_late("DML-LATE", "rmse"))`
+against `r fmt(pick_late("2SLS, linear controls", "rmse"))`, because the
+forests absorb the quadratic term that linear controls leave in the
+residual. Its standard error also matches its sampling variation (coverage
+`r fmt(pick_late("DML-LATE", "coverage"))`), while the 2SLS interval
+over-covers (`r fmt(pick_late("2SLS, linear controls", "coverage"))`). The
+two estimands coincide here because the compliance varies linearly with
+$x_1$; when it does not, 2SLS targets a linear projection and the score
+targets the ratio of averages, and only the second is the LATE.
+
+## Observed heterogeneity: the complier CATE {#sec-late-blp}
+
+The two brackets of the LATE score are pseudo-outcomes in the sense of
+Section 08: conditional on $X$, their means are the conditional effects of
+$Z$ on $Y$ and on $D$. Projecting each on a dictionary $p(X)$ and taking
+the ratio gives the complier CATE $E[Y(1) - Y(0) \mid X, \text{complier}]$
+when it is linear in the dictionary (Chernozhukov et al. 2026, eq. 12.3.1;
+Abadie 2003). `late_scores()` extracts the two scores and `late_blp()`
+forms the ratio with delta-method standard errors.
+
+```{r late-blp}
+ls <- late_scores(late_dml)
+late_blp(ls, ~ x1, newdata = data.frame(x1 = c(-1, 0, 1)))[, c("x1", "estimate", "std.error", "conf.low", "conf.high")]
+```
+
+The complier effect in the design is $2 + x_1$. The same scores feed
+`cate_learner()` for a flexible complier CATE and `policy_learn()` for
+rules whose value is measured among compliers; `grf::instrumental_forest()`
+is the forest version.
+
+## Proxy controls as a technical instrument {#sec-proxy}
+
+Sometimes the confounder is unobserved but two noisy proxies of it are:
+two test scores for ability, education and family size for household
+income. Griliches and Chamberlain's insight is that one proxy can be put in
+the outcome equation in place of the confounder, and the other proxy used
+as an instrument for it, because the measurement errors are independent.
+In the partially linear form this is `est_dml(model = "pliv")` with the
+outcome proxy as the endogenous regressor and the treatment proxy as the
+instrument, and the treatment of interest as an exogenous control
+(Chernozhukov et al. 2026, Section 12.5). The proximal-inference literature
+extends the idea to nonlinear models.
+
+## Control function or orthogonal score? {#sec-cf-vs-score}
+
+Both start from the same first stage. The control function conditions on
+$\hat V$ inside a parametric second stage and identifies the structural
+function under an independence assumption on $V$. The orthogonal score
+projects on the residualized instrument and identifies an average effect
+under an exclusion restriction, letting machine learning absorb $X$. Use
+the control function when the second stage must be nonlinear and structural
+(a probit, a demand system, a stock of exposure); use the orthogonal score
+when the target is an average effect and the controls are many or their
+functional form unknown. In the linear model with linear controls, they are
+the same regression.
+
+# Weak instruments {#sec-weak}
+
+## Why a small first stage breaks the approximation {#sec-weak-problem}
+
+With one instrument and controls partialled out, $\hat\theta - \theta = \mathbb{E}_n[\tilde Z U] / \mathbb{E}_n[\tilde Z \tilde D]$.
+The usual approximation treats the denominator as fixed at its limit. When
+$E[\tilde Z \tilde D]$ is small relative to the sampling variation of its
+estimate, the denominator can be near zero, and the ratio is heavy-tailed,
+biased toward OLS (the numerator and denominator share the endogenous
+variation), and far from normal. The strength of the first stage is
+summarized by the concentration parameter $\mu^2 = n\,\pi^2 \mathrm{Var}(\tilde Z) / \mathrm{Var}(V)$,
+of which the first-stage F is the sample analogue. Figure
+\@ref(fig:fig-weak) shows the sampling distribution of 2SLS for three values.
+
+```{r weak-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, sim_md5, n_sims_weak)}
+weak_mc <- run_weak_iv_experiment(n_sims = n_sims_weak, n = 500, concentrations = c(2, 10, 50), seed = 5)
+weak_tab <- weak_mc %>% group_by(concentration) %>%
+  summarise(median_F = median(first_stage_F), median_2sls = median(tsls), mean_ols = mean(ols),
+            sd_2sls = sd(tsls), wald_coverage = mean(wald_covers), ar_coverage = mean(ar_covers),
+            ar_bounded = mean(ar_bounded), .groups = "drop")
+```
+
+```{r fig-weak, echo = FALSE, fig.height = 3.2, fig.cap = "Sampling distribution of the 2SLS estimate (true effect 1, n = 500) for concentration parameters 2, 10, and 50. The dotted line is the mean OLS estimate. Estimates beyond three units from the truth are trimmed for display."}
+weak_plot <- weak_mc %>% mutate(concentration = factor(paste0("concentration = ", concentration),
+                                                       levels = paste0("concentration = ", c(2, 10, 50)))) %>%
+  filter(abs(tsls - 1) < 3)
+ols_lines <- weak_mc %>% group_by(concentration) %>% summarise(ols = mean(ols), .groups = "drop") %>%
+  mutate(concentration = factor(paste0("concentration = ", concentration), levels = levels(weak_plot$concentration)))
+ggplot(weak_plot, aes(x = tsls)) +
+  geom_histogram(bins = 50, fill = iv_colors[["2SLS"]], alpha = 0.8, colour = "white", linewidth = 0.1) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_vline(data = ols_lines, aes(xintercept = ols), linetype = "dotted", colour = iv_colors[["OLS"]]) +
+  facet_wrap(~ concentration, scales = "free_y") +
+  labs(x = "2SLS estimate", y = "Simulations") + iv_theme()
+```
+
+```{r tab-weak, echo = FALSE}
+weak_tab %>% mutate(across(-concentration, ~ fmt(.x, 3))) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Concentration", "Median F", "Median 2SLS", "Mean OLS", "SD 2SLS", "Wald coverage", "AR coverage", "AR set bounded"),
+      caption = paste0("Weak-instrument Monte Carlo, ", n_sims_weak, " simulations per design, n = 500, true effect 1, nominal 95 percent coverage.")) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+```
+
+```{r weak-numbers, echo = FALSE}
+weak_tail <- weak_mc %>% group_by(concentration) %>% summarise(tail = mean(abs(tsls - 1) > 1), .groups = "drop")
+```
+
+With a concentration parameter of 2 the median first-stage F is
+`r fmt(weak_tab$median_F[1], 1)`. The 2SLS distribution is wide and heavy
+tailed: `r fmt(100 * weak_tail$tail[1], 0)` percent of the samples land
+more than one unit from the truth, against `r fmt(100 * weak_tail$tail[3], 0)`
+percent at a concentration parameter of 50, and its mean is pulled toward
+the OLS value of about `r fmt(weak_tab$mean_ols[1], 1)`. The Wald interval
+covers the truth in `r fmt(100 * weak_tab$wald_coverage[1], 0)` percent of
+samples instead of 95. At a concentration parameter of 50 the
+approximation is fine. The F of 10 in between is the rule of thumb of
+Staiger and Stock (1997): with F around 10 the bias of 2SLS relative to
+OLS is about 10 percent. Lee, McCrary, Moreira, and Porter (2022) show that
+the rule is not enough for inference: across all values of the
+endogeneity correlation, a first-stage F must exceed about 104.7 for the
+usual 1.96 critical value to deliver 95 percent coverage, and they tabulate
+the inflated critical values to use below that.
+
+## Diagnostics and their limits {#sec-weak-diagnostics}
+
+Report the first-stage F, the robust F, and the effective F of Montiel
+Olea and Pflueger (2013), which is the statistic to compare with
+weak-instrument thresholds when errors are heteroskedastic or clustered.
+`iv_first_stage()` gives all three. Then be careful with what the numbers
+license. A pretest ("proceed with the Wald interval if F > 10") distorts
+the inference that follows: conditional on passing, the estimator's
+distribution is not the unconditional one (Andrews, Stock, and Sun 2019).
+The diagnostics are for transparency. The decision should be to use
+inference that does not need them.
+
+```{r first-stage}
+iv_first_stage(dat, d = "d", z = "z", x = x5)
+```
+
+## Inference that does not need a strong first stage {#sec-ar}
+
+The Anderson-Rubin (1949) test never inverts the first stage. For a
+candidate value $\theta_0$, form $Y - \theta_0 D$ and test whether the
+instrument predicts it: under $H_0: \theta = \theta_0$ the coefficient of
+$\tilde Z$ in a regression of $\tilde Y - \theta_0 \tilde D$ on $\tilde Z$
+is zero, and the robust Wald statistic is $\chi^2$ with as many degrees of
+freedom as instruments, however weak the instrument. Collecting all
+$\theta_0$ that are not rejected gives a confidence set. With one instrument
+the set is the solution of a quadratic inequality: bounded when the
+instrument is strong, unbounded or the whole real line when it is not. That
+is the honest answer. The reduced-form test ($\theta = 0$ if and only if
+the reduced-form coefficient is zero) is the special case $\theta_0 = 0$.
+
+```{r ar}
+weak <- sim_iv(500, dgp = "weak", concentration = 3, seed = 6)
+ar <- iv_ar_confidence_set(weak, "y", "d", "z", x = paste0("x", 1:3))
+ar
+```
+
+```{r ar-plot, echo = FALSE, fig.height = 3.4, fig.cap = "The Anderson-Rubin statistic as a function of the candidate coefficient in a weak-instrument sample. The confidence set is where the statistic lies below the critical value; with a weak instrument it is wider than the Wald interval, asymmetric around the 2SLS estimate, and can be unbounded."}
+plot_ar_set(ar)
+```
+
+In the Monte Carlo, the Anderson-Rubin set covers the truth in
+`r fmt(100 * weak_tab$ar_coverage[1], 0)`, `r fmt(100 * weak_tab$ar_coverage[2], 0)`,
+and `r fmt(100 * weak_tab$ar_coverage[3], 0)` percent of samples at the three
+concentration values, at the cost of being unbounded in
+`r fmt(100 * (1 - weak_tab$ar_bounded[1]), 0)` percent of the weakest
+samples. Other tests (the conditional likelihood ratio, the Lagrange
+multiplier) improve power when the model is overidentified; with one
+instrument the Anderson-Rubin test is optimal (Andrews, Stock, and Sun
+2019).
+
+## Weak identification with machine-learned controls {#sec-weak-dml}
+
+The Anderson-Rubin statistic is Neyman's $C(\alpha)$ statistic for the
+orthogonal moment: $C(\theta_0) = n\, \bar\psi(\theta_0)^2 / \widehat{\mathrm{Var}}(\psi(\theta_0))$
+with $\psi$ evaluated at cross-fitted nuisances. Because the moment is
+orthogonal, the nuisance estimation error has no first-order effect on
+$C(\theta_0)$ either, so the test and the set inherit their validity with
+machine-learned residuals (Chernozhukov et al. 2026, Theorem 13.3.1). The
+same construction works for any orthogonal score, including the LATE score,
+which is what `weak_iv = TRUE` computes in `est_dml()`.
+
+```{r weak-dml}
+pliv_rf$weak_iv$set
+c(wald_lower = pliv_rf$conf.low, wald_upper = pliv_rf$conf.high)
+```
+
+With a strong residualized instrument the two intervals agree. The
+Chernozhukov et al. (2026) example of institutions and growth, with settler
+mortality as the instrument and a first-stage t of about 2 after forests,
+is the case where they do not: the robust set's lower end is higher than
+the Wald interval's, which changes the economic conclusion.
+
+## Exclusion violations are amplified by weak first stages {#sec-plausibly}
+
+If the instrument has a small direct effect $\gamma$ on the outcome, the
+IV estimand is $\theta + \gamma / \pi$: the violation is divided by the
+first-stage coefficient. Bound, Jaeger, and Baker (1995) made the point
+for quarter of birth as an instrument for schooling, where a first stage of
+0.1 years multiplies any direct effect by ten. Conley, Hansen, and Rossi
+(2012) turn it into an interval: allow $\gamma$ in a range, re-estimate
+with $Y - \gamma Z$ as the outcome, and take the union of the confidence
+intervals.
+
+```{r plausibly}
+pe <- iv_plausibly_exogenous(dat, "y", "d", "z", x5, gamma_grid = seq(-0.2, 0.2, by = 0.1))
+pe
+attr(pe, "union")
+```
+
+A direct effect of the instrument of 0.2 in either direction, which is a
+fifth of the first-stage coefficient here, moves the estimate by about
+`r fmt(abs(pe$estimate[1] - pe$estimate[3]) / 2, 2)`. With a first stage
+one tenth as large the same violation would move it ten times as much.
+
+# Many instruments, many effects, constructed instruments {#sec-many}
+
+## Several instruments: what 2SLS averages {#sec-many-weights}
+
+With several instruments the 2SLS coefficient is a weighted average of the
+just-identified estimates that use one instrument at a time,
+$$
+\hat\theta_{2SLS} = \sum_k \omega_k \hat\theta_k, \qquad
+\hat\theta_k = \frac{\mathrm{Cov}(Z_k, Y)}{\mathrm{Cov}(Z_k, D)}, \qquad
+\omega_k = \frac{\hat\pi_k \mathrm{Cov}(Z_k, D)}{\sum_j \hat\pi_j \mathrm{Cov}(Z_j, D)},
+$$
+with $\hat\pi$ the first-stage coefficients (appendix \@ref(app-weights)).
+The weights sum to one but need not be positive. With homogeneous effects
+every $\hat\theta_k$ estimates the same number and the weights are
+irrelevant. With heterogeneous effects each instrument has its own
+compliers and its own LATE, and Mogstad, Torgovitsky, and Walters (2021)
+show that the Imbens-Angrist monotonicity condition applied to the vector
+of instruments (every unit responds to every instrument in the same
+direction) is much stronger than it looks. Under the weaker *partial
+monotonicity* (each instrument is monotone on its own), the 2SLS weights
+on the instrument-specific LATEs can be negative, and the sign of
+$\hat\theta_{2SLS}$ can differ from the sign of every LATE. Their test
+checks the sign patterns of the first stages and reduced forms that
+positive weights require. `iv_late_weights()` reports the decomposition.
+
+```{r late-weights}
+dat$z2 <- dat$z + rnorm(nrow(dat))
+dat$z3 <- rnorm(nrow(dat)) + 0.1 * dat$z
+lw <- iv_late_weights(dat, "y", "d", c("z", "z2", "z3"), x = xc)
+lw
+```
+
+Here the effect is homogeneous, so all three instrument-specific estimates
+are near 1 and the weights only redistribute precision. The instrument with
+the small first stage gets a small weight; when a weight is negative and
+the effects differ, the 2SLS number is not an average of anything a policy
+would deliver. The remedy is to report the instrument-specific estimates
+and the weights, or to move to the marginal treatment effect framework of
+Section \@ref(sec-mte), which makes the weighting explicit.
+
+## Judge leniency and examiner designs {#sec-judges}
+
+The most common instrument in recent applied work is the assigned decision
+maker: judges for incarceration, examiners for disability insurance,
+reviewers for patents, loan officers for credit. Cases are assigned at
+random within a court and year; judges differ in leniency; leniency moves
+the treatment. The instrument is the leave-one-out leniency of the assigned
+judge,
+$$
+Z_i = \frac{1}{n_{j(i)} - 1} \sum_{k \neq i:\, j(k) = j(i)} D_k,
+$$
+computed within the randomization cell and after residualizing $D$ on
+controls so that leniency is compared among judges who see the same case
+mix. Leaving out the own case avoids the mechanical correlation between $Z_i$
+and $D_i$ that would bias 2SLS toward OLS. Standard errors cluster at the
+judge level.
+
+```{r judges}
+dj <- sim_iv(6000, dgp = "judge", n_judges = 40, seed = 7)
+dj <- leniency_instrument(dj, examiner = "judge", d = "d", x = "x1")
+iv_first_stage(dj, d = "d", z = "leniency", x = "x1", cluster = "judge")
+jfit <- iv_robust(y ~ d + x1 | leniency + x1, data = dj, clusters = judge)
+c(estimate = coef(jfit)[["d"]], se = jfit$std.error[["d"]])
+```
+
+The design's monotonicity condition is the delicate part. Monotonicity
+across judges requires that a stricter judge incarcerates every defendant a
+more lenient judge would; judges who are strict on drug cases and lenient
+on theft violate it. What 2SLS identifies under the weaker *average
+monotonicity* condition (Frandsen, Lefgren, and Leslie 2023) is a
+positively weighted average of individual effects only if the
+judge-specific first stages and effects are positively correlated; the same
+sign checks as in Section \@ref(sec-many-weights) apply, and the exclusion
+restriction (judges affect outcomes only through the decision) is itself
+testable with the leniency distribution.
+
+## Continuous instruments and the marginal treatment effect {#sec-mte}
+
+The LATE model with a binary instrument is a threshold model in disguise:
+monotonicity is equivalent to $D = \mathbb{1}\{p(Z, X) \ge V\}$ with
+$V \sim U(0, 1)$ independent of $(Z, X)$, where $p$ is the propensity of
+treatment and $V$ the unit's resistance to it (Vytlacil 2002). With a
+continuous instrument the propensity takes many values, and comparing units
+with propensities $p$ and $p + h$ identifies the effect for units with
+$V \in (p, p + h]$. Taking $h \to 0$ gives the marginal treatment effect
+$$
+\mathrm{MTE}(u, x) = E[Y(1) - Y(0) \mid X = x, V = u] = \frac{\partial E[Y \mid X = x, p(Z, X) = u]}{\partial u},
+$$
+the local instrumental variables estimand of Heckman and Vytlacil (2005).
+This is the control-function approach of Section \@ref(sec-cf) with the
+propensity as the control and no functional-form assumption about how the
+unobservable enters: $E[Y \mid X, p] = X'\beta_0 + p X'(\beta_1 - \beta_0) + K(p)$
+and $K'(u)$ is the part of the MTE that varies with resistance.
+
+Every standard estimand is a weighted integral of the curve (appendix
+\@ref(app-mte)): the ATE weights all $u$ equally; the ATT weights
+$u$ by $P(p > u) / E[p]$ (units with low resistance are over-represented
+among the treated); the ATU by $P(p \le u) / E[1 - p]$; the LATE of an
+instrument shift from $p_0$ to $p_1$ uniformly on $(p_0, p_1]$; and a policy
+that changes the propensity from $p$ to $p'$ has the policy-relevant
+treatment effect with weights $(F_p(u) - F_{p'}(u)) / (E[p'] - E[p])$. The
+curve can be integrated only over the support of the estimated propensity;
+outside it the estimates are extrapolations of the polynomial.
+
+```{r mte}
+dm <- sim_iv(5000, dgp = "mte", seed = 8)
+m <- mte_curve(dm, "y", "d", "z", x = "x1", degree = 3, late_range = c(0.3, 0.7),
+               policy = function(p) pmin(p + 0.1, 0.99), n_boot = 99, seed = 1)
+m
+c(true_ate = attr(dm, "ate"), true_att = attr(dm, "att"))
+```
+
+```{r mte-plot, echo = FALSE, fig.height = 3.6, fig.cap = "Estimated marginal treatment effect curve (polynomial of degree three in the propensity) with bootstrap bands, and the true curve of the design (dashed). The effect falls with resistance: units easy to move into treatment gain most, which is why the ATT exceeds the ATE."}
+truth_mte <- attr(dm, "mte")
+plot_mte(m) + geom_line(data = data.frame(u = m$curve$u, mte = truth_mte(m$curve$u)), aes(u, mte), linetype = "dashed")
+```
+
+```{r mte-weights, echo = FALSE, fig.height = 3.2, fig.cap = "The weights that turn the MTE curve into the ATE, ATT, ATU, the LATE of a propensity shift from 0.3 to 0.7, and the policy-relevant effect of raising every propensity by 0.1."}
+plot_mte(m, "weights")
+```
+
+The MTE framework answers the question the LATE cannot: what would a
+policy that moves a different margin do? It costs a continuous instrument
+with wide support and a parametric or smoothing choice for $K$. Mogstad,
+Torgovitsky, and Walters (2021) use instrument-specific MTE curves to show
+that two instruments for college attendance move different people; the
+replication reproduces that exercise.
+
+## Many candidate instruments {#sec-many-candidates}
+
+When many variables could serve as instruments, two problems appear. Using
+all of them in 2SLS adds bias: each instrument adds a little of the
+endogenous variation back into $\hat D$, and with $K$ instruments the bias
+toward OLS grows with $K / \mu^2$ (Bekker 1994). Limited-information
+maximum likelihood and jackknife IV (which predicts $D_i$ from a first stage
+that excludes unit $i$) reduce it. Choosing among instruments by looking at
+the outcome invalidates inference.
+
+Belloni, Chen, Chernozhukov, and Hansen (2012) solve both problems with the
+lasso: select instruments by their first-stage predictive power alone,
+which is a prediction problem and does not use $Y$, then run 2SLS with the
+selected set (or the lasso first-stage prediction as the instrument). Under
+approximate sparsity the resulting estimator is as good as knowing the
+relevant instruments. In `est_dml(model = "pliv")` the same idea is the
+choice of `learner_m` for $E[Z \mid X]$ and of the instrument set; the `hdm`
+package implements `rlassoIV()` directly. Gilchrist and Sands (2016) use
+this to choose among dozens of weather variables as instruments for opening
+weekend movie attendance, then estimate how much later attendance responds
+to the exogenous opening shock: social spillovers identified from rain.
+
+## A constructed instrument: shift-share {#sec-ssiv}
+
+Many instruments are built rather than found. The shift-share (Bartik)
+instrument combines local exposure shares with aggregate shocks:
+$$
+B_i = \sum_k s_{ik}\, g_k,
+$$
+local industry employment shares times national industry growth (Bartik
+1991), or, in Autor, Dorn, and Hanson (2013), commuting-zone industry
+shares times the growth of Chinese imports in other rich countries. Two
+identification stories justify it and they have different implications.
+
+- **Exogenous shares** (Goldsmith-Pinkham, Sorkin, and Swift 2020): the
+  shares are as good as randomly assigned given controls, and the shocks
+  only provide the weights. Then $B_i$ is a weighted combination of $K$
+  instruments (the shares), and the estimate is a weighted average of the
+  share-specific just-identified estimates with Rotemberg weights
+  $\alpha_k = g_k \mathrm{Cov}(s_k, D^\perp) / \sum_j g_j \mathrm{Cov}(s_j, D^\perp)$.
+  The weights say which industries drive the estimate; a few large weights
+  mean the identifying assumption is about those industries.
+- **Exogenous shocks** (Borusyak, Hull, and Jaravel 2022): the shocks are
+  as good as randomly assigned across industries, and the shares can be
+  endogenous. Then the estimate equals a shock-level regression of the
+  exposure-weighted outcome on the exposure-weighted treatment instrumented
+  by the shock, and inference should be at the shock level, with as many
+  effective observations as there are independent shocks.
+
+`ssiv_rotemberg()` and `ssiv_shock_level()` compute the two diagnostics.
+
+```{r ssiv}
+ds <- sim_iv(600, dgp = "shift_share", n_industries = 15, seed = 9)
+sh <- paste0("s", 1:15)
+rot <- ssiv_rotemberg(ds, "y", "d", shares = sh, shocks = attr(ds, "shocks"), x = "x1")
+rot
+ssiv_shock_level(ds, "y", "d", shares = sh, shocks = attr(ds, "shocks"), x = "x1")
+```
+
+The two point estimates coincide by construction; the standard errors do
+not, because the second counts `r rot$n` regions as
+`r length(attr(ds, "shocks"))` independent shocks. Which one is right
+depends on which story the paper tells. The replication of Autor, Dorn,
+and Hanson (2013) works through both.
+
+# Instruments in experiments and platforms {#sec-platforms}
+
+## Encouragement designs and A/B tests as instruments {#sec-encouragement}
+
+A randomized offer with imperfect take-up is the cleanest instrument there
+is: independence holds by design, exclusion holds if the offer itself does
+not change behavior, and monotonicity holds if no one is put off by being
+offered. The intention-to-treat effect is the reduced form; the LATE is the
+effect among those the offer moved. Digital platforms run these designs
+constantly: a recommendation shown at random is an instrument for the
+action recommended, a nudge is an instrument for the behavior nudged. The
+tools of Sections \@ref(sec-late) and \@ref(sec-late-score) apply without
+change, and the complier profile answers the platform's own question, which
+is who reacts to the nudge.
+
+## Realized minus expected exposure {#sec-exposure}
+
+Hsieh et al. (2026) estimate the effect of television advertising on
+purchases from single-source data. Exposure is endogenous: the brand
+targets shows whose viewers are likely buyers. Their instrument uses the
+timing of ads within a show. Given that a household watched a portion of a
+targeted show, whether it saw the ad depends on whether the ad aired during
+that portion, and the expected exposure is the integral of the ad-timing
+density over the watched segment. The instrument is realized minus expected
+exposure, which is mean zero conditional on targeting and viewing, and
+shifts actual exposure one for one. The second stage is a purchase model
+with an ad stock, estimated with the control-function stock of Section
+\@ref(sec-cf-demand). The replication draft simulates the pipeline
+(exposure, purchase, first stage, second stage) with the public code.
+
+## When instruments are not exogenous shocks {#sec-not-shocks}
+
+Garcia, Grewal, and coauthors (2022) estimate hotel demand from managerial
+responses to automated price recommendations. The natural instruments
+(prices at other hotels) load on correlated demand shocks; the paper argues
+they are not excluded and instead conditions on the recommendation, which
+absorbs the manager's information, using post-double-selection to handle
+the high-dimensional interactions of recommendations with calendar
+variables. The lesson for this lecture is that an instrument is a claim
+about a mechanism, and when the mechanism is not credible the better design
+is the one that conditions on the information the decision maker used.
+
+# Traps {#sec-traps}
+
+## Exclusion failures dressed as natural experiments
+
+Rain is random, but farmers, moviegoers, and voters all respond to rain
+through more than one channel. Quarter of birth is random, but it is
+correlated with parental characteristics and with health. The question is
+never whether $Z$ is random; it is whether $Z$ has *no* other path to $Y$.
+Weak instruments make small failures large (Section \@ref(sec-plausibly)).
+
+## LATE is not the ATE
+
+Report the compliers, and say whose effect the number describes. When the
+policy question is universal ("treat everyone"), the LATE is one point
+inside the bounds of Section \@ref(sec-tests-bounds), and the MTE curve
+tells whether the marginal units gain more or less than the average.
+
+## Forbidden regressions
+
+Fitted values from a nonlinear first stage plugged into 2SLS, or fitted
+values from a linear first stage plugged into a nonlinear second stage, are
+both wrong. The first can be repaired by using the nonlinear fitted value as
+an *instrument* in a linear 2SLS; the second by the control function
+(Section \@ref(sec-cf-nonlinear)).
+
+## IV larger than OLS
+
+Systematic reviews find that IV estimates exceed OLS far more often than
+the usual endogeneity stories predict. Measurement error in $D$ explains
+some (OLS is attenuated); weak instruments and small exclusion failures
+explain more, because both push IV away from zero in the direction of the
+reduced-form noise. Young (2022) shows that IV inference is also unusually
+sensitive to a few high-leverage observations. Report the first stage, the
+reduced form, a weak-IV-robust interval, and the sensitivity of the estimate
+to dropping influential units.
+
+## Bad controls, again
+
+Controls measured after the instrument is realized, or affected by the
+treatment, break the exclusion restriction in the same way they broke
+conditional exogeneity in Section 03. Judge fixed effects in a leniency
+design are fine; the judge's sentence length is not.
+
+# Practice {#sec-practice}
+
+## Replications and anchors {#sec-replications}
+
+- **Mogstad, Torgovitsky, and Walters (2021).** Two instruments for college
+  attendance, the 2SLS weights, instrument-specific MTE curves, and the
+  test of positive weights; `iv_late_weights()` and `mte_curve()`.
+- **Hsieh et al. (2026).** Realized-minus-expected exposure as an
+  instrument for advertising, and the control-function stock;
+  `cf_residuals()` with user-written accumulation.
+- **Garcia et al. (2022).** Why external instruments fail for hotel demand
+  and how conditioning on the recommendation with post-double-selection
+  replaces them; `est_dml()` and `hdm`.
+- **Gilchrist and Sands (2016).** Lasso-chosen weather instruments for
+  opening-weekend attendance and social spillovers; `hdm::rlassoIV()`,
+  `iv_first_stage()`, `iv_ar_confidence_set()`.
+- **Autor, Dorn, and Hanson (2013).** The China shock as a shift-share
+  instrument; `ssiv_rotemberg()`, `ssiv_shock_level()`.
+- **Oreopoulos (2006).** The school-leaving age reform as an instrument for
+  schooling, from Wayne's earlier note; the reporting template of Section
+  \@ref(sec-reporting).
+
+## An IV checklist {#sec-checklist}
+
+1. Write the structural equation and say what the error contains. Name
+   the instrument in the abstract and give the mechanism for exclusion.
+2. Report the first stage, the reduced form, and the IV estimate with the
+   same controls and sample; cluster where the instrument varies.
+3. Report first-stage strength (F, robust F, effective F) and a
+   weak-instrument-robust interval regardless of the F.
+4. Say whose effect it is: complier share and characteristics; instrument-
+   specific estimates and 2SLS weights when there are several instruments.
+5. With a nonlinear outcome, use a control function and report average
+   partial effects with bootstrap standard errors.
+6. With many controls or unknown functional forms, use the orthogonal IV
+   scores with cross-fitting and report the nuisance fit.
+7. For a constructed instrument, state which identification story you rely
+   on and report the diagnostics that story implies.
+8. Report a sensitivity analysis to exclusion violations, and, if the paper
+   also reports a no-instrument estimate, its sensitivity to unobserved
+   confounding.
+
+# Appendix {#sec-appendix}
+
+## The LATE theorem and the kappa identities {#app-late}
+
+By consistency $D = Z D(1) + (1 - Z) D(0)$ and $Y = D Y(1) + (1 - D) Y(0)$.
+By independence, $E[Y \mid Z = 1] = E[Y(D(1))]$ and $E[Y \mid Z = 0] = E[Y(D(0))]$,
+so the reduced form is $E[Y(D(1)) - Y(D(0))] = E[(D(1) - D(0))(Y(1) - Y(0))]$
+after substituting $Y(d) = Y(0) + d(Y(1) - Y(0))$. Partition by type:
+$D(1) - D(0)$ equals 1 for compliers, 0 for always- and never-takers, and
+$-1$ for defiers, so the reduced form equals
+$P(\text{complier})\,E[Y(1) - Y(0) \mid \text{complier}] - P(\text{defier})\,E[Y(1) - Y(0) \mid \text{defier}]$.
+The first stage is $E[D(1) - D(0)] = P(\text{complier}) - P(\text{defier})$.
+Monotonicity removes the defier terms and the ratio is the complier effect.
+
+For the kappa weights, note that under monotonicity a unit with $D = 1,
+Z = 0$ is an always-taker and a unit with $D = 0, Z = 1$ a never-taker, and
+that by independence
+$E[g(X) D(1 - Z) / (1 - \pi(X))] = E[g(X) D(0)] = E[g(X) \mathbb{1}\{\text{always-taker}\}]$
+and $E[g(X)(1 - D)Z / \pi(X)] = E[g(X)(1 - D(1))] = E[g(X)\mathbb{1}\{\text{never-taker}\}]$.
+Hence $E[\kappa g(X)] = E[g(X)] - E[g(X)\mathbb{1}\{\text{AT}\}] - E[g(X)\mathbb{1}\{\text{NT}\}] = E[g(X)\mathbb{1}\{\text{complier}\}]$,
+and dividing by $E[\kappa] = P(\text{complier})$ gives the complier mean
+(Abadie 2003, Theorem 3.1).
+
+## The omitted-confounder bias bound {#app-ovb}
+
+With $\tilde A$ normalized to unit variance, $\gamma = E[\tilde A \tilde D]$
+and $\delta = E[\bar A \bar Y] / E[\bar A^2]$ where bars denote residuals
+after projecting on $\tilde D$. The bias is $\phi = \delta\gamma / E[\tilde D^2]$.
+Writing $R^2_{D \sim A} = \gamma^2 / E[\tilde D^2]$ and
+$R^2_{Y \sim A \mid D} = \delta^2 E[\bar A^2] / E[\bar Y^2]$ with
+$E[\bar A^2] = 1 - R^2_{D \sim A}$ and $E[\bar Y^2] = E[(\tilde Y - \beta\tilde D)^2]$,
+substitute and simplify to obtain the formula of Section
+\@ref(sec-sensitivity) (Chernozhukov et al. 2026, Appendix 12.A). The
+robustness value solves $\phi(r, r) = |\hat\theta|$, a quadratic in $r$.
+
+## Control functions: equivalence with 2SLS and the average structural function {#app-cf}
+
+*Equivalence.* Let $\hat D = P_{[Z, X]} D$ and $\hat V = D - \hat D$. The
+regression of $Y$ on $(D, X, \hat V)$ spans the same column space as the
+regression on $(\hat D, X, \hat V)$, so the coefficient on $D$ equals the
+coefficient on $\hat D$ in the latter. By Frisch-Waugh-Lovell that
+coefficient is obtained by regressing $Y$ on the residual of $\hat D$ after
+projecting on $(X, \hat V)$. Since $\hat D$ is orthogonal to $\hat V$ (a
+first-stage fitted value is orthogonal to its residual) and $X$ is in the
+first-stage regressors, the residual of $\hat D$ after $(X, \hat V)$ equals
+the residual of $\hat D$ after $X$ alone, and the coefficient is that of
+the regression of $Y$ on $\hat D$ and $X$: two-stage least squares. The
+argument does not use the number of instruments.
+
+*Average structural function.* If $U = \rho V + \varepsilon$ with
+$\varepsilon \perp (D, Z, X, V)$ and $\varepsilon \sim N(0, \sigma^2)$, then
+$P(Y = 1 \mid D, X, V) = \Phi((\alpha + \theta D + X'\beta + \rho V)/\sigma)$,
+a probit in $(D, X, V)$ with coefficients scaled by $1/\sigma$. The
+structural probability at $(d, x)$ is
+$\mathrm{ASF}(d, x) = E_V[\Phi((\alpha + \theta d + x'\beta + \rho V)/\sigma)]$,
+averaging over the marginal distribution of $V$; its derivative in $d$,
+averaged over the distribution of $(D, X)$, is the average partial effect.
+Replacing $V$ by $\hat V$ and the expectation by the sample average gives
+`cf_ape()`. The generalized residual for a probit first stage is
+$E[V \mid D, Z, X]$ under the threshold model $D = \mathbb{1}\{z'\gamma + V > 0\}$
+with $V$ standard normal, which is $\lambda(z'\gamma)$ for $D = 1$ and
+$-\lambda(-z'\gamma)$ for $D = 0$, with $\lambda = \phi / \Phi$ the inverse
+Mills ratio.
+
+## Orthogonality of the IV scores {#app-orthogonal-iv}
+
+*Partially linear IV.* $\psi = (Y - \ell - \theta(D - r))(Z - m)$. The
+derivative with respect to $\ell$ in direction $h$ is $-E[h(X)(Z - m_0(X))] = 0$
+because $E[Z - m_0 \mid X] = 0$; the same for $r$. The derivative with
+respect to $m$ is $-E[(Y - \ell_0 - \theta_0(D - r_0)) h(X)] = -E[E[U \mid X] h(X)] = 0$
+where $U$ is the structural error with $E[U \mid X] = 0$. The estimator is
+the ratio of sample means of $\psi_b = (Y - \ell)(Z - m)$ and
+$\psi_a = (D - r)(Z - m)$, and the influence function is
+$\psi / E[\psi_a]$; the variance is the IV sandwich on residuals
+(Chernozhukov et al. 2026, Theorem 13.1.1).
+
+*LATE score.* Each bracket is the AIPW score of an average treatment effect
+of $Z$ with the instrument propensity, and Section 04 showed that score is
+orthogonal to its outcome regressions and its propensity. The ratio
+$\theta = E[\psi_b] / E[\psi_a]$ is a smooth function of two orthogonal
+functionals, so it is orthogonal, with influence function
+$(\psi_b - \theta \psi_a) / E[\psi_a]$ (Chernozhukov et al. 2026, Theorem
+13.2.1).
+
+## Anderson-Rubin with cross-fitted residuals {#app-ar}
+
+At the true $\theta_0$ the moment $\bar\psi(\theta_0) = \mathbb{E}_n[(\check Y - \theta_0 \check D)\check Z]$
+built from cross-fitted residuals equals its oracle version up to a term
+whose leading part is a product of nuisance errors (orthogonality) plus a
+term of order $n^{-1/2}$ times the nuisance error (cross-fitting removes
+the dependence). Neither involves the first stage, so
+$\sqrt n \bar\psi(\theta_0) / \sqrt{\widehat{\mathrm{Var}}} \to N(0, 1)$
+whatever $E[\tilde D \tilde Z]$ is. Squaring gives the $\chi^2(1)$ limit;
+with $k$ instruments the quadratic form in the inverse covariance gives
+$\chi^2(k)$ (Chernozhukov et al. 2026, Theorem 13.3.1). Test inversion
+over $\theta_0$ yields the set; for $k = 1$ the inequality
+$n(\bar m_Y - \theta \bar m_D)^2 \le c\,(S_{YY} - 2\theta S_{YD} + \theta^2 S_{DD})$
+is quadratic in $\theta$, which is why the set is an interval, its
+complement, or the whole line.
+
+## Marginal treatment effects and the policy weights {#app-mte}
+
+Under $D = \mathbb{1}\{p(Z, X) \ge V\}$ with $V \sim U(0,1) \perp (Z, X)$ and
+$(Y(0), Y(1)) \perp Z \mid (X, V)$,
+$E[Y \mid X, p(Z, X) = p] = E[Y(0) \mid X] + \int_0^p E[Y(1) - Y(0) \mid X, V = u]\, du$,
+so the derivative in $p$ is the MTE. For any estimand of the form
+$E[Y(1) - Y(0)]$ over a population defined by $V$ and $p$, write it as
+$\int_0^1 \mathrm{MTE}(u)\, \omega(u)\, du$: for the ATE $\omega = 1$; for the
+ATT, $E[Y(1) - Y(0) \mid D = 1] = E[\int_0^p \mathrm{MTE}(u) du] / E[p]$, so
+$\omega(u) = P(p > u) / E[p]$; for the ATU, $\omega(u) = P(p \le u) / E[1 - p]$;
+for the effect of a policy that moves $p$ to $p'$, the change in
+$E[Y] = E[\int_0^p \mathrm{MTE}]$ divided by the change in $E[D] = E[p]$ gives
+$\omega(u) = (F_p(u) - F_{p'}(u)) / (E[p'] - E[p])$ (Heckman and Vytlacil
+2005, Table 1). The separable estimator regresses $Y$ on $X$, $pX$, and
+a polynomial in $p$; the coefficients on $pX$ are $\beta_1 - \beta_0$ and
+the derivative of the polynomial is $K'(u)$.
+
+## Weights of 2SLS and Rotemberg weights {#app-weights}
+
+With residualized variables, $\hat D = \sum_k \hat\pi_k Z_k$ and
+$\hat\theta_{2SLS} = \mathrm{Cov}(\hat D, Y) / \mathrm{Cov}(\hat D, D)$. Expanding
+the numerator, $\sum_k \hat\pi_k \mathrm{Cov}(Z_k, Y) = \sum_k \hat\pi_k \mathrm{Cov}(Z_k, D)\,\hat\theta_k$,
+and dividing by the denominator $\sum_j \hat\pi_j \mathrm{Cov}(Z_j, D)$
+gives the weights of Section \@ref(sec-many-weights). For a shift-share
+instrument $B = \sum_k g_k s_k$, the same expansion with $\hat\pi_k = g_k$
+gives the Rotemberg weights $\alpha_k$. The shock-level equivalence of
+Borusyak, Hull, and Jaravel (2022) follows from writing
+$\sum_i B_i D_i^\perp = \sum_k g_k \sum_i s_{ik} D_i^\perp = \sum_k s_k g_k \bar D_k$
+with $s_k = \sum_i s_{ik}$ and $\bar D_k$ the exposure-weighted mean, and
+likewise for the numerator, so the ratio is the shock-level IV coefficient
+weighted by $s_k$ without an intercept.
+
+## References
+
+- Abadie, Alberto. 2003. "Semiparametric Instrumental Variable Estimation of Treatment Response Models." *Journal of Econometrics*.
+- Anderson, T. W., and Herman Rubin. 1949. "Estimation of the Parameters of a Single Equation in a Complete System of Stochastic Equations." *Annals of Mathematical Statistics*.
+- Andrews, Isaiah, James H. Stock, and Liyang Sun. 2019. "Weak Instruments in Instrumental Variables Regression: Theory and Practice." *Annual Review of Economics*.
+- Autor, David H., David Dorn, and Gordon H. Hanson. 2013. "The China Syndrome: Local Labor Market Effects of Import Competition in the United States." *American Economic Review*.
+- Balke, Alexander, and Judea Pearl. 1997. "Bounds on Treatment Effects from Studies with Imperfect Compliance." *Journal of the American Statistical Association*.
+- Bartik, Timothy J. 1991. *Who Benefits from State and Local Economic Development Policies?* Upjohn Institute.
+- Bekker, Paul A. 1994. "Alternative Approximations to the Distributions of Instrumental Variable Estimators." *Econometrica*.
+- Belloni, Alexandre, Daniel Chen, Victor Chernozhukov, and Christian Hansen. 2012. "Sparse Models and Methods for Optimal Instruments with an Application to Eminent Domain." *Econometrica*.
+- Blundell, Richard, and James L. Powell. 2004. "Endogeneity in Semiparametric Binary Response Models." *Review of Economic Studies*.
+- Borusyak, Kirill, Peter Hull, and Xavier Jaravel. 2022. "Quasi-Experimental Shift-Share Research Designs." *Review of Economic Studies*.
+- Bound, John, David A. Jaeger, and Regina M. Baker. 1995. "Problems with Instrumental Variables Estimation When the Correlation between the Instruments and the Endogenous Explanatory Variable Is Weak." *Journal of the American Statistical Association*.
+- Chernozhukov, Victor, Christian Hansen, Nathan Kallus, Martin Spindler, and Vasilis Syrgkanis. 2026. *Applied Causal Inference Powered by ML and AI*, chapters 12 and 13.
+- Chernozhukov, Victor, Carlos Cinelli, Whitney Newey, Amit Sharma, and Vasilis Syrgkanis. 2022. "Long Story Short: Omitted Variable Bias in Causal Machine Learning." NBER Working Paper 30302.
+- Cinelli, Carlos, and Chad Hazlett. 2020. "Making Sense of Sensitivity: Extending Omitted Variable Bias." *Journal of the Royal Statistical Society B*.
+- Conley, Timothy G., Christian B. Hansen, and Peter E. Rossi. 2012. "Plausibly Exogenous." *Review of Economics and Statistics*.
+- Cornelissen, Thomas, Christian Dustmann, Anna Raute, and Uta Schönberg. 2016. "From LATE to MTE: Alternative Methods for the Evaluation of Policy Interventions." *Labour Economics*.
+- Frandsen, Brigham, Lars Lefgren, and Emily Leslie. 2023. "Judging Judge Fixed Effects." *American Economic Review*.
+- Frölich, Markus. 2007. "Nonparametric IV Estimation of Local Average Treatment Effects with Covariates." *Journal of Econometrics*.
+- Garen, John. 1984. "The Returns to Schooling: A Selectivity Bias Approach with a Continuous Choice Variable." *Econometrica*.
+- Gilchrist, Duncan Sheppard, and Emily Glassberg Sands. 2016. "Something to Talk About: Social Spillovers in Movie Consumption." *Journal of Political Economy*.
+- Goldsmith-Pinkham, Paul, Isaac Sorkin, and Henry Swift. 2020. "Bartik Instruments: What, When, Why, and How." *American Economic Review*.
+- Griliches, Zvi. 1977. "Estimating the Returns to Schooling: Some Econometric Problems." *Econometrica*.
+- Heckman, James J. 1979. "Sample Selection Bias as a Specification Error." *Econometrica*.
+- Heckman, James J., and Richard Robb. 1985. "Alternative Methods for Evaluating the Impact of Interventions." In *Longitudinal Analysis of Labor Market Data*.
+- Heckman, James J., and Edward Vytlacil. 2005. "Structural Equations, Treatment Effects, and Econometric Policy Evaluation." *Econometrica*.
+- Imbens, Guido W., and Joshua D. Angrist. 1994. "Identification and Estimation of Local Average Treatment Effects." *Econometrica*.
+- Kitagawa, Toru. 2015. "A Test for Instrument Validity." *Econometrica*.
+- Lee, David S., Justin McCrary, Marcelo J. Moreira, and Jack Porter. 2022. "Valid t-Ratio Inference for IV." *American Economic Review*.
+- Manski, Charles F. 1990. "Nonparametric Bounds on Treatment Effects." *American Economic Review*.
+- Mogstad, Magne, Alexander Torgovitsky, and Christopher R. Walters. 2021. "The Causal Interpretation of Two-Stage Least Squares with Multiple Instrumental Variables." *American Economic Review*.
+- Montiel Olea, José Luis, and Carolin Pflueger. 2013. "A Robust Test for Weak Instruments." *Journal of Business & Economic Statistics*.
+- Mourifié, Ismael, and Yuanyuan Wan. 2017. "Testing Local Average Treatment Effect Assumptions." *Review of Economics and Statistics*.
+- Oreopoulos, Philip. 2006. "Estimating Average and Local Average Treatment Effects of Education When Compulsory Schooling Laws Really Matter." *American Economic Review*.
+- Petrin, Amil, and Kenneth Train. 2010. "A Control Function Approach to Endogeneity in Consumer Choice Models." *Journal of Marketing Research*.
+- Rivers, Douglas, and Quang H. Vuong. 1988. "Limited Information Estimators and Exogeneity Tests for Simultaneous Probit Models." *Journal of Econometrics*.
+- Smith, Richard J., and Richard W. Blundell. 1986. "An Exogeneity Test for a Simultaneous Equation Tobit Model with an Application to Labor Supply." *Econometrica*.
+- Staiger, Douglas, and James H. Stock. 1997. "Instrumental Variables Regression with Weak Instruments." *Econometrica*.
+- Vytlacil, Edward. 2002. "Independence, Monotonicity, and Latent Index Models: An Equivalence Result." *Econometrica*.
+- Wooldridge, Jeffrey M. 2015. "Control Function Methods in Applied Econometrics." *Journal of Human Resources*.
+- Wright, Philip G. 1928. *The Tariff on Animal and Vegetable Oils*. Macmillan.
+- Young, Alwyn. 2022. "Consistency without Inference: Instrumental Variables in Practical Application." *European Economic Review*.

@@ -1,0 +1,1277 @@
+---
+title: "Replication: Does Premium Version Adoption in mHealth Improve User Engagement and Health-Related Outcomes?"
+subtitle: "Jiang, Uetake, and Yang (Marketing Science 2026): the Callaway-Sant'Anna workflow on a freemium app, with causalmetrics"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/07_did/jiang2026does/"
+  n_boot: 999
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "95%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(kableExtra)
+library(fixest)
+library(MatchIt)
+data_path <- params$data_path
+n_boot <- params$n_boot
+data_md5 <- tools::md5sum(file.path(data_path, "data", c("simulated_data.csv", "simulated_data_robust_accuracy.csv")))
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+fmt0 <- function(x) formatC(x, digits = 0, format = "f", big.mark = ",")
+paren <- function(x, digits = 3) paste0("(", fmt(x, digits), ")")
+est_se <- function(e, s, digits = 3) paste0(fmt(e, digits), " ", paren(s, digits))
+ci_of <- function(e, s, digits = 3) paste0("[", fmt(e - qnorm(0.975) * s, digits), ", ", fmt(e + qnorm(0.975) * s, digits), "]")
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+run_dcdh <- requireNamespace("DIDmultiplegtDYN", quietly = TRUE) && requireNamespace("polars", quietly = TRUE)
+run_honest <- requireNamespace("HonestDiD", quietly = TRUE)
+outcomes6 <- c("track_exercise_avg", "track_food_avg", "within_track_avg",
+               "exercisecalories_avg", "lower_initial_avg", "weight_loss_norm_avg")
+labels6 <- c("Exercise tracking", "Food tracking", "Within budget",
+             "Exercise calories", "Positive weight loss", "Weight loss amount")
+names(labels6) <- outcomes6
+eng4 <- outcomes6[1:4]
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is whether paying for the premium tier of a freemium
+fitness app changes what users do and what they achieve.** Jiang, Uetake,
+and Yang (2026) observe 11,873 users of a food- and exercise-tracking app
+for 15 weeks after registration. Some pay $39.99 for a year of premium
+features in weeks 1 to 7; most never do. The outcomes are four engagement
+measures (days tracking food, days tracking exercise, days tracking and
+staying within the calorie budget, exercise calories logged) and two
+health measures (any weight loss relative to the starting weight, pounds
+lost).
+
+**The answer is an immediate lift that fades and does not reach the
+scale.** Premium adopters track more in the adoption week, the lift
+attenuates within about five weeks, and weight loss shows at most a
+modest, delayed, and imprecise improvement. A mechanism section splits
+adopters by their exposure to the free version before upgrading: the lift
+is concentrated among low-exposure users, which fits hedonic decline
+(novelty wears off) rather than sunk costs (everyone paid the same fee).
+
+**The methodological point is why this paper anchors Section 07.**
+Adoption is staggered and chosen, and later adopters upgrade while their
+engagement is already rising. A pooled two-way fixed effects regression
+therefore overstates both the size and the persistence of the effects.
+The paper's preferred estimator is Callaway and Sant'Anna (2021) with the
+doubly robust score, not-yet-treated comparisons, and covariates in both
+nuisances, followed by the Rambachan and Roth (2023) sensitivity analysis
+and a matched-sample design for time-varying selection. That is exactly
+the workflow of the lecture, and every step below runs on the package's
+functions: `att_gt()`, `aggregate_att()`, `event_study_frame()`,
+`plot_event_study()`, `honestdid_inputs()`, plus `bacon_decomp()`,
+`twfe_weights()`, `pretrend_power()`, `did_imputation()`, and
+`sdid_weights()` in the extensions.
+
+**What the replication package allows.** The proprietary data are under a
+nondisclosure agreement. The authors ship two simulated datasets that
+preserve the panel structure and all variables, the complete analysis
+code (15 R scripts and one Stata script), and a README that says the
+scripts are illustrational: numbers from the simulated data differ from
+the paper. The standard for matching in this note is therefore the
+authors' scripts run on the simulated data; published numbers are printed
+for orientation only and labelled as such. Section \@ref(sec-verify)
+verifies the match standard directly.
+
+# Data and setting {#sec-data}
+
+**One row per user-week, with adoption timing, outcomes, and the
+covariates the design conditions on.** `weeks_join` counts weeks since
+registration (1 to 15). `week_upgrade` is the adoption week; values above
+100 mean the user never upgrades in the window. The `first_7_*` columns
+are week-1 covariates: engagement, weight, and three national Google
+search indexes for app- and weight-loss-related terms.
+
+```{r load}
+Data <- read.csv(file.path(data_path, "data", "simulated_data.csv"))
+Data$norm_distance <- Data$initial_distance / Data$initialweight
+users <- Data %>% arrange(userid, weeks_join) %>% group_by(userid) %>% slice(1) %>% ungroup()
+c(users = nrow(users), user_weeks = nrow(Data), weeks = max(Data$weeks_join),
+  adopters_w1_7 = sum(users$week_upgrade <= 7), never = sum(users$week_upgrade > 100))
+```
+
+**The estimation sample drops week-1 adopters so every treated user has a
+pre-period.** Adopters in weeks 2 to 7 plus never-adopters form the DiD
+sample used from Table 3 onward. The group variable `g` codes
+never-adopters as 0, the package's convention.
+
+```{r sample}
+dat <- Data %>% filter((week_upgrade >= 2 & week_upgrade <= 7) | week_upgrade > 100) %>%
+  mutate(g = ifelse(week_upgrade > 100, 0L, week_upgrade),
+         rel = ifelse(g == 0, -1000L, weeks_join - week_upgrade),
+         rel_b = ifelse(rel <= -4, -1000L, pmin(rel, 13L)))
+xv <- c("initialweight", "heightinches", "age", "first_day", "ini_goalweight", "ini_goalbmi",
+        "ini_bmi", "gender", "norm_distance",
+        "first_7_track_food_avg", "first_7_foodcalories_avg", "first_7_track_exercise_avg",
+        "first_7_within_track_avg", "first_7_exercisecalories_avg", "first_7_lower_initial_avg",
+        "first_7_weight_loss_norm_avg", "first_7_app_weight_loss_search_avg",
+        "first_7_app_premium_search_avg", "first_7_weight_loss_premium_search_avg")
+table(users$week_upgrade[users$week_upgrade <= 7])
+```
+
+## Table 1: summary statistics {#sec-table1}
+
+**Table 1 describes the full sample of 11,873 users, per-user averages
+over the 15 weeks.** The published sample is 29 percent male, 42 years
+old, 204 pounds at the start, aiming to lose 19 percent of the initial
+weight; food is tracked on 58 percent of days. The simulated data are
+drawn to preserve these properties.
+
+```{r table1}
+sumdat <- Data %>% filter(week_upgrade <= 7 | week_upgrade > 100) %>%
+  arrange(userid, weeks_join) %>% group_by(userid) %>%
+  mutate(across(c(track_food_avg, track_exercise_avg, within_track_avg,
+                  exercisecalories_avg, foodcalories_avg, budgetcalories_avg), mean,
+                .names = "{.col}_mean")) %>% slice(1) %>% ungroup()
+t1_vars <- c(gender = "Male", age = "Age", initialweight = "Initial weight (lb)",
+             ini_goalweight = "Target weight (lb)", initial_distance = "Initial distance to goal weight (lb)",
+             norm_distance = "Proportional distance to goal weight",
+             budgetcalories_avg = "Suggested budget of calories (kcal)",
+             foodcalories_avg_mean = "Food calories logged (kcal)",
+             exercisecalories_avg_mean = "Exercise calories logged (kcal)",
+             track_food_avg_mean = "Avg. proportion of days tracked food",
+             track_exercise_avg_mean = "Avg. proportion of days tracked exercise",
+             within_track_avg_mean = "Avg. proportion of days tracked and within budget",
+             active_days = "Number of active days")
+t1 <- tibble(Variable = unname(t1_vars),
+             Mean = sapply(names(t1_vars), function(v) mean(sumdat[[v]], na.rm = TRUE)),
+             `Std. dev.` = sapply(names(t1_vars), function(v) sd(sumdat[[v]], na.rm = TRUE)))
+t1 %>% mutate(across(where(is.numeric), ~ fmt(.x))) %>%
+  bind_rows(tibble(Variable = "N", Mean = fmt0(nrow(sumdat)), `Std. dev.` = "")) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lrr",
+      caption = "Table 1 of the paper: summary statistics for the full sample (simulated data; per-user averages over the 15-week window).") %>%
+  tab_style()
+```
+
+## Figure 1: when users upgrade {#sec-figure1}
+
+**Adoption is front-loaded and staggered, which is the whole
+identification problem.** Most upgrades happen in week 1; the histogram
+motivates both the staggered design and the decision to drop week-1
+adopters, who have no pre-period.
+
+```{r figure1, echo = FALSE, fig.height = 3.2, fig.cap = "Figure 1 of the paper: number of premium upgrades in each week since registration (simulated data)."}
+users %>% filter(week_upgrade <= 7) %>% count(week_upgrade) %>%
+  ggplot(aes(x = factor(paste0("Week ", week_upgrade), levels = paste0("Week ", 1:7)), y = n)) +
+  geom_col(fill = "#c9c58a", width = 0.95) +
+  labs(x = "Week Upgrade", y = "Frequency") +
+  theme_minimal(base_size = 12) + theme(panel.grid.minor = element_blank())
+```
+
+## Table 2: who upgrades {#sec-table2}
+
+**Table 2 profiles adopters with a linear probability model and shows
+why selection is the threat.** The published estimates say adopters are
+older, aim to lose a larger share of their weight, log more exercise
+calories in week 1, and are less likely to have tracked food consistently
+in week 1; the app-name premium search index predicts upgrading. The
+regression uses classical standard errors, as the authors' `lm` call
+does.
+
+```{r table2}
+f1 <- ever_upgrade ~ initialweight + heightinches + age + first_day + ini_goalweight +
+  ini_goalbmi + ini_bmi + norm_distance + gender + first_7_track_food_avg +
+  first_7_foodcalories_avg + first_7_track_exercise_avg + first_7_within_track_avg +
+  first_7_exercisecalories_avg + first_7_lower_initial_avg + first_7_weight_loss_norm_avg
+f2 <- update(f1, . ~ . + first_7_app_premium_search_avg + first_7_app_weight_loss_search_avg +
+               first_7_weight_loss_premium_search_avg)
+users_r <- users %>% filter((week_upgrade >= 2 & week_upgrade <= 7) | week_upgrade > 100)
+m1 <- feols(f1, data = users, vcov = "iid")
+m2 <- feols(f2, data = users_r, vcov = "iid")
+cm <- c(initialweight = "Initial weight", heightinches = "Height", age = "Age",
+        first_day = "Start date", ini_goalweight = "Initial goal weight",
+        ini_goalbmi = "Initial goal BMI", ini_bmi = "Initial BMI",
+        norm_distance = "Prop. distance to goal weight", gender = "Male",
+        first_7_track_food_avg = "Prop. days tracked food (wk 1)",
+        first_7_foodcalories_avg = "Food calories (wk 1)",
+        first_7_track_exercise_avg = "Prop. days tracked exercise (wk 1)",
+        first_7_within_track_avg = "Prop. days within budget (wk 1)",
+        first_7_exercisecalories_avg = "Exercise calories (wk 1)",
+        first_7_lower_initial_avg = "Prop. days below initial weight (wk 1)",
+        first_7_weight_loss_norm_avg = "Avg. weight change (wk 1)",
+        first_7_app_premium_search_avg = "App premium searches (wk 1)",
+        first_7_app_weight_loss_search_avg = "App weight loss searches (wk 1)",
+        first_7_weight_loss_premium_search_avg = "Weight loss premium searches (wk 1)")
+modelsummary::modelsummary(list("Full sample" = m1, "Restricted sample" = m2),
+  output = "kableExtra", coef_map = cm, stars = c(`*` = 0.10, `**` = 0.05, `***` = 0.01),
+  gof_map = list(list(raw = "nobs", clean = "Observations", fmt = 0),
+                 list(raw = "r.squared", clean = "R2", fmt = 3)),
+  fmt = 3, title = "Table 2 of the paper: linear probability model of upgrading within seven weeks (classical standard errors, as in the authors' script). The restricted sample is the DiD sample: adopters in weeks 2-7 and never-adopters.") %>%
+  tab_style("scale_down")
+```
+
+# The staggered DiD design {#sec-design}
+
+**The estimand is the group-time average treatment effect and everything
+else is an aggregation of it.** For adoption cohort $g$ and week $t$,
+$ATT(g,t) = E[Y_t(1) - Y_t(0) \mid G = g]$. Callaway and Sant'Anna
+(2021) estimate each cell by a doubly robust comparison of the outcome
+change from $g-1$ to $t$ between cohort $g$ and users not yet treated at
+$t$, with the covariates entering a propensity score and an outcome
+regression. Under limited anticipation and conditional parallel trends,
+either nuisance being correct suffices. Dynamic aggregation over event
+time $e = t - g$ gives the event studies of Figures 2 and 3; the simple
+aggregation gives the overall ATT of Table 3; the multiplier bootstrap
+gives simultaneous bands.
+
+**The specification, exactly as in the authors' scripts.**
+
+- Sample: adopters in weeks 2-7 plus never-adopters (`r fmt0(length(unique(dat$userid)))` users).
+- Comparison group: not yet treated (never-adopters plus later cohorts).
+- Method: doubly robust; logistic propensity, linear outcome regression.
+- Covariates: demographics, start date, initial goals and BMI,
+  proportional distance to goal, week-1 engagement and weight, week-1
+  search indexes (19 variables).
+- Benchmark: TWFE event study with user and week fixed effects, dummies
+  for event times $-3$ to $12$ and $13{+}$, reference: never-adopters and
+  event times $\le -4$; pooled TWFE with a single post indicator.
+  Standard errors clustered by user everywhere.
+
+## Verifying the match standard {#sec-verify}
+
+**Our `att_gt()` reproduces the `did` package on this data to every
+digit, and the TWFE helper reproduces the authors' dummy regression
+exactly.** The chunk runs both packages on food tracking and compares;
+it also compares `fixest::i()` with the authors' hand-built dummies.
+
+```{r verify, cache = TRUE, cache.extra = data_md5}
+a_cm <- att_gt(dat, id = "userid", time = "weeks_join", group = "g", y = "track_food_avg",
+               x = xv, method = "dr", control_group = "notyet", n_boot = 0)
+s_cm <- aggregate_att(a_cm, type = "simple", n_boot = 0)
+b_did <- suppressWarnings(did::att_gt(yname = "track_food_avg", tname = "weeks_join",
+  idname = "userid", gname = "week_upgrade", xformla = reformulate(xv), data = dat,
+  control_group = "notyettreated", est_method = "dr"))
+s_did <- did::aggte(b_did, type = "simple")
+tw_i <- feols(track_food_avg ~ i(rel_b, ref = -1000) | userid + weeks_join, data = dat, cluster = ~userid)
+da <- dat
+for (k in 0:12) da[[paste0("u_", k)]] <- as.integer(da$rel == k)
+da$u_13a <- as.integer(da$rel >= 13 & da$g != 0)
+for (k in 1:3) da[[paste0("u_p", k)]] <- as.integer(da$rel == -k)
+tw_a <- feols(reformulate(c(paste0("u_p", 3:1), paste0("u_", 0:12), "u_13a"),
+                          response = "track_food_avg"), data = da,
+              fixef = c("userid", "weeks_join"), cluster = ~userid)
+c(att_gt_vs_did = abs(s_cm$overall$estimate - s_did$overall.att),
+  twfe_i_vs_dummies = max(abs(sort(coef(tw_i)) - sort(coef(tw_a)))))
+```
+
+**Both differences are zero to machine precision.** From here on, every
+Callaway-Sant'Anna object is the package's, and every published number is
+quoted for orientation.
+
+```{r helpers, include = FALSE}
+# TWFE event study in the authors' specification; returns a fixest fit.
+tw_es <- function(y, data) {
+  feols(as.formula(paste0(y, " ~ i(rel_b, ref = -1000) | userid + weeks_join")),
+        data = data, cluster = ~userid)
+}
+# Event-study plot in the paper's style: pre in salmon, post in blue.
+paper_es <- function(frame, title, band = FALSE, ylab = "Estimates") {
+  frame$period <- factor(ifelse(frame$event_time < 0, "Pre", "Post"), levels = c("Pre", "Post"))
+  lo <- if (band && all(!is.na(frame$band.low))) frame$band.low else frame$conf.low
+  hi <- if (band && all(!is.na(frame$band.high))) frame$band.high else frame$conf.high
+  ggplot(frame, aes(x = event_time, y = estimate, colour = period)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_point(size = 1.4) +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.25, linewidth = 0.4) +
+    scale_colour_manual(values = c(Pre = "salmon", Post = "blue"), name = NULL) +
+    scale_x_continuous(breaks = seq(min(frame$event_time), max(frame$event_time), by = 2)) +
+    labs(title = title, x = "Time Relative to Treatment", y = ylab) +
+    theme_minimal(base_size = 9) +
+    theme(plot.title = element_text(size = 8.5, face = "bold"), legend.position = "right",
+          panel.grid.minor = element_blank())
+}
+frame_tw <- function(fit) event_study_frame(TWFE = fit)
+frame_cs <- function(dyn) event_study_frame(CS = dyn)
+```
+
+# Results: event studies and the overall ATT {#sec-results}
+
+```{r cs-main, cache = TRUE, cache.extra = list(data_md5, n_boot)}
+cs_main <- lapply(setNames(outcomes6, outcomes6), function(y)
+  att_gt(dat, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+         method = "dr", control_group = "notyet", n_boot = n_boot, seed = 678))
+dyn_main <- lapply(cs_main, aggregate_att, type = "dynamic", min_e = -3, seed = 678)
+simple_main <- lapply(cs_main, aggregate_att, type = "simple", seed = 678)
+tw_main <- lapply(setNames(outcomes6, outcomes6), function(y) tw_es(y, dat))
+```
+
+## Figures 2 and 3: TWFE against Callaway-Sant'Anna {#sec-fig23}
+
+**The two columns of each figure are the paper's argument in one
+picture.** The left column is the TWFE event study: a sharp rise at
+adoption that appears to persist for three months. The right column is
+the Callaway-Sant'Anna event study with simultaneous bands: the same
+sharp rise, but it attenuates within weeks. The published reading is that
+TWFE overstates persistence because later adopters upgrade on rising
+trajectories and contaminate the comparisons.
+
+```{r figure2, echo = FALSE, fig.height = 11.5, fig.cap = "Figure 2 of the paper: impact of premium adoption on the four engagement outcomes. Left column: TWFE event studies (pointwise 95 percent intervals, clustered by user; reference: never-adopters and event times at or below -4). Right column: Callaway-Sant'Anna doubly robust event studies with not-yet-treated comparisons and simultaneous confidence bands."}
+plots2 <- list()
+for (y in eng4) {
+  plots2[[length(plots2) + 1]] <- paper_es(frame_tw(tw_main[[y]]), paste0("TWFE: ", labels6[y]))
+  plots2[[length(plots2) + 1]] <- paper_es(frame_cs(dyn_main[[y]]), paste0("Staggered DiD: ", labels6[y]), band = TRUE)
+}
+wrap_plots(plots2, ncol = 2)
+```
+
+```{r figure3, echo = FALSE, fig.height = 6, fig.cap = "Figure 3 of the paper: impact of premium adoption on the two health outcomes, same layout as Figure 2."}
+plots3 <- list()
+for (y in outcomes6[5:6]) {
+  plots3[[length(plots3) + 1]] <- paper_es(frame_tw(tw_main[[y]]), paste0("TWFE: ", labels6[y]))
+  plots3[[length(plots3) + 1]] <- paper_es(frame_cs(dyn_main[[y]]), paste0("Staggered DiD: ", labels6[y]), band = TRUE)
+}
+wrap_plots(plots3, ncol = 2)
+```
+
+```{r fig23-numbers, echo = FALSE}
+e0 <- sapply(dyn_main, function(d) d$by$estimate[d$by$event_time == 0])
+e5 <- sapply(dyn_main, function(d) d$by$estimate[d$by$event_time == 5])
+e10 <- sapply(dyn_main, function(d) d$by$estimate[d$by$event_time == 10])
+```
+
+**On the simulated data the levels and the TWFE-CS ordering reproduce;
+the decay is clear for the exercise outcomes and slower for the food
+outcomes.** Exercise tracking falls from `r fmt(e0["track_exercise_avg"])`
+in the adoption week to `r fmt(e5["track_exercise_avg"])` five weeks
+later, and exercise calories from `r fmt(e0["exercisecalories_avg"], 1)`
+to `r fmt(e5["exercisecalories_avg"], 1)`. Food tracking starts at
+`r fmt(e0["track_food_avg"])`, is still `r fmt(e5["track_food_avg"])` at
+week five, and declines to `r fmt(e10["track_food_avg"])` by week ten;
+budget adherence behaves like food tracking. The published estimates
+attenuate faster (food tracking insignificant after week five), so this
+simulated draw damps the decay without changing its direction. The
+health outcomes show wide bands and no effect covered by the band at any
+horizon.
+
+## Table 3: overall ATT, pooled TWFE against Callaway-Sant'Anna {#sec-table3}
+
+**The overall ATT makes the overstatement quantitative.** The pooled
+TWFE coefficient (one post indicator, user and week fixed effects) is
+compared with the simple aggregation of the group-time effects.
+
+```{r table3}
+tw_pool <- lapply(setNames(outcomes6, outcomes6), function(y)
+  feols(as.formula(paste0(y, " ~ upgraded | userid + weeks_join")), data = dat, cluster = ~userid))
+row_tw <- function(y) {
+  ct <- coeftable(tw_pool[[y]])["upgraded", ]
+  tibble(Variable = labels6[y], ATT = fmt(ct[1]), `Std. error` = fmt(ct[2]), `95\\% CI` = ci_of(ct[1], ct[2]))
+}
+row_cs <- function(y) {
+  o <- simple_main[[y]]$overall
+  tibble(Variable = labels6[y], ATT = fmt(o$estimate), `Std. error` = fmt(o$std.error), `95\\% CI` = ci_of(o$estimate, o$std.error))
+}
+pub3 <- tibble(Variable = labels6,
+  `Published TWFE` = c("0.124", "0.163", "0.124", "47.657", "0.036", "1.584"),
+  `Published CS` = c("0.074", "0.060", "0.048", "32.183", "0.026", "0.487"))
+bind_rows(bind_rows(lapply(outcomes6, row_tw)), bind_rows(lapply(outcomes6, row_cs))) %>%
+  left_join(pub3, by = "Variable") %>%
+  mutate(`Published ATT` = c(pub3$`Published TWFE`, pub3$`Published CS`)) %>%
+  select(Variable, ATT, `Std. error`, `95\\% CI`, `Published ATT`) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, align = "lcccc",
+      caption = "Table 3 of the paper: overall ATT estimates from the pooled TWFE regression and from the simple aggregation of the Callaway-Sant'Anna group-time effects, standard errors clustered by user. The published column shows the proprietary-data estimates for orientation.") %>%
+  pack_rows("Panel A: pooled TWFE estimates", 1, 6) %>%
+  pack_rows("Panel B: Callaway and Sant'Anna (2021) estimates", 7, 12) %>%
+  tab_style()
+```
+
+```{r table3-numbers, echo = FALSE}
+gap <- sapply(outcomes6, function(y) coef(tw_pool[[y]])[["upgraded"]] / simple_main[[y]]$overall$estimate)
+gap5 <- gap[setdiff(outcomes6, "lower_initial_avg")]
+```
+
+**TWFE is larger for the four engagement outcomes and the weight-loss
+amount, here by factors of `r fmt(min(gap5), 1)` to
+`r fmt(max(gap5), 1)`.** Positive weight loss is small and imprecise in
+both panels, and its two estimates are indistinguishable. In the paper
+the ratios run from about 1.5 (exercise calories) to 3.3 (weight loss
+amount). Extension \@ref(sec-ext-bacon) decomposes where the gap comes
+from.
+
+# Sensitivity and robustness {#sec-robust}
+
+## Figure 4: overlap {#sec-figure4}
+
+**The overlap assumption is checked by the propensity-score densities by
+cohort.** The score is a pooled logistic regression of the premium
+indicator on the design covariates plus first-week weight, as in the
+authors' script; nondegenerate, overlapping densities support the
+weighting.
+
+```{r figure4, fig.height = 3.8, fig.cap = "Figure 4 of the paper: density of the predicted propensity score across adoption cohorts (pooled logistic regression on the design covariates plus first-week weight)."}
+ps_x <- c(xv, "first_7_weight_avg")
+ps_fit <- glm(reformulate(ps_x, response = "upgraded"), data = dat, family = binomial())
+dat$pscore <- predict(ps_fit, newdata = dat, type = "response")
+dat$cohort_lab <- ifelse(dat$g == 0, "Never", paste0("Week ", dat$g))
+ggplot(dat, aes(x = pscore, colour = cohort_lab)) +
+  geom_density() +
+  scale_colour_manual(values = c("Week 2" = "orange", "Week 3" = "blue", "Week 4" = "brown",
+                                 "Week 5" = "green", "Week 6" = "pink", "Week 7" = "darkgreen",
+                                 "Never" = "purple"), name = "Upgrade Week") +
+  coord_cartesian(xlim = c(0, 0.1), ylim = c(0, 60)) +
+  labs(x = "Predicted Propensity Score", y = "Density") +
+  theme_classic(base_size = 11) + theme(legend.position = "top")
+```
+
+## Figures 5 and 6: pre-adoption trajectories {#sec-fig56}
+
+**The raw trajectories are the selection story.** Mean outcomes by week
+since registration, one line per adoption cohort (including week-1
+adopters) plus never-adopters, with each cohort's adoption week marked.
+In the paper, later adopters ride rising engagement into their upgrade
+and never-adopters drift down; weight-loss trajectories rise for
+everyone, steepest for late adopters.
+
+```{r figure56, echo = FALSE, fig.height = 8.5, fig.cap = "Figures 5 and 6 of the paper: pre-adoption trajectories. Mean outcome by week since registration for each adoption cohort and for never-adopters; dashed vertical lines mark adoption weeks."}
+traj <- Data %>%
+  mutate(cohort_lab = case_when(week_upgrade <= 7 ~ paste0("Week ", week_upgrade),
+                                week_upgrade > 100 ~ "Never Adopters")) %>%
+  filter(!is.na(cohort_lab))
+cols_traj <- c("Week 1" = "red", "Week 2" = "orange", "Week 3" = "blue", "Week 4" = "brown",
+               "Week 5" = "green", "Week 6" = "pink", "Week 7" = "darkgreen",
+               "Never Adopters" = "purple")
+traj_plot <- function(y) {
+  traj %>% group_by(weeks_join, cohort_lab) %>%
+    summarise(m = mean(.data[[y]], na.rm = TRUE), .groups = "drop") %>%
+    ggplot(aes(x = weeks_join, y = m, colour = cohort_lab)) +
+    geom_line(linewidth = 0.5) +
+    geom_vline(xintercept = 1:7, linetype = "dashed", colour = cols_traj[1:7], linewidth = 0.3) +
+    scale_colour_manual(values = cols_traj, name = NULL) +
+    scale_x_continuous(breaks = seq(1, 15, 2)) +
+    labs(x = "Weeks Since Joined", y = labels6[y]) +
+    theme_minimal(base_size = 8.5) + theme(panel.grid.minor = element_blank())
+}
+wrap_plots(lapply(outcomes6, traj_plot), ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+## Figure 7: Rambachan-Roth sensitivity {#sec-figure7}
+
+**The sensitivity analysis asks how large a violation of conditional
+parallel trends the significant effects survive.** The relative-magnitudes
+family bounds the post-treatment violation by $\bar M$ times the largest
+pre-treatment violation; the conditional least-favorable hybrid interval
+is computed for the week-of-adoption effect over a grid of $\bar M$.
+`att_gt()` is re-run with the universal base period, so every pre-period
+coefficient is a genuine pre-trend estimate, and `honestdid_inputs()`
+hands the coefficients and their clustered covariance to HonestDiD. The
+published thresholds are $\bar M \le 1.6$ for exercise tracking,
+$\le 1.1$ for food tracking, and $\le 1.0$ for the other two engagement
+outcomes.
+
+```{r cs-universal, cache = TRUE, cache.extra = data_md5}
+cs_uni <- lapply(setNames(eng4, eng4), function(y)
+  att_gt(dat, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+         method = "dr", control_group = "notyet", base_period = "universal", n_boot = 0))
+dyn_uni <- lapply(cs_uni, aggregate_att, type = "dynamic", min_e = -4, max_e = 3, n_boot = 0)
+```
+
+```{r honest, cache = TRUE, cache.extra = data_md5, eval = run_honest}
+honest_one <- function(dyn, mbars = seq(0.5, 1.8, by = 0.1)) {
+  hi <- honestdid_inputs(dyn)
+  l1 <- HonestDiD::basisVector(1, hi$numPostPeriods)
+  orig <- HonestDiD::constructOriginalCS(betahat = hi$betahat, sigma = hi$sigma,
+    numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods, l_vec = l1)
+  rob <- HonestDiD::createSensitivityResults_relativeMagnitudes(betahat = hi$betahat,
+    sigma = hi$sigma, numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods,
+    Mbarvec = mbars, l_vec = l1, gridPoints = 100)
+  list(orig = as.data.frame(orig), rob = as.data.frame(rob))
+}
+honest_res <- lapply(dyn_uni, honest_one)
+```
+
+```{r figure7, echo = FALSE, eval = run_honest, fig.height = 7, fig.cap = "Figure 7 of the paper: conditional least-favorable hybrid confidence intervals for the week-of-adoption effect under relative-magnitudes violations of size Mbar times the largest pre-treatment violation. The leftmost red interval is the original confidence interval under conditional parallel trends."}
+honest_plot <- function(hr, title) {
+  rob <- hr$rob; orig <- hr$orig
+  df <- bind_rows(tibble(M = min(rob$Mbar) - 0.15, lb = orig$lb, ub = orig$ub, which = "Original"),
+                  tibble(M = rob$Mbar, lb = rob$lb, ub = rob$ub, which = "C-LF"))
+  ggplot(df, aes(x = M, colour = which)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.04, linewidth = 0.5) +
+    scale_colour_manual(values = c("C-LF" = "#0072B2", "Original" = "#D55E00"), name = NULL) +
+    labs(title = title, x = "Mbar", y = "Effect at event time 0") +
+    theme_minimal(base_size = 9) + theme(plot.title = element_text(size = 9, face = "bold"))
+}
+wrap_plots(Map(honest_plot, honest_res, labels6[eng4]), ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r figure7-numbers, echo = FALSE, eval = run_honest}
+last_sig <- sapply(honest_res, function(hr) {
+  sig <- hr$rob$lb > 0
+  if (all(sig)) Inf else if (any(sig)) max(hr$rob$Mbar[sig]) else 0
+})
+last_txt <- ifelse(is.infinite(last_sig), "beyond the plotted 1.8", fmt(last_sig, 1))
+```
+
+**On the simulated data the week-of-adoption effects stay significant up
+to `r paste(paste0(labels6[eng4], ": ", last_txt), collapse = "; ")`.**
+The reading is the paper's: the effects survive violations comparable to
+the worst pre-period deviation, and extreme violations erase them.
+Extension \@ref(sec-ext-honest) extends the exercise to more horizons and
+the smoothness family, on a finer grid.
+
+## Figure 8: matched sample for time-varying selection {#sec-figure8}
+
+**The matched design conditions on recent trajectories, not only week-1
+levels.** Adopters in weeks 5 and 6 are matched one-to-ten to
+never-adopters on demographics, goals, week-1 engagement, and weeks 3-4
+engagement, weight, and search intensities, with a generalized additive
+model propensity (the authors' seed 123). A TWFE event study on the
+matched panel then adjusts for what the matching balanced.
+
+```{r figure8-match, cache = TRUE, cache.extra = data_md5}
+recent <- Data %>% arrange(userid, weeks_join) %>% group_by(userid) %>%
+  mutate(across(c(track_food_avg, foodcalories_avg, track_exercise_avg, within_track_avg,
+                  exercisecalories_avg, lower_initial_avg, weight_loss_norm_avg, weight_avg,
+                  app_premium_search_avg, app_weight_loss_search_avg, weight_loss_premium_search_avg),
+                list(w3 = ~nth(.x, 3), w4 = ~nth(.x, 4), w5 = ~nth(.x, 5)),
+                .names = "{.col}_{.fn}")) %>% ungroup()
+sub8 <- recent %>% group_by(userid) %>%
+  filter(week_upgrade %in% c(5, 6) | ever_upgrade == 0) %>% slice(1) %>% ungroup()
+f8 <- reformulate(c("initialweight", "heightinches", "age", "first_day", "ini_goalweight",
+  "ini_goalbmi", "ini_bmi", "gender", "norm_distance",
+  "first_7_track_food_avg", "first_7_foodcalories_avg", "first_7_track_exercise_avg",
+  "first_7_within_track_avg", "first_7_exercisecalories_avg",
+  paste0(c("track_food_avg", "foodcalories_avg", "track_exercise_avg", "within_track_avg",
+           "exercisecalories_avg", "lower_initial_avg", "weight_loss_norm_avg", "weight_avg",
+           "app_weight_loss_search_avg", "app_premium_search_avg", "weight_loss_premium_search_avg"),
+         rep(c("_w3", "_w4"), each = 11))), response = "ever_upgrade")
+set.seed(123)
+m8 <- matchit(f8, data = sub8, method = "nearest", distance = "gam", ratio = 10, replacement = FALSE)
+ids8 <- match.data(m8)$userid
+dat8 <- Data %>% filter(userid %in% ids8) %>%
+  mutate(g = ifelse(week_upgrade > 100, 0L, week_upgrade),
+         rel = ifelse(g == 0, -1000L, weeks_join - week_upgrade),
+         rel_b = ifelse(rel <= -4, -1000L, pmin(rel, 13L)))
+c(adopters = sum(sub8$ever_upgrade), matched_users = length(ids8))
+```
+
+```{r figure8, echo = FALSE, fig.height = 8.5, fig.cap = "Figure 8 of the paper: TWFE event studies on the matched sample (adopters in weeks 5-6 matched 1:10 to never-adopters on demographics, goals, week-1 engagement, and weeks 3-4 engagement, weight, and search intensities). Pointwise 95 percent intervals, clustered by user."}
+tw8 <- lapply(setNames(outcomes6, outcomes6), function(y) tw_es(y, dat8))
+wrap_plots(lapply(outcomes6, function(y)
+  paper_es(frame_tw(tw8[[y]]), paste0("Matched: ", labels6[y]))), ncol = 2)
+```
+
+**The immediate lift and the attenuation survive the matching, and the
+pre-periods flatten.** That is the published conclusion: the response is
+not only a motivational surge that jointly causes upgrading and
+engagement. Extension \@ref(sec-ext-matchcs) re-estimates this design
+with the main estimator instead of TWFE.
+
+# Mechanisms: exposure to the free version {#sec-mechanism}
+
+## Tables 4 and 5: the exposure split {#sec-table45}
+
+**Hedonic decline and sunk costs both predict the immediate lift; only
+hedonic decline predicts that prior exposure dampens it.** Adopters are
+split at the median days of tracking before the upgrade. Table 4 shows
+the two groups are otherwise comparable. Table 5 estimates the
+Callaway-Sant'Anna effects separately for each group against the
+never-adopters, at the adoption week and one week after.
+
+```{r table4}
+med_track <- median(users$total_track_before[users$week_upgrade >= 2 & users$week_upgrade <= 7])
+never_ids <- users$userid[users$week_upgrade > 100]
+dat_exp <- dat %>% mutate(distance_goal = weight_avg - goalweight)
+adopt_at <- dat_exp %>% filter(weeks_join == week_upgrade)
+low_at <- adopt_at %>% filter(total_track_before < med_track)
+high_at <- adopt_at %>% filter(total_track_before >= med_track)
+t4_vars <- c(total_track_before = "Number of prior days tracked food/exercise", gender = "Male",
+             age = "Age", initialweight = "Initial weight (lb)", heightinches = "Height (inch)",
+             ini_goalweight = "Initial goal weight (lb)", ini_goalbmi = "Initial goal BMI",
+             weight_avg = "Current weight (lb)", distance_goal = "Current distance to goal (lb)")
+t4 <- bind_rows(lapply(names(t4_vars), function(v) {
+  tt <- t.test(low_at[[v]], high_at[[v]])
+  tibble(Variable = t4_vars[v], `Low exposure` = fmt(mean(low_at[[v]], na.rm = TRUE)),
+         `High exposure` = fmt(mean(high_at[[v]], na.rm = TRUE)),
+         `t-statistic` = fmt(tt$statistic), `p-value` = fmt(tt$p.value))
+}))
+t4 %>% bind_rows(tibble(Variable = "Number of observations", `Low exposure` = fmt0(nrow(low_at)),
+                        `High exposure` = fmt0(nrow(high_at)), `t-statistic` = "", `p-value` = "")) %>%
+  kbl(booktabs = TRUE, linesep = "",
+      caption = "Table 4 of the paper: comparison of means between low- and high-exposure adopters (median split on days of food or exercise tracking before the upgrade), with two-sample t-tests.") %>%
+  tab_style()
+```
+
+```{r table5, cache = TRUE, cache.extra = data_md5}
+dat_low <- dat %>% filter((total_track_before < med_track & g > 0) | userid %in% never_ids)
+dat_high <- dat %>% filter((total_track_before >= med_track & g > 0) | userid %in% never_ids)
+t5_run <- function(data) lapply(setNames(eng4, eng4), function(y) {
+  a <- att_gt(data, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+              method = "dr", control_group = "notyet", n_boot = 499, seed = 1234)
+  aggregate_att(a, type = "dynamic", min_e = -3, na.rm = TRUE, seed = 1234)$by
+})
+t5_low <- t5_run(dat_low)
+t5_high <- t5_run(dat_high)
+```
+
+```{r table5-table, echo = FALSE}
+t5_row <- function(by, lab) {
+  w0 <- by[by$event_time == 0, ]; w1 <- by[by$event_time == 1, ]
+  tibble(Outcome = lab, `Estimate (wk 0)` = fmt(w0$estimate), `SE (wk 0)` = fmt(w0$std.error),
+         `Estimate (wk 1)` = fmt(w1$estimate), `SE (wk 1)` = fmt(w1$std.error))
+}
+bind_rows(lapply(eng4, function(y) bind_rows(
+  t5_row(t5_low[[y]], paste0(labels6[y], " (low exposure)")),
+  t5_row(t5_high[[y]], paste0(labels6[y], " (high exposure)"))))) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lcccc",
+      col.names = c("Outcome", "Estimate", "Std. error", "Estimate", "Std. error"),
+      caption = "Table 5 of the paper: heterogeneous effects by pre-adoption exposure. Callaway-Sant'Anna dynamic effects at the adoption week and one week after, estimated separately for low- and high-exposure adopters against never-adopters.") %>%
+  add_header_above(c(" " = 1, "Immediate (week 0)" = 2, "Short term (week 1)" = 2)) %>%
+  tab_style()
+```
+
+```{r table5-numbers, echo = FALSE}
+g50 <- function(l, y, e) l[[y]]$estimate[l[[y]]$event_time == e]
+```
+
+**Low-exposure adopters respond more, as the paper reports.** Food
+tracking one week after upgrading rises by `r fmt(g50(t5_low, "track_food_avg", 1))`
+for low-exposure adopters and `r fmt(g50(t5_high, "track_food_avg", 1))`
+for high-exposure adopters (published: 0.167 against 0.041, a wider gap
+than this simulated draw produces). The same ordering holds for every
+engagement outcome, most sharply for exercise calories. The sunk cost is
+the same $39.99 for everyone, so the asymmetry points to hedonic
+decline.
+
+## Figures 9 and 10: matched samples by exposure {#sec-fig910}
+
+**The sharpest version matches each exposure group to its own controls.**
+Week-5 adopters are split at their own median, each group is matched to
+never-adopters on recent (weeks 3-4) engagement and search (the authors'
+probit, ratio 2, seed 123 for the low group; GAM, ratio 1, seed 234 for
+the high group), and TWFE event studies run per group.
+
+```{r fig910-match, cache = TRUE, cache.extra = data_md5}
+med5 <- median(users$total_track_before[users$week_upgrade == 5])
+f910 <- reformulate(c("initialweight", "heightinches", "age", "first_day", "ini_goalweight",
+  "ini_goalbmi", "ini_bmi", "gender",
+  "track_food_avg_w3", "track_exercise_avg_w3",
+  paste0(c("track_food_avg", "foodcalories_avg", "track_exercise_avg", "within_track_avg",
+           "exercisecalories_avg", "lower_initial_avg", "weight_loss_norm_avg",
+           "app_weight_loss_search_avg", "app_premium_search_avg", "weight_loss_premium_search_avg"),
+         "_w4")), response = "ever_upgrade")
+match_ids <- function(cut_low, seed, dist, ratio, link = NULL) {
+  sub <- recent %>% group_by(userid) %>%
+    filter(week_upgrade == 5 | ever_upgrade == 0) %>% slice(1) %>% ungroup() %>%
+    filter(if (cut_low) total_track_before < med5 else total_track_before >= med5)
+  set.seed(seed)
+  args <- list(f910, data = sub, method = "nearest", distance = dist, ratio = ratio, replacement = FALSE)
+  if (!is.null(link)) args$link <- link
+  match.data(do.call(matchit, args), data = sub)$userid
+}
+ids_low5 <- match_ids(TRUE, 123, "glm", 2, link = "probit")
+ids_high5 <- match_ids(FALSE, 234, "gam", 1)
+panel_of <- function(ids) Data %>% filter(userid %in% ids) %>%
+  mutate(g = ifelse(week_upgrade > 100, 0L, week_upgrade),
+         rel = ifelse(g == 0, -1000L, weeks_join - week_upgrade),
+         rel_b = ifelse(rel <= -4, -1000L, pmin(rel, 13L)))
+pan_low5 <- panel_of(ids_low5); pan_high5 <- panel_of(ids_high5)
+c(low = length(ids_low5), high = length(ids_high5))
+```
+
+```{r figure910, echo = FALSE, fig.height = 11.5, fig.cap = "Figures 9 and 10 of the paper: TWFE event studies for week-5 adopters split at the median of pre-adoption exposure, each group matched to never-adopters on demographics, goals, and weeks 3-4 engagement, weight-loss, and search variables. Left column: low exposure; right column: high exposure."}
+p910 <- list()
+for (y in eng4) {
+  p910[[length(p910) + 1]] <- paper_es(frame_tw(tw_es(y, pan_low5)), paste0("Low exposure: ", labels6[y]))
+  p910[[length(p910) + 1]] <- paper_es(frame_tw(tw_es(y, pan_high5)), paste0("High exposure: ", labels6[y]))
+}
+wrap_plots(p910, ncol = 2)
+```
+
+**Only the low-exposure group shows the clear lift, as published.** The
+high-exposure panels sit near zero throughout. The same design for
+week-6 adopters (published as Online Figures D1 and D2) is reproduced in
+Section \@ref(sec-appendix-d).
+
+# Appendix replications {#sec-appendix}
+
+## Appendix A: alternative sample {#sec-appendix-a}
+
+**The published check re-runs everything on weeks 2-6 adopters and a
+3 percent random sample of never-adopters.** The point is that the
+baseline pattern is not driven by the week-7 cohort (19 users here) or by
+the size of the control pool.
+
+```{r appendix-a, cache = TRUE, cache.extra = data_md5}
+set.seed(123)
+never_3pct <- sample(never_ids, round(0.03 * length(never_ids)))
+dat_a <- dat %>% filter((g >= 2 & g <= 6) | userid %in% never_3pct)
+cs_a <- lapply(setNames(outcomes6, outcomes6), function(y)
+  att_gt(dat_a, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+         method = "dr", control_group = "notyet", n_boot = 499, seed = 678))
+dyn_a <- lapply(cs_a, aggregate_att, type = "dynamic", min_e = -3, seed = 678)
+```
+
+```{r appendix-a-fig, echo = FALSE, fig.height = 8.5, fig.cap = "Appendix Figures A1-A2 of the paper (Callaway-Sant'Anna panels): event studies on the alternative sample of weeks 2-6 adopters and a 3 percent random sample of never-adopters."}
+wrap_plots(lapply(outcomes6, function(y)
+  paper_es(frame_cs(dyn_a[[y]]), paste0("Alt. sample: ", labels6[y]), band = TRUE)), ncol = 2)
+```
+
+## Appendix B1: measurement-thresholded outcomes {#sec-appendix-b}
+
+**The second simulated file applies physiologically credible thresholds
+to food and weight logs.** The Callaway-Sant'Anna overall ATTs on that
+file sit next to the baseline Table 3 panel.
+
+```{r appendix-b, cache = TRUE, cache.extra = data_md5}
+DataB <- read.csv(file.path(data_path, "data", "simulated_data_robust_accuracy.csv"))
+DataB$norm_distance <- DataB$initial_distance / DataB$initialweight
+dat_b <- DataB %>% filter((week_upgrade >= 2 & week_upgrade <= 7) | week_upgrade > 100) %>%
+  mutate(g = ifelse(week_upgrade > 100, 0L, week_upgrade))
+simple_b <- lapply(setNames(outcomes6, outcomes6), function(y) {
+  a <- att_gt(dat_b, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+              method = "dr", control_group = "notyet", n_boot = 499, seed = 678)
+  aggregate_att(a, type = "simple", seed = 678)$overall
+})
+```
+
+```{r appendix-b-table, echo = FALSE}
+bind_rows(lapply(outcomes6, function(y) tibble(Variable = labels6[y],
+  `Baseline ATT` = est_se(simple_main[[y]]$overall$estimate, simple_main[[y]]$overall$std.error),
+  `Thresholded ATT` = est_se(simple_b[[y]]$estimate, simple_b[[y]]$std.error)))) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lcc",
+      caption = "Appendix Table B1 of the paper: Callaway-Sant'Anna overall ATTs on the accuracy-thresholded data next to the baseline estimates (standard errors in parentheses).") %>%
+  tab_style()
+```
+
+## Appendix C1: de Chaisemartin and d'Haultfoeuille {#sec-appendix-c1}
+
+**The first alternative estimator replaces the Callaway-Sant'Anna
+aggregation with the de Chaisemartin-d'Haultfoeuille dynamic estimator.**
+The authors run `did_multiplegt_dyn` with 13 effects and 2 placebos,
+clustered by user; the table mirrors their Panel B (the average total
+effect per switcher).
+
+```{r appendix-c1, cache = TRUE, cache.extra = data_md5, eval = run_dcdh}
+suppressPackageStartupMessages(library(polars))
+dcdh <- lapply(setNames(outcomes6, outcomes6), function(y) {
+  pdf(NULL)
+  m <- DIDmultiplegtDYN::did_multiplegt_dyn(as.data.frame(dat), y, "userid", "weeks_join",
+                                            "upgraded", effects = 13, placebo = 2,
+                                            cluster = "userid", graph_off = TRUE)
+  dev.off()
+  m$results$ATE
+})
+```
+
+```{r appendix-c1-table, echo = FALSE, eval = run_dcdh}
+bind_rows(lapply(outcomes6, function(y) {
+  r <- dcdh[[y]]
+  tibble(Variable = labels6[y], ATT = fmt(r[1, "Estimate"]), `Std. error` = fmt(r[1, "SE"]),
+         `95\\% CI` = paste0("[", fmt(r[1, "LB CI"]), ", ", fmt(r[1, "UB CI"]), "]"),
+         `CS ATT` = fmt(simple_main[[y]]$overall$estimate))
+})) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, align = "lcccc",
+      caption = "Appendix Table C1 of the paper: de Chaisemartin-d'Haultfoeuille average effect per switcher (13 effects, 2 placebos, clustered by user), with the Callaway-Sant'Anna simple ATT for comparison.") %>%
+  tab_style()
+```
+
+**The two heterogeneity-robust estimators agree on the engagement
+outcomes, as the paper reports for the proprietary data.** The
+weight-loss amount differs more, with both estimates inside each other's
+wide intervals. Both estimators sit well below the pooled TWFE of
+Table 3 for engagement.
+
+## Appendix C2: synthetic DiD {#sec-appendix-c2}
+
+**The second alternative is synthetic DiD, which the authors run in Stata
+cohort by cohort.** `sdid_weights()` is the package's implementation; it
+requires a block design, so it is applied per adoption cohort and the
+cohort estimates are combined with weights proportional to the number of
+treated cells, which is how the Stata command aggregates. Cohort 2 has a
+single pre-period and is excluded (the regularization needs two); no
+Stata output ships with the package, so these numbers stand without a
+comparison, and standard errors are omitted because each placebo
+replication refits the weights over 11,091 control units.
+
+```{r appendix-c2, cache = TRUE, cache.extra = data_md5}
+sdid_cohort <- function(y, gg) {
+  dg <- dat %>% filter(g == 0 | g == gg)
+  w <- sdid_weights(dg, id = "userid", time = "weeks_join", y = y, d = "upgraded")
+  c(estimate = w$estimate, n1 = w$N1, post = 15 - gg + 1)
+}
+sdid_tab <- lapply(setNames(outcomes6, outcomes6), function(y) {
+  cells <- sapply(3:7, function(gg) sdid_cohort(y, gg))
+  wts <- cells["n1", ] * cells["post", ]
+  list(by_cohort = cells["estimate", ], overall = sum(cells["estimate", ] * wts) / sum(wts))
+})
+```
+
+```{r appendix-c2-table, echo = FALSE}
+bind_rows(lapply(outcomes6, function(y) {
+  s <- sdid_tab[[y]]
+  tibble(Variable = labels6[y],
+         !!!setNames(lapply(fmt(s$by_cohort), identity), paste0("g = ", 3:7)),
+         `SDID overall` = fmt(s$overall), `CS ATT` = fmt(simple_main[[y]]$overall$estimate))
+})) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lccccccc",
+      caption = "Appendix Table C2 of the paper, in R: synthetic DiD estimates by adoption cohort (cohort 2 excluded: one pre-period) and their treated-cell-weighted combination, with the Callaway-Sant'Anna ATT for comparison.") %>%
+  tab_style("scale_down")
+```
+
+**Synthetic DiD lands near Callaway-Sant'Anna for the exercise and
+health outcomes and above it for food tracking and budget adherence.**
+It uses no covariates and builds its counterfactual by reweighting
+never-adopters to match each cohort's pre-period path, so it differs
+most where the week-1 covariates matter for selection. Later cohorts,
+which upgrade on rising trajectories, also show the largest cohort
+estimates, echoing Figure 5.
+
+## Appendix D: the TWFE coefficient tables and the week-6 exposure design {#sec-appendix-d}
+
+**Online Tables D1 and D2 print the coefficients behind the left panels
+of Figures 2 and 3.** They come straight from the same fits.
+
+```{r appendix-d-table, echo = FALSE}
+dtab <- lapply(outcomes6, function(y) {
+  fr <- frame_tw(tw_main[[y]])
+  setNames(est_se(fr$estimate, fr$std.error), fr$event_time)
+})
+et <- sort(unique(as.numeric(names(dtab[[1]]))))
+tibble(`Event time` = ifelse(et == 13, "13+", as.character(et)),
+       !!!setNames(lapply(dtab, function(v) v[as.character(et)]), labels6)) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lcccccc",
+      caption = "Online Tables D1-D2 of the paper: TWFE event-study coefficients for all six outcomes (standard errors in parentheses, clustered by user). Reference: never-adopters and event times at or below -4.") %>%
+  tab_style("scale_down")
+```
+
+**Online Figures D1 and D2 repeat the exposure-matched design for week-6
+adopters** (GAM matching, ratios 4 and 3, seed 123). Food and exercise
+tracking are shown; the pattern matches the week-5 figures.
+
+```{r appendix-d-fig, cache = TRUE, cache.extra = data_md5, echo = FALSE, fig.height = 6, fig.cap = "Online Figures D1-D2 of the paper: the exposure-matched TWFE design for week-6 adopters, food and exercise tracking. Left: low exposure; right: high exposure."}
+med6 <- median(users$total_track_before[users$week_upgrade == 6])
+f_d <- reformulate(c("initialweight", "heightinches", "age", "first_day", "ini_goalweight",
+  "ini_goalbmi", "ini_bmi", "gender", "track_food_avg_w4", "foodcalories_avg_w4",
+  paste0(c("track_food_avg", "foodcalories_avg", "track_exercise_avg", "within_track_avg",
+           "exercisecalories_avg", "lower_initial_avg", "weight_loss_norm_avg",
+           "app_weight_loss_search_avg", "app_premium_search_avg", "weight_loss_premium_search_avg"),
+         "_w5")), response = "ever_upgrade")
+match6 <- function(cut_low, ratio) {
+  sub <- recent %>% group_by(userid) %>%
+    filter(week_upgrade == 6 | ever_upgrade == 0) %>% slice(1) %>% ungroup() %>%
+    filter(if (cut_low) total_track_before < med6 else total_track_before >= med6)
+  set.seed(123)
+  M <- matchit(f_d, data = sub, method = "nearest", distance = "gam",
+               ratio = ratio, replacement = FALSE)
+  match.data(M, data = sub)$userid
+}
+pan_low6 <- panel_of(match6(TRUE, 4)); pan_high6 <- panel_of(match6(FALSE, 3))
+pd <- list()
+for (y in c("track_food_avg", "track_exercise_avg")) {
+  pd[[length(pd) + 1]] <- paper_es(frame_tw(tw_es(y, pan_low6)), paste0("Week 6, low exposure: ", labels6[y]))
+  pd[[length(pd) + 1]] <- paper_es(frame_tw(tw_es(y, pan_high6)), paste0("Week 6, high exposure: ", labels6[y]))
+}
+wrap_plots(pd, ncol = 2)
+```
+
+# Extensions {#sec-extensions}
+
+**Eight extensions, each answering a question the paper raises but does
+not settle, all on the same sample and labelled as ours.**
+
+## Where the TWFE-CS gap comes from {#sec-ext-bacon}
+
+**The Goodman-Bacon decomposition writes the pooled TWFE as a weighted
+average of all two-by-two comparisons, and the forbidden ones carry the
+overstatement.** `bacon_decomp()` gives every comparison's weight and
+estimate; `twfe_weights()` gives the de Chaisemartin-d'Haultfoeuille
+cell weights and their negative share.
+
+```{r ext-bacon, cache = TRUE, cache.extra = data_md5}
+bacon_food <- bacon_decomp(dat, id = "userid", time = "weeks_join", y = "track_food_avg", d = "upgraded")
+bacon_food$by_type
+tw_w <- twfe_weights(dat, id = "userid", time = "weeks_join", d = "upgraded", y = "track_food_avg")
+c(share_negative = tw_w$share_negative, sum_negative = tw_w$sum_negative)
+```
+
+```{r ext-bacon-fig, echo = FALSE, fig.height = 3.6, fig.cap = "Extension 1: Goodman-Bacon decomposition of the pooled TWFE for food tracking. Each point is one two-by-two comparison; the horizontal line is the TWFE coefficient, the dashed line the Callaway-Sant'Anna ATT."}
+ggplot(bacon_food$decomposition, aes(x = weight, y = estimate, colour = type)) +
+  geom_hline(yintercept = bacon_food$twfe, colour = "grey30") +
+  geom_hline(yintercept = simple_main[["track_food_avg"]]$overall$estimate, linetype = "dashed", colour = "grey30") +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c("#0072B2", "#D55E00", "#009E73", "#CC79A7"), name = NULL) +
+  labs(x = "Weight", y = "2x2 DiD estimate") +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+```
+
+```{r ext-bacon-numbers, echo = FALSE}
+bt <- bacon_food$by_type
+w_never <- bt$weight[grepl("never", bt$type)]
+```
+
+**The decomposition acquits the usual suspects and convicts the
+aggregation.** Negative weights are absent
+(`r fmt(100 * tw_w$share_negative, 1)` percent of cells), and the
+comparisons that use already-treated units as controls carry about
+`r fmt(100 * (1 - w_never), 1)` percent of the weight. Instead,
+`r fmt(100 * w_never, 1)` percent of the TWFE coefficient is the static
+treated-versus-never comparison, which averages the whole post-adoption
+window without covariates. The Callaway-Sant'Anna ATT differs because it
+adjusts for the week-1 covariates and weights the group-time cells by
+cohort size over a defined window, not because forbidden comparisons
+dominate here.
+
+## Which cohorts carry the effect {#sec-ext-groups}
+
+**Group and calendar aggregations, and a balanced event study, unpack
+the composition of Figures 2 and 3.** Later cohorts (the ones with rising
+pre-adoption engagement in Figure 5) contribute only short horizons; the
+balanced aggregation holds the cohort mix fixed across event times.
+
+```{r ext-groups, cache = TRUE, cache.extra = data_md5}
+grp <- lapply(cs_main[eng4], aggregate_att, type = "group", seed = 678)
+bal <- lapply(cs_main[c("track_food_avg", "track_exercise_avg")], aggregate_att,
+              type = "dynamic", min_e = -3, balance_e = 8, seed = 678)
+```
+
+```{r ext-groups-table, echo = FALSE}
+bind_rows(lapply(eng4, function(y) {
+  b <- grp[[y]]$by
+  tibble(Outcome = labels6[y], !!!setNames(lapply(seq_len(nrow(b)), function(i) est_se(b$estimate[i], b$std.error[i])),
+                                           paste0("g = ", b$group)))
+})) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lcccccc",
+      caption = "Extension 2: cohort-specific ATTs (average post-treatment effect per adoption cohort), standard errors in parentheses.") %>%
+  tab_style("scale_down")
+```
+
+```{r ext-balance-fig, echo = FALSE, fig.height = 3.6, fig.cap = "Extension 2: unbalanced against balanced (eight post periods per cohort) dynamic aggregation. The unbalanced curve changes cohort composition as the horizon grows; the balanced curve holds it fixed."}
+wrap_plots(lapply(c("track_food_avg", "track_exercise_avg"), function(y) {
+  fr <- event_study_frame(Unbalanced = dyn_main[[y]], Balanced = bal[[y]])
+  plot_event_study(fr) + labs(title = labels6[y], y = "Estimates") +
+    theme_minimal(base_size = 9) + theme(plot.title = element_text(size = 9, face = "bold"), legend.position = "bottom")
+}), ncol = 2, guides = "collect") & theme(legend.position = "bottom")
+```
+
+**The attenuation is not a composition artifact.** The balanced curve
+attenuates like the unbalanced one over the common window, so the decay
+in Figure 2 is within cohorts, not a changing mix of them.
+
+## How much power the pre-trend evidence has {#sec-ext-power}
+
+**Three pre-period estimates cannot rule out much, and Roth's (2022)
+calculation says how much.** For each outcome, `pretrend_power()` finds
+the linear violation that the pre-test would detect with 50 and 80
+percent power and the bias such an undetected trend would leave in the
+week-0 effect.
+
+```{r ext-power, cache = TRUE, cache.extra = data_md5}
+pow <- lapply(dyn_main[c("track_food_avg", "track_exercise_avg")], function(d) {
+  p0 <- pretrend_power(d, seed = 1)
+  s50 <- p0$detectable$slope[p0$detectable$target_power == 0.5]
+  p1 <- pretrend_power(d, slope = s50, seed = 1)
+  list(detectable = p0$detectable, bias0 = p1$slopes[[1]]$bias)
+})
+```
+
+```{r ext-power-table, echo = FALSE}
+bind_rows(lapply(c("track_food_avg", "track_exercise_avg"), function(y) {
+  p <- pow[[y]]
+  b0 <- p$bias0[p$bias0$event_time == 0, ]
+  tibble(Outcome = labels6[y],
+         `Slope detected, 50\\% power` = fmt(p$detectable$slope[1], 4),
+         `Slope detected, 80\\% power` = fmt(p$detectable$slope[2], 4),
+         `Week-0 effect` = fmt(e0[y]),
+         `Bias at 50\\%-power slope` = fmt(b0$unconditional_bias, 4),
+         `Conditional bias (test passed)` = fmt(b0$conditional_bias, 4))
+})) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      caption = "Extension 3: power of the pre-trend evidence (Roth 2022). The detectable slope is the linear violation per week the three pre-period coefficients would flag with the stated power; the last columns give the week-0 bias such a trend would leave, unconditionally and conditional on the pre-test passing.") %>%
+  tab_style("scale_down")
+```
+
+**A violation detected only half the time would move the week-0 effect
+by a small fraction of its size.** That is why Figure 7's conclusions
+survive moderate $\bar M$: the effects are an order of magnitude larger
+than the trends the pre-periods could hide.
+
+## Breakdown values by outcome and horizon {#sec-ext-honest}
+
+**Figure 7 covers event time 0; the honest question extends across
+horizons and to the smoothness family.** For each engagement outcome the
+table reports the relative-magnitudes breakdown value (the smallest
+$\bar M$ at which zero enters the interval) at event time 0 and for the
+average of event times 0 to 3, and the smoothness breakdown $M$ at event
+time 0.
+
+```{r ext-honest, cache = TRUE, cache.extra = data_md5, eval = run_honest}
+breakdown_rm <- function(dyn, l_vec) {
+  hi <- honestdid_inputs(dyn)
+  rob <- HonestDiD::createSensitivityResults_relativeMagnitudes(betahat = hi$betahat, sigma = hi$sigma,
+    numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods,
+    Mbarvec = seq(0.2, 3, by = 0.1), l_vec = l_vec, gridPoints = 100)
+  cov0 <- rob$lb <= 0 & rob$ub >= 0
+  if (any(cov0)) min(rob$Mbar[cov0]) else Inf
+}
+breakdown_sm <- function(dyn, l_vec, m_max) {
+  hi <- honestdid_inputs(dyn)
+  rob <- HonestDiD::createSensitivityResults(betahat = hi$betahat, sigma = hi$sigma,
+    numPrePeriods = hi$numPrePeriods, numPostPeriods = hi$numPostPeriods,
+    Mvec = seq(0, m_max, length.out = 11), l_vec = l_vec)
+  cov0 <- rob$lb <= 0 & rob$ub >= 0
+  if (any(cov0)) min(rob$M[cov0]) else Inf
+}
+honest_ext <- lapply(setNames(eng4, eng4), function(y) {
+  d <- dyn_uni[[y]]
+  np <- honestdid_inputs(d)$numPostPeriods
+  l0 <- HonestDiD::basisVector(1, np)
+  lavg <- rep(1 / np, np)
+  m_max <- if (y == "exercisecalories_avg") 25 else if (y == "track_exercise_avg") 0.15 else 0.06
+  c(rm0 = breakdown_rm(d, l0), rm_avg = breakdown_rm(d, lavg), sm0 = breakdown_sm(d, l0, m_max))
+})
+```
+
+```{r ext-honest-table, echo = FALSE, eval = run_honest}
+bind_rows(lapply(eng4, function(y) tibble(Outcome = labels6[y],
+  `RM breakdown, e = 0` = fmt(honest_ext[[y]]["rm0"], 1),
+  `RM breakdown, avg e = 0-3` = fmt(honest_ext[[y]]["rm_avg"], 1),
+  `Smoothness breakdown, e = 0` = fmt(honest_ext[[y]]["sm0"], 3)))) %>%
+  kbl(booktabs = TRUE, linesep = "",
+      caption = "Extension 4: breakdown values. RM columns: the smallest Mbar (violations up to Mbar times the largest pre-period deviation) at which zero enters the confidence set. Smoothness column: the smallest per-week slope change M with the same property.") %>%
+  tab_style()
+```
+
+**Averaging over the first month is less robust than the impact effect,
+because later horizons let violations accumulate.** A smoothness
+breakdown of zero for exercise calories says a continued linear
+pre-trend alone removes its significance, matching its weaker
+relative-magnitudes robustness. This sharpens the paper's reading: the
+credible finding is the short-lived lift, not its persistence.
+
+## The matched sample with the main estimator {#sec-ext-matchcs}
+
+**Figure 8 switches estimators along with samples; holding the estimator
+fixed isolates what the matching does.** `att_gt()` runs on the matched
+panel of Section \@ref(sec-figure8), and the frame overlays it on the
+matched-sample TWFE.
+
+```{r ext-matchcs, cache = TRUE, cache.extra = data_md5}
+cs_m <- lapply(setNames(c("track_food_avg", "track_exercise_avg"), c("track_food_avg", "track_exercise_avg")),
+  function(y) {
+    a <- att_gt(dat8, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+                method = "dr", control_group = "notyet", n_boot = 499, seed = 678)
+    aggregate_att(a, type = "dynamic", min_e = -3, na.rm = TRUE, seed = 678)
+  })
+```
+
+```{r ext-matchcs-fig, echo = FALSE, fig.height = 3.8, fig.cap = "Extension 5: the matched sample of Figure 8 estimated with Callaway-Sant'Anna next to the matched-sample TWFE."}
+wrap_plots(lapply(c("track_food_avg", "track_exercise_avg"), function(y) {
+  fr <- event_study_frame(`Matched TWFE` = tw8[[y]], `Matched CS` = cs_m[[y]])
+  fr <- fr[fr$event_time <= 9, ]
+  plot_event_study(fr) + labs(title = labels6[y], y = "Estimates") +
+    theme_minimal(base_size = 9) + theme(plot.title = element_text(size = 9, face = "bold"))
+}), ncol = 2, guides = "collect") & theme(legend.position = "bottom")
+```
+
+**The two agree on the matched sample, so the robustness claim does not
+depend on switching estimators.** The lift and the attenuation are in
+the design, not the method.
+
+## Anticipation {#sec-ext-anticipation}
+
+**Figure 5's rising pre-adoption activity could be anticipation rather
+than selection.** `att_gt(anticipation = 1)` treats the week before
+adoption as already affected and moves the base period one week back.
+
+```{r ext-anticipation, cache = TRUE, cache.extra = data_md5}
+ant <- lapply(setNames(c("track_food_avg", "track_exercise_avg"), c("track_food_avg", "track_exercise_avg")),
+  function(y) {
+    a <- att_gt(dat, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+                method = "dr", control_group = "notyet", anticipation = 1, n_boot = 499, seed = 678)
+    aggregate_att(a, type = "dynamic", min_e = -3, na.rm = TRUE, seed = 678)$by
+  })
+```
+
+```{r ext-anticipation-table, echo = FALSE}
+bind_rows(lapply(c("track_food_avg", "track_exercise_avg"), function(y) {
+  b0 <- dyn_main[[y]]$by; b1 <- ant[[y]]
+  bind_rows(lapply(c(-1, 0, 1, 2), function(e) tibble(Outcome = labels6[y], `Event time` = e,
+    `Baseline` = est_se(b0$estimate[b0$event_time == e], b0$std.error[b0$event_time == e]),
+    `Anticipation = 1` = if (any(b1$event_time == e)) est_se(b1$estimate[b1$event_time == e], b1$std.error[b1$event_time == e]) else "")))
+})) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lccc",
+      caption = "Extension 6: allowing one week of anticipation. The base period moves from g-1 to g-2; a large change in the week-0 effect would signal that the g-1 outcome is already treated.") %>%
+  collapse_rows(columns = 1, latex_hline = "major", valign = "top") %>%
+  tab_style()
+```
+
+**Exercise tracking is stable; the food-tracking impact effect grows
+when the decision week counts as treated.** With one week of
+anticipation the food effect at adoption rises from
+`r fmt(dyn_main[["track_food_avg"]]$by$estimate[dyn_main[["track_food_avg"]]$by$event_time == 0])`
+to `r fmt(ant[["track_food_avg"]]$estimate[ant[["track_food_avg"]]$event_time == 0])`,
+which says part of the food response in this draw begins in the week the
+upgrade happens rather than strictly after it. The baseline week
+$-1$ coefficient is small and insignificant, so the lift-then-decay
+reading survives either dating; the exercise is a reminder that the
+anticipation window is a modelling choice worth reporting.
+
+## Exposure as a gradient {#sec-ext-tercile}
+
+**The median split of Table 5 is the coarsest version of the hedonic
+decline test; terciles sharpen it.** Adopters are split into thirds by
+pre-adoption tracking days, and the week-0 and week-1 effects are
+estimated per tercile.
+
+```{r ext-tercile, cache = TRUE, cache.extra = data_md5}
+adopters <- users %>% filter(week_upgrade >= 2, week_upgrade <= 7)
+terc <- quantile(adopters$total_track_before, c(1/3, 2/3))
+terc_of <- function(v) cut(v, c(-Inf, terc, Inf), labels = c("Low", "Middle", "High"))
+terc_run <- function(lev) {
+  ids <- adopters$userid[terc_of(adopters$total_track_before) == lev]
+  dd <- dat %>% filter(userid %in% c(ids, never_ids))
+  lapply(setNames(c("track_food_avg", "track_exercise_avg"), c("track_food_avg", "track_exercise_avg")),
+    function(y) {
+      a <- att_gt(dd, id = "userid", time = "weeks_join", group = "g", y = y, x = xv,
+                  method = "dr", control_group = "notyet", n_boot = 499, seed = 1234)
+      aggregate_att(a, type = "dynamic", min_e = -3, na.rm = TRUE, seed = 1234)$by
+    })
+}
+terc_res <- lapply(setNames(c("Low", "Middle", "High"), c("Low", "Middle", "High")), terc_run)
+```
+
+```{r ext-tercile-fig, echo = FALSE, fig.height = 3.6, fig.cap = "Extension 7: week-0 and week-1 effects by tercile of pre-adoption exposure, with 95 percent intervals. Hedonic decline predicts the monotone decline in the lift; sunk costs predict a flat profile."}
+terc_df <- bind_rows(lapply(names(terc_res), function(lev) bind_rows(lapply(c("track_food_avg", "track_exercise_avg"), function(y) {
+  b <- terc_res[[lev]][[y]]
+  bind_rows(lapply(c(0, 1), function(e) tibble(Tercile = lev, Outcome = labels6[y], event = paste("Week", e),
+    estimate = b$estimate[b$event_time == e], se = b$std.error[b$event_time == e])))
+}))))
+terc_df$Tercile <- factor(terc_df$Tercile, levels = c("Low", "Middle", "High"))
+ggplot(terc_df, aes(x = Tercile, y = estimate, colour = event)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se),
+                  position = position_dodge(width = 0.4)) +
+  facet_wrap(~ Outcome) +
+  scale_colour_manual(values = c("#0072B2", "#D55E00"), name = NULL) +
+  labs(x = "Pre-adoption exposure tercile", y = "Effect") +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+```
+
+**The high-exposure tercile sits well below the other two; low and
+middle are indistinguishable.** The profile is a step down at high
+exposure rather than a straight line, which still contradicts the flat
+profile sunk costs predict: users who had already exhausted the shared
+features respond least. The novelty margin appears to bind only once
+exposure is high.
+
+## An estimator horse race {#sec-ext-race}
+
+**The lecture's comparison of heterogeneity-robust estimators, run on
+this application.** Callaway-Sant'Anna (covariates, not-yet-treated),
+Sun-Abraham (interaction-weighted, `fixest::sunab()`), the imputation
+estimator (`did_imputation()`), and the binned TWFE, all for food
+tracking.
+
+```{r ext-race, cache = TRUE, cache.extra = data_md5}
+dat$g_sa <- ifelse(dat$g == 0, 10000L, dat$g)
+sa <- feols(track_food_avg ~ sunab(g_sa, weeks_join) | userid + weeks_join, data = dat, cluster = ~userid)
+imp <- did_imputation(dat, id = "userid", time = "weeks_join", group = "g", y = "track_food_avg",
+                      pre_window = 3)
+race <- event_study_frame(`Callaway-Sant'Anna` = dyn_main[["track_food_avg"]],
+                          `Sun-Abraham` = sa, Imputation = imp,
+                          `TWFE (binned)` = tw_main[["track_food_avg"]])
+```
+
+```{r ext-race-fig, echo = FALSE, fig.height = 4.2, fig.cap = "Extension 8: four estimators of the food-tracking event study. The binned TWFE sits far above the three heterogeneity-robust estimators at every horizon."}
+plot_event_study(race %>% filter(event_time >= -3, event_time <= 13)) +
+  labs(y = "Effect on food tracking") + theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+```
+
+```{r ext-race-table, echo = FALSE}
+race %>% filter(event_time %in% c(0, 1, 5, 10)) %>%
+  mutate(cell = est_se(estimate, std.error)) %>%
+  select(method, event_time, cell) %>%
+  pivot_wider(names_from = event_time, values_from = cell, names_prefix = "e = ") %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lcccc", col.names = c("Estimator", "e = 0", "e = 1", "e = 5", "e = 10"),
+      caption = "Extension 8: the food-tracking event study at four horizons across estimators (standard errors in parentheses).") %>%
+  tab_style()
+```
+
+**Callaway-Sant'Anna and Sun-Abraham agree to the third decimal, the
+imputation estimator sits slightly above them, and the binned TWFE is
+far above all three at every horizon.** The TWFE gap is the reference
+group: its coefficients compare against never-adopters and distant
+pre-periods jointly, so cohort-level differences load onto the event
+dummies. The imputation estimator fits the untreated model on all
+pre-periods, which buys precision at the price of pre-period parallel
+trends; its closeness to Callaway-Sant'Anna says that assumption is not
+doing damage here. Synthetic DiD, the remaining estimator, is in Section
+\@ref(sec-appendix-c2).
+
+# What the replication says {#sec-reading}
+
+**The workflow reproduces end to end on the package.** On the simulated
+data our `att_gt()` matches the `did` package to machine precision, the
+TWFE helper matches the authors' dummy regressions exactly, and every
+table and figure of the paper and its appendix is rebuilt in the
+published layout with `att_gt()`, `aggregate_att()`,
+`event_study_frame()`, `plot_event_study()`, and `honestdid_inputs()`,
+plus MatchIt as the matching engine and HonestDiD, DIDmultiplegtDYN, and
+`sdid_weights()` for the sensitivity and alternative estimators.
+
+**The paper's lessons survive the added cuts, with two honest
+qualifications from the simulated draw.** The TWFE-versus-CS gap is the
+static, covariate-free treated-versus-never comparison, not negative
+weights or forbidden controls; the attenuation is within cohorts, not
+composition, though this draw damps the food-tracking decay; the
+exposure effect is a step down at high exposure rather than a monotone
+gradient; the matched sample gives the same answer under the main
+estimator; one week of anticipation leaves exercise unchanged and grows
+the food impact effect, a dating choice worth reporting; and Sun-Abraham
+and the imputation estimator agree with Callaway-Sant'Anna where their
+assumptions overlap.
+
+**What to remember for one's own staggered designs.** Drop cohorts
+without pre-periods; state the comparison group; put covariates in both
+nuisances; aggregate deliberately (dynamic, group, balanced); report
+simultaneous bands; quantify how much the pre-periods can actually rule
+out before calling trends parallel; and treat TWFE as a diagnostic, not
+an estimate.
+
+# References
+
+- Baker, A., Callaway, B., Cunningham, S., Goodman-Bacon, A., and Sant'Anna, P. H. C. 2026. "Difference-in-Differences Designs: A Practitioner's Guide." Working paper.
+- Callaway, B., and Sant'Anna, P. H. C. 2021. "Difference-in-Differences with Multiple Time Periods." *Journal of Econometrics*.
+- de Chaisemartin, C., and d'Haultfoeuille, X. 2020. "Two-Way Fixed Effects Estimators with Heterogeneous Treatment Effects." *American Economic Review*.
+- Goodman-Bacon, A. 2021. "Difference-in-Differences with Variation in Treatment Timing." *Journal of Econometrics*.
+- Jiang, Y., Uetake, K., and Yang, N. 2026. "Does Premium Version Adoption in mHealth Improve User Engagement and Health-Related Outcomes?" *Marketing Science*, Articles in Advance. Replication package: INFORMS.
+- Rambachan, A., and Roth, J. 2023. "A More Credible Approach to Parallel Trends." *Review of Economic Studies*.
+- Roth, J. 2022. "Pretest with Caution: Event-Study Estimates after Testing for Parallel Trends." *AER: Insights*.
+- Sun, L., and Abraham, S. 2021. "Estimating Dynamic Treatment Effects in Event Studies with Heterogeneous Treatment Effects." *Journal of Econometrics*.

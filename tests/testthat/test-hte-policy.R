@@ -206,6 +206,22 @@ test_that("policy_value and policy_learn recover the optimal tree and agree with
   expect_equal(pv$estimate[1], mean(oracle * sc$score))
   expect_equal(pv$estimate[3], 0)
   expect_equal(pv$diff_vs_first[2], pv$estimate[2] - pv$estimate[1])
+  pv_boot <- policy_value(sc, list(oracle = oracle, none = rep(0, 3000)), n_boot = 200, seed = 1)
+  B <- attr(pv_boot, "boot")
+  expect_equal(dim(B), c(200, 2))
+  expect_equal(pv_boot$boot.low[1], unname(quantile(B[, 1], 0.025)))
+  expect_lt(abs(pv_boot$boot.se[1] - pv_boot$std.error[1]) / pv_boot$std.error[1], 0.35)
+  expect_equal(unname(pv_boot$boot.se[2]), 0)
+  expect_equal(dim(attr(pv_boot, "boot_diff")), c(200, 2))
+  # weighted values: the adaptively weighted estimator and its standard error
+  w <- 1 / seq_len(3000)^0.5
+  pv_w <- policy_value(sc, list(oracle = oracle, none = rep(0, 3000)), weights = w, n_boot = 50, seed = 1)
+  c_i <- oracle * sc$score
+  expect_equal(pv_w$estimate[1], sum(w * c_i) / sum(w))
+  expect_equal(pv_w$std.error[1], sqrt(sum(w^2 * (c_i - pv_w$estimate[1])^2)) / sum(w))
+  expect_equal(pv_w$diff_vs_first[2], -pv_w$estimate[1])
+  expect_equal(dim(attr(pv_w, "boot")), c(50, 2))
+  expect_error(policy_value(sc, oracle, weights = -w), "weights")
   pv_all <- policy_value(sc, oracle, baseline = "all")
   expect_equal(pv_all$estimate, mean((oracle - 1) * sc$score))
   expect_equal(policy_value(sc, oracle, cost = 0.5)$estimate, mean(oracle * (sc$score - 0.5)))
@@ -235,11 +251,25 @@ test_that("policy_value and policy_learn recover the optimal tree and agree with
     expect_true(all(p$assign %in% c(0, 1)))
     expect_gt(p$value$value_vs_none[2], 0)
   }
+  expect_s3_class(policy_learn(sc, method = "linear", seed = 1)$model, "glm")
+  expect_true(inherits(policy_learn(sc, method = "classifier", seed = 1)$model, "Learner"))
+  expect_equal(pol$model$var, "x1")
   m_dr <- cate_learner(scores = sc, x_het = x5, method = "dr")
   pb <- policy_learn(sc, method = "budget", budget = 0.3, tau_hat = m_dr, seed = 1)
   expect_lt(abs(mean(pb$assign) - 0.3), 0.05)
   expect_error(policy_learn(sc, method = "budget"), "budget")
   expect_error(policy_learn(sc, depth = 3), "depth 1 or 2")
+
+  # weighted tree search equals the unweighted search on duplicated rows
+  wi <- c(rep(2, 400), rep(1, 800))
+  sc_w <- dr_scores(dat[1:1200, ], "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true")
+  sc_dup <- dr_scores(dat[c(1:1200, 1:400), ], "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true")
+  tw <- policy_learn(sc_w, x = c("x1", "x2", "x3"), depth = 2, holdout = 0, weights = wi, max_root_splits = 1e6)
+  td <- policy_learn(sc_dup, x = c("x1", "x2", "x3"), depth = 2, holdout = 0, max_root_splits = 1e6)
+  expect_equal(tw$rule$threshold, td$rule$threshold)
+  expect_equal(tw$rule$value * mean(wi), td$rule$value, tolerance = 1e-8)
+  expect_equal(tw$value$value_vs_none, policy_value(sc_w, tw$assign, weights = wi)$estimate)
+  expect_equal(length(tw$weights), 1200)
 
   skip_if_not_installed("policytree")
   small <- dat[1:300, ]
@@ -252,6 +282,9 @@ test_that("policy_value and policy_learn recover the optimal tree and agree with
   b1 <- policy_learn(scs, x = c("x1", "x2", "x3"), depth = 1, holdout = 0, engine = "policytree")
   expect_equal(a1$value$value_vs_none, b1$value$value_vs_none, tolerance = 1e-10)
   expect_equal(length(predict(b, small)), 300)
+  b_step <- policy_learn(scs, x = c("x1", "x2", "x3"), depth = 2, holdout = 0, engine = "policytree",
+                         split_step = 5, weights = rep(c(1, 2), 150))
+  expect_true(all(b_step$assign %in% c(0, 1)))
 })
 
 test_that("policy_frontier moves from impact-only to deprivation-only targeting", {
@@ -281,4 +314,99 @@ test_that("sim_hte designs have the documented properties", {
   expect_true(all(d4$y %in% c(0, 1)))
   d5 <- sim_hte(400, "policy", seed = 1)
   expect_type(attr(d5, "optimal_tree"), "list")
+})
+
+test_that("bind_scores pools score objects and glance.cm_blp feeds modelsummary", {
+  dat <- sim_hte(900, dgp = "smooth", seed = 11)
+  a <- dr_scores(dat[1:300, ], "y", "d", x5, seed = 1)
+  b <- dr_scores(dat[301:600, ], "y", "d", x5, seed = 2)
+  cc <- dr_scores(dat[601:900, ], "y", "d", x5, seed = 3)
+  pooled <- bind_scores(first = a, second = b, cc)
+  expect_s3_class(pooled, "cm_scores")
+  expect_equal(pooled$n, 900)
+  expect_equal(pooled$score, c(a$score, b$score, cc$score))
+  expect_equal(as.character(unique(pooled$data$set)), c("first", "second", "set3"))
+  expect_equal(length(unique(pooled$fold_id)), 15L)
+  expect_equal(pooled$ate$estimate, mean(pooled$score))
+  expect_equal(bind_scores(list(a, b))$n, 600)
+  expect_error(bind_scores(a, dr_scores(dat[1:300, ], "y", "d", x5, type = "reg", seed = 1)), "same `type`")
+  # projection on a set-level dictionary
+  comp <- data.frame(set = c("first", "second", "set3"), z = c(-1, 0, 1))
+  extra <- comp[match(pooled$data$set, comp$set), "z", drop = FALSE]
+  blp <- cate_blp(pooled, ~ z, data = extra, uniform = FALSE)
+  m <- lm(pooled$score ~ extra$z)
+  expect_equal(blp$beta, unname(coef(m)), tolerance = 1e-10)
+  expect_equal(blp$r.squared, summary(m)$r.squared, tolerance = 1e-6)
+  expect_equal(blp$adj.r.squared, summary(m)$adj.r.squared, tolerance = 1e-6)
+  g <- glance(blp)
+  expect_equal(g$nobs, 900)
+  skip_if_not_installed("modelsummary")
+  tab <- modelsummary::modelsummary(list(blp), output = "data.frame")
+  expect_true(any(grepl("z", tab$term)))
+  expect_true(any(grepl("R2", tab$term)))
+})
+
+test_that("dr_scores trims on the propensity and records the share dropped", {
+  dat <- sim_hte(800, dgp = "smooth", seed = 12)
+  dat$p_true[1:10] <- 0.005
+  sc <- dr_scores(dat, "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true", trim = c(0.01, 0.99))
+  expect_equal(sc$n, 790)
+  expect_equal(sc$diagnostics$trimmed_share, 10 / 800)
+  expect_equal(nrow(sc$data), 790)
+  expect_equal(length(sc$fold_id), 790)
+  expect_output(print(sc), "trimmed share")
+  expect_error(dr_scores(dat, "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true", trim = c(0.5, 0.4)), "increasing")
+})
+
+test_that("multi-arm scores reproduce the IPS reward, agree with policytree, and contrast to pairwise scores", {
+  set.seed(21)
+  n <- 3000
+  x1 <- rnorm(n); x2 <- rnorm(n)
+  grp <- sample(c("a", "b", "c"), n, TRUE, c(0.6, 0.25, 0.15))
+  arm <- sample(c("7", "14", "30"), n, TRUE, c(0.15, 0.15, 0.7))
+  mu <- cbind(`7` = 0.15 + 0.05 * (grp == "a") + 0.02 * x1, `14` = 0.15 + 0.05 * (grp == "b") + 0.02 * x1,
+              `30` = 0.15 + 0.05 * (grp == "c") + 0.02 * x1)
+  y <- rbinom(n, 1, mu[cbind(seq_len(n), match(arm, colnames(mu)))])
+  dat <- data.frame(y = y, arm = arm, x1 = x1, x2 = x2, ga = as.integer(grp == "a"), gb = as.integer(grp == "b"))
+  xs <- c("x1", "x2", "ga", "gb")
+  e <- matrix(rep(c(0.15, 0.15, 0.7), each = n), n, dimnames = list(NULL, c("7", "14", "30")))
+  sc <- dr_scores(dat, "y", "arm", xs, arms = c("7", "14", "30"), p_hat = e, seed = 1)
+  expect_s3_class(sc, "cm_scores_multi")
+  expect_equal(dim(sc$gamma), c(n, 3))
+  I <- matrix(0, n, 3); I[cbind(seq_len(n), match(arm, sc$arms))] <- 1
+  expect_equal(sc$gamma, sc$nuisance$mu + I * (y - sc$nuisance$mu) / sc$nuisance$e, ignore_attr = TRUE)
+  expect_equal(nrow(tidy(sc)), 3)
+  expect_output(print(sc), "3 arms")
+  # IPS reward of the off-policy literature
+  sci <- dr_scores(dat, "y", "arm", xs, arms = c("7", "14", "30"), p_hat = e, type = "ipw")
+  pol <- ifelse(dat$ga == 1, "7", ifelse(dat$gb == 1, "14", "30"))
+  ips <- sum((arm == pol) * y / e[cbind(seq_len(n), match(pol, colnames(e)))]) / n
+  pv <- policy_value(sci, list(rule = pol, all30 = rep("30", n)), baseline = "30")
+  expect_equal(pv$estimate[1] + pv$baseline_value[1], ips, tolerance = 1e-12)
+  expect_equal(pv$estimate[2], 0)
+  expect_equal(pv$gain_pct[1], 100 * pv$estimate[1] / pv$baseline_value[1])
+  expect_equal(unname(unlist(pv[1, c("share_7", "share_14", "share_30")])), as.numeric(prop.table(table(factor(pol, levels = c("7", "14", "30"))))))
+  expect_error(policy_value(sc, pol, baseline = "99"), "one of the arms")
+  # trees over three arms
+  p1 <- policy_learn(sc, x = xs, depth = 1, holdout = 0)
+  expect_true(all(p1$assign %in% sc$arms))
+  small <- dat[1:400, ]
+  scs <- dr_scores(small, "y", "arm", xs, arms = c("7", "14", "30"), p_hat = e[1:400, ], seed = 1)
+  a <- policy_learn(scs, x = xs, depth = 2, holdout = 0, max_root_splits = 1e6)
+  expect_output(print(a), "3 arms")
+  skip_if_not_installed("policytree")
+  b <- policy_learn(scs, x = xs, depth = 2, holdout = 0, engine = "policytree")
+  expect_equal(a$value$value, b$value$value, tolerance = 1e-10)
+  expect_true(all(predict(b, small) %in% sc$arms))
+  # a pairwise contrast equals the pairwise binary object built from the same nuisances
+  cs <- contrast_scores(sc, "7", "30")
+  expect_s3_class(cs, "cm_scores")
+  rows <- arm %in% c("7", "30")
+  pair <- dat[rows, ]; pair$W <- as.integer(pair$arm == "7")
+  ref <- dr_scores(pair, "y", "W", p_hat = rep(0.15 / 0.85, nrow(pair)),
+                   mu0_hat = sc$nuisance$mu[rows, "30"], mu1_hat = sc$nuisance$mu[rows, "7"])
+  expect_equal(cs$score, ref$score, tolerance = 1e-12)
+  expect_equal(cs$d, ref$d)
+  expect_s3_class(cate_learner(scores = cs, x_het = xs, method = "dr"), "cm_cate")
+  expect_error(contrast_scores(sc, "7", "7"), "two different arms")
 })

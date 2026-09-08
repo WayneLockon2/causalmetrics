@@ -16,12 +16,15 @@ policy_learn(
   holdout = 0.5,
   engine = c("exhaustive", "policytree"),
   max_root_splits = 50L,
+  baseline = NULL,
+  weights = NULL,
+  split_step = 1L,
   seed = NULL,
   conf_level = 0.95
 )
 }
 \arguments{
-\item{scores}{A \code{cm_scores} object.}
+\item{scores}{A \code{cm_scores} or \code{cm_scores_multi} object.}
 
 \item{x}{Character vector of policy variables (default the \code{x} of
 \code{scores}).}
@@ -30,7 +33,8 @@ policy_learn(
 
 \item{depth}{Tree depth, 1 or 2 (any depth with \code{engine = "policytree"}).}
 
-\item{cost}{Cost of treating one unit, in outcome units.}
+\item{cost}{Cost of treating one unit (binary) or per-arm costs
+(multi-arm), in outcome units.}
 
 \item{budget}{Share of the population to treat (\code{method = "budget"}).}
 
@@ -45,17 +49,34 @@ policy_learn(
 \item{max_root_splits}{Maximum root thresholds per variable in the
 depth-2 exhaustive search.}
 
+\item{baseline}{Multi-arm case: the arm of the uniform policy the
+held-out value is compared with (default the first arm).}
+
+\item{weights}{Optional positive unit weights (vector or column name).
+The objective becomes \verb{sum(w_i Gamma[i, pi(X_i)]) / sum(w_i)}: the
+scores are scaled by the normalized weights in the tree searches, and
+the classification weights are multiplied by them. Use the
+time-decaying weights \code{h_t} of Zhan et al. (2024) with adaptively
+collected data, or survey weights. The reported values use the same
+weights.}
+
+\item{split_step}{policytree engine only: consider every \code{split_step}-th
+split point (\code{policytree}'s \code{split.step}); larger values are faster
+and approximate.}
+
 \item{seed}{Optional seed for the holdout split.}
 
 \item{conf_level}{Confidence level for the values.}
 }
 \value{
 A list of class \code{cm_policy}: \code{rule} (tree nodes, coefficients,
-fitted classifier, or threshold), \code{assign} (0/1 on all rows),
-\code{value} (data frame with the in-sample and held-out values over no
-treatment and over treating everyone), \code{holdout_id}, and settings.
-\code{\link[=predict]{predict()}} applies the rule to new data; \code{\link[=plot_policy_tree]{plot_policy_tree()}} draws a
-tree.
+fitted classifier with the underlying model in \code{rule$model}, or
+threshold; also available as \code{model}), \code{assign} (0/1 or arm labels on all
+rows), \code{value} (data frame with the in-sample and held-out values;
+binary: over no treatment and over treating everyone; multi-arm: the
+expected outcome and the gain over the uniform baseline arm),
+\code{holdout_id}, and settings. \code{\link[=predict]{predict()}} applies the rule to new data;
+\code{\link[=plot_policy_tree]{plot_policy_tree()}} draws a tree.
 }
 \description{
 Empirical welfare maximization (Kitagawa and Tetenov 2018; Athey and
@@ -64,23 +85,23 @@ sample analogue of \verb{E[(2 pi(X) - 1)(Y(eta) - cost)]}. Because
 \verb{E[(2 pi - 1) Gamma] = E[1\{2 pi - 1 = sign(Gamma)\} |Gamma|]} up to a
 constant, this is a weighted classification problem with labels
 \code{sign(Gamma_i)} and weights \verb{|Gamma_i|}, \code{Gamma_i = Y_i(eta) - cost}.
+With a multi-arm score object the objective is the mean of
+\code{Gamma[i, pi(X_i)]} over the arms, as in \code{policytree}.
 }
 \details{
 \itemize{
-\item \code{"tree"}: exact search over depth-1 or depth-2 trees. Depth 1 scans
-every split of every variable in one pass over sorted cumulative sums.
-Depth 2 scans root splits over a grid of at most \code{max_root_splits}
-thresholds per variable (all thresholds when there are fewer) and solves
-both children exactly. With \code{engine = "policytree"} the search is
-delegated to that package (any depth).
+\item \code{"tree"}: exact search over depth-1 or depth-2 trees for any number of
+arms. Depth 1 scans every split of every variable in one pass over
+sorted cumulative sums. Depth 2 scans root splits over a grid of at most
+\code{max_root_splits} thresholds per variable (all thresholds when there are
+fewer) and solves both children exactly. With \code{engine = "policytree"}
+the search is delegated to that package (any depth).
 \item \code{"linear"}: rules \verb{1\{x'b > 0\}}; fitted by the weighted logistic
-surrogate of the classification problem (exact mixed-integer solutions
-are out of scope).
+surrogate of the classification problem (binary only).
 \item \code{"classifier"}: any \code{mlr3} classification learner accepting weights
-(default \code{classif.rpart}).
+(default \code{classif.rpart}; binary only).
 \item \code{"budget"}: treat the top \code{budget} share ranked by a CATE model
-\code{tau_hat} (a \code{cm_cate} object); the constrained problem's solution when
-the ranking is correct.
+\code{tau_hat} (a \code{cm_cate} object; binary only).
 }
 
 A share \code{holdout} of the rows is set aside before fitting so the reported

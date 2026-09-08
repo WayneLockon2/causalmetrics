@@ -1,0 +1,382 @@
+---
+title: "Using causalmetrics for mediation and mechanisms"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using causalmetrics for mediation and mechanisms}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4,
+                      message = FALSE, warning = FALSE)
+library(causalmetrics)
+library(mlr3)
+library(mlr3learners)
+set.seed(1)
+run_ranger <- requireNamespace("ranger", quietly = TRUE)
+```
+
+## The question and the objects
+
+The functions in this part of the package answer one question: how does a
+treatment $D$ produce its effect on an outcome $Y$? A mediator $M$ is a
+variable on the path from $D$ to $Y$. Writing $M(d)$ for the mediator under
+treatment $d$ and $Y(d, m)$ for the outcome under treatment $d$ and
+mediator level $m$, the estimands are
+
+- the total effect $E[Y(1, M(1)) - Y(0, M(0))]$,
+- the natural direct effect (NDE) $E[Y(1, M(0)) - Y(0, M(0))]$: change the
+  treatment, hold the mediator at its untreated value,
+- the natural indirect effect (NIE) $E[Y(1, M(1)) - Y(1, M(0))]$: hold the
+  treatment, let the mediator move,
+- the controlled direct effect (CDE) $E[Y(1, m) - Y(0, m)]$ at a fixed
+  mediator level $m$.
+
+Total = NDE + NIE by construction. Every estimator below returns a data
+frame `effects` with these terms, and `tidy()` returns it. Identification
+needs more than an experiment on $D$: sequential ignorability (Imai, Keele,
+and Yamamoto 2010) also requires the mediator to be as good as randomly
+assigned given $D$ and covariates $X$. The package makes the assumption
+explicit rather than hiding it, and offers a sensitivity analysis, a
+controlled-direct-effect estimator that survives some violations, an
+instrumental-variables version, and a front-door version for a different
+identifying structure.
+
+`sim_mediation()` generates data from nine designs whose true effects are
+stored in the `truth` attribute. Every example below compares an estimate
+with that truth.
+
+```{r designs}
+dat <- sim_mediation(3000, dgp = "linear", seed = 1)
+head(dat, 3)
+str(attr(dat, "truth")[c("total", "nde", "nie", "cde")])
+```
+
+## Regression-based mediation: `mediate_reg()`
+
+### The linear system
+
+With a linear mediator model $M = \alpha_0 + \alpha_1 D + X'\alpha + e_M$
+and a linear outcome model $Y = \beta_0 + \beta_1 D + \beta_2 M + X'\beta +
+e_Y$, the NDE is $\beta_1$ and the NIE is $\alpha_1 \beta_2$ (Baron and
+Kenny 1986). `mediate_reg()` fits the two models by `lm()` and computes the
+effects by g-computation, which reduces to these products here. Three
+inference methods are available: the quasi-Bayesian simulation of Imai et
+al. (the default), a nonparametric bootstrap, and Sobel's delta method for
+the linear single-mediator case.
+
+```{r reg-linear}
+fit_lin <- mediate_reg(dat, "y", "d", "m", x = c("x1", "x2"), method = "delta")
+fit_lin
+tidy(fit_lin)
+```
+
+The `shares` element reports the proportion mediated and the two shares
+used by Wheeler et al. (2022): `S1` multiplies the mediator coefficient
+from the full outcome model by the treatment effect on the mediator, `S2`
+uses the mediator-outcome association in the control group instead.
+
+```{r reg-shares}
+fit_lin$shares
+```
+
+The four potential-outcome means behind the effects are in `potential`, and
+`plot_mediation()` draws the effects with their intervals.
+
+```{r reg-plot, fig.height=3.2}
+fit_lin$potential
+plot_mediation(fit_lin)
+```
+
+### Treatment-mediator interaction
+
+When the effect of the mediator depends on the treatment, the product of
+coefficients is wrong and the two decompositions differ: the pure NDE plus
+the total NIE, or the total NDE plus the pure NIE (VanderWeele 2015). With
+`interaction = TRUE` both are returned, as `nde` and `nie` (pure direct,
+total indirect) and `nde_total` and `nie_pure`.
+
+```{r reg-interaction}
+dat_int <- sim_mediation(3000, dgp = "interaction", seed = 2)
+fit_int <- mediate_reg(dat_int, "y", "d", "m", x = c("x1", "x2"), interaction = TRUE, seed = 1)
+fit_int
+unlist(attr(dat_int, "truth")[c("nde", "nie", "nde_total", "nie_pure", "cde")])
+```
+
+Ignoring the interaction misses part of the indirect effect:
+
+```{r reg-interaction-wrong}
+mediate_reg(dat_int, "y", "d", "m", x = c("x1", "x2"), method = "delta")$effects[1:3, ]
+```
+
+### Binary outcomes and mediators
+
+`outcome = "logit"` and `mediator = "logit"` switch the models. Effects are
+then on the probability scale, computed by g-computation over the sample.
+The simulation method draws coefficients from their sampling distribution
+and recomputes the effects for each draw.
+
+```{r reg-binary}
+dat_bin <- sim_mediation(3000, dgp = "binary", seed = 3)
+fit_bin <- mediate_reg(dat_bin, "y", "d", "m", x = c("x1", "x2"),
+                       outcome = "logit", mediator = "logit", n_sim = 500, seed = 1)
+fit_bin$effects[1:3, ]
+unlist(attr(dat_bin, "truth")[c("total", "nde", "nie")])
+```
+
+### Several parallel mediators
+
+`m` may name several mediators that do not cause each other. The output
+adds one `nie_<mediator>` term per mediator; they sum to the joint `nie`.
+
+```{r reg-parallel}
+dat_par <- sim_mediation(3000, dgp = "parallel", seed = 4)
+fit_par <- mediate_reg(dat_par, "y", "d", c("m1", "m2"), x = c("x1", "x2"), n_sim = 500, seed = 1)
+fit_par$effects
+unlist(attr(dat_par, "truth")[c("nde", "nie", "nie_m1", "nie_m2")])
+```
+
+### Clustered data and the bootstrap
+
+`cluster` names a cluster column; the coefficient covariance and the
+bootstrap are clustered on it.
+
+```{r reg-cluster}
+dat$school <- sample(1:60, nrow(dat), replace = TRUE)
+fit_cl <- mediate_reg(dat, "y", "d", "m", x = c("x1", "x2"), method = "bootstrap",
+                      cluster = "school", n_boot = 99, seed = 1)
+fit_cl$effects[1:3, ]
+```
+
+## Sensitivity to an unmeasured mediator-outcome confounder
+
+An experiment randomizes $D$ but not $M$. If an unmeasured variable affects
+both the mediator and the outcome, the errors of the two regressions are
+correlated, and the estimated NIE is biased. `mediate_sensitivity()`
+computes the NIE that a linear model would imply for each value of the
+error correlation $\rho$ (Imai, Keele, and Yamamoto 2010, Theorem 3) and
+reports the $\rho$ at which the NIE crosses zero. The `correlated_errors`
+design has $\rho = 0.5$; the estimate at $\rho = 0$ is off, the estimate at
+the true $\rho$ is right.
+
+```{r sensitivity, fig.height=3.5}
+dat_rho <- sim_mediation(4000, dgp = "correlated_errors", rho = 0.5, seed = 5)
+fit_rho <- mediate_reg(dat_rho, "y", "d", "m", x = c("x1", "x2"), method = "delta")
+sens <- mediate_sensitivity(fit_rho, rho = seq(-0.8, 0.8, by = 0.1))
+sens
+sens$curve[sens$curve$rho %in% c(0, 0.5), ]
+attr(dat_rho, "truth")$nie
+plot_mediate_sensitivity(sens)
+```
+
+## Double machine learning mediation: `mediate_dml()`
+
+`mediate_reg()` needs correct parametric models. `mediate_dml()` uses the
+efficient influence function for $E[Y(d, M(d'))]$ under sequential
+ignorability (Tchetgen Tchetgen and Shpitser 2012; Farbmacher et al. 2022),
+whose nuisances are the outcome regression $\mu_d(M, X)$, two propensity
+scores $p(D = 1 \mid X)$ and $p(D = 1 \mid M, X)$, and a nested regression
+of $\mu_d(M, X)$ on $X$ among units with $D = d'$. All are cross-fitted
+with `mlr3` learners, and the mediator can be binary, continuous, or a
+vector. The defaults are linear and logistic regressions, which reproduce
+the linear case.
+
+```{r dml-linear}
+fit_dml <- mediate_dml(dat, "y", "d", "m", x = c("x1", "x2"), seed = 1)
+fit_dml
+```
+
+In the `nonlinear` design the mediator and outcome models have curvature
+and an interaction. Linear learners are biased; random forests are not.
+
+```{r dml-nonlinear, eval=run_ranger}
+dat_nl <- sim_mediation(3000, dgp = "nonlinear", seed = 6)
+rf <- lrn("regr.ranger", num.trees = 200, min.node.size = 10)
+rfc <- lrn("classif.ranger", num.trees = 200, min.node.size = 10, predict_type = "prob")
+fit_nl_lin <- mediate_dml(dat_nl, "y", "d", "m", x = c("x1", "x2"), seed = 1)
+fit_nl_rf <- mediate_dml(dat_nl, "y", "d", "m", x = c("x1", "x2"),
+                         learner_y = rf, learner_d = rfc, seed = 1)
+cbind(truth = unlist(attr(dat_nl, "truth")[c("total", "nde", "nie")]),
+      linear = fit_nl_lin$effects$estimate[1:3], forest = fit_nl_rf$effects$estimate[1:3])
+```
+
+The `diagnostics` element reports the propensity overlap and the share of
+units trimmed; `psi` holds the influence-function values used for the
+standard errors, one column per potential outcome.
+
+```{r dml-diagnostics}
+fit_dml$diagnostics[c("propensity_x", "propensity_mx")]
+head(fit_dml$psi, 3)
+```
+
+With a binary mediator and `m_ref`, the controlled direct effect at that
+mediator level is added.
+
+```{r dml-cde}
+fit_dml_bin <- mediate_dml(dat_bin, "y", "d", "m", x = c("x1", "x2"), m_ref = 0, seed = 1)
+fit_dml_bin$effects
+attr(dat_bin, "truth")$cde
+```
+
+## Controlled direct effects with treatment-induced confounders: `mediate_cde()`
+
+Natural effects are not identified when a variable affected by the
+treatment also confounds the mediator and the outcome. The controlled
+direct effect still is, by sequential g-estimation (Acharya, Blackwell, and
+Sen 2016): estimate the mediator's effect in a regression that includes the
+intermediate confounder, subtract it from the outcome, and regress the
+result on the treatment and pre-treatment covariates only. The one-step
+regression that conditions on the intermediate confounder is biased,
+because that confounder is itself an outcome of the treatment.
+
+```{r cde}
+dat_z <- sim_mediation(3000, dgp = "post_treatment_confounder", seed = 7)
+fit_cde <- mediate_cde(dat_z, "y", "d", "m", x_pre = c("x1", "x2"), x_post = "z", n_boot = 99, seed = 1)
+fit_cde
+attr(dat_z, "truth")$cde
+```
+
+## Mechanism accounting in regressions: `gelbach_decomp()`
+
+Applied papers often add candidate mediators to a regression and read the
+drop in the treatment coefficient as the part "explained" by them. Gelbach
+(2016) shows how to attribute that drop to each added covariate in a way
+that does not depend on the order of addition: the contribution of
+covariate $k$ is the product of its coefficient in the full regression and
+the coefficient on $D$ in the regression of covariate $k$ on $D$ and the
+base covariates. The contributions sum exactly to the change.
+
+```{r gelbach, fig.height=3}
+g <- gelbach_decomp(dat_par, "y", "d", x_base = c("x1", "x2"), x_add = c("m1", "m2"),
+                    groups = list(both = c("m1", "m2")), n_boot = 99, seed = 1)
+g
+plot_gelbach(g)
+```
+
+The decomposition is a description of the regressions. In this linear
+design without interaction it coincides with the per-mediator indirect
+effects; with post-treatment covariates and unmeasured confounding it does
+not; the lecture notes discuss when each reading is
+warranted. Fixed effects are passed through `fe` and use `fixest`.
+
+## An instrumented mediator: `mediate_iv()`
+
+When the mediator is endogenous but an instrument $Z$ shifts it, the
+system of Cattan, Salvanes, and Tominey (2025) estimates the direct effect
+as the coefficient on $D$ in the second stage where $M$ is instrumented by
+$Z$, and the indirect effect as the product of the first-stage effect of
+$D$ on $M$ and the instrumented mediator effect. The `iv_mediator` design
+has an unobserved variable that raises both the mediator and the outcome,
+so the OLS mediator coefficient is too large and the OLS direct effect is
+wrong.
+
+```{r iv}
+dat_iv <- sim_mediation(3000, dgp = "iv_mediator", seed = 8)
+fit_iv <- mediate_iv(dat_iv, "y", "d", "m", z = "z", x = c("x1", "x2"), n_boot = 99, seed = 1)
+fit_iv
+unlist(attr(dat_iv, "truth")[c("total", "direct", "indirect", "first_stage", "mediator_effect")])
+```
+
+The decomposition assumes that the mediator effect is the same for the
+instrument's compliers and for the population. `homogeneity_by` re-runs the
+system within subgroups and reports the mediator effect in each, a check
+in the spirit of the authors' Figure A13.
+
+```{r iv-homogeneity}
+dat_iv$group <- ifelse(dat_iv$x1 > 0, "high x1", "low x1")
+mediate_iv(dat_iv, "y", "d", "m", z = "z", x = c("x1", "x2"), homogeneity_by = "group",
+           n_boot = 49, seed = 1)$homogeneity
+```
+
+Fixed effects (`fe`) and clustered bootstraps (`cluster`) are supported;
+the `fixest` models are returned in `models`.
+
+## Front-door adjustment: `front_door()`
+
+The front-door criterion (Pearl 1995) identifies the effect of $D$ on $Y$
+when their confounding is unobserved, provided a mediator carries the whole
+effect, is unconfounded given $D$, and its effect on $Y$ is unconfounded
+given $D$. The `front_door` design has exactly that structure: the
+regression of $Y$ on $D$ (the "backdoor" estimate) is biased, the front-door
+estimate is not. `method = "regression"` plugs two regressions into the
+formula; `method = "aipw"` uses the influence function of Fulcher et al.
+(2020) with cross-fitted learners (binary mediator).
+
+```{r front-door}
+dat_fd <- sim_mediation(4000, dgp = "front_door", seed = 9)
+fd_reg <- front_door(dat_fd, "y", "d", "m", x = c("x1", "x2"), n_boot = 99, seed = 1)
+fd_reg
+fd_aipw <- front_door(dat_fd, "y", "d", "m", x = c("x1", "x2"), method = "aipw", seed = 1)
+fd_aipw$effects
+attr(dat_fd, "truth")$total
+```
+
+## Weights
+
+`mediate_reg()`, `mediate_iv()`, and `gelbach_decomp()` accept a `weights`
+column: every regression is weighted, the robust and clustered
+covariances use the weights, the g-computation averages over units with
+the weights, and the bootstrap carries them. Survey or design weights
+(Cattan et al. weight by school size) go here.
+
+```{r weights}
+dat$w <- runif(nrow(dat), 0.5, 2)
+fit_w <- mediate_reg(dat, "y", "d", "m", x = c("x1", "x2"), weights = "w", method = "delta")
+rbind(unweighted = fit_lin$effects$estimate[1:3], weighted = fit_w$effects$estimate[1:3])
+dat_iv$w <- runif(nrow(dat_iv), 0.5, 2)
+mediate_iv(dat_iv, "y", "d", "m", z = "z", x = c("x1", "x2"), weights = "w", n_boot = 49, seed = 1)$effects[1:4, ]
+dat_par$w <- runif(nrow(dat_par), 0.5, 2)
+gelbach_decomp(dat_par, "y", "d", x_base = c("x1", "x2"), x_add = c("m1", "m2"), weights = "w", n_boot = 0)$contributions
+```
+
+## Which function when
+
+| Situation | Function |
+|---|---|
+| Mediator as good as random given $D$ and $X$, parametric models acceptable | `mediate_reg()` |
+| Same assumption, flexible nuisances and root-n inference | `mediate_dml()` |
+| Unmeasured mediator-outcome confounder, how large would it need to be | `mediate_sensitivity()` |
+| A treatment-induced confounder of the mediator and the outcome; only the CDE is wanted | `mediate_cde()` |
+| "How much of the coefficient do these covariates absorb", by covariate or group | `gelbach_decomp()` |
+| Endogenous mediator with its own instrument | `mediate_iv()` |
+| Unobserved treatment-outcome confounding, but a mediator that satisfies the front-door criterion | `front_door()` |
+
+## References
+
+Acharya, A., Blackwell, M., and Sen, M. (2016). Explaining causal findings
+without bias. *American Political Science Review*, 110(3), 512-529.
+
+Cattan, S., Salvanes, K. G., and Tominey, E. (2025). First-generation
+elite: the role of school social networks. *American Economic Review*,
+115(12), 4369-4403.
+
+Farbmacher, H., Huber, M., Laffers, L., Langen, H., and Spindler, M.
+(2022). Causal mediation analysis with double machine learning. *The
+Econometrics Journal*, 25(2), 277-300.
+
+Fulcher, I. R., Shpitser, I., Marealle, S., and Tchetgen Tchetgen, E. J.
+(2020). Robust inference on population indirect causal effects. *JRSS-B*,
+82(1), 199-214.
+
+Gelbach, J. B. (2016). When do covariates matter? And which ones, and how
+much? *Journal of Labor Economics*, 34(2), 509-543.
+
+Imai, K., Keele, L., and Yamamoto, T. (2010). Identification, inference and
+sensitivity analysis for causal mediation effects. *Statistical Science*,
+25(1), 51-71.
+
+Pearl, J. (1995). Causal diagrams for empirical research. *Biometrika*,
+82(4), 669-688.
+
+Tchetgen Tchetgen, E. J. and Shpitser, I. (2012). Semiparametric theory for
+causal mediation analysis. *Annals of Statistics*, 40(3), 1816-1845.
+
+VanderWeele, T. J. (2015). *Explanation in Causal Inference*. Oxford
+University Press.
+
+Wheeler, L., Garlick, R., Johnson, E., Shaw, P., and Gargano, M. (2022).
+LinkedIn(to) job opportunities. *AEJ: Applied Economics*, 14(2), 101-125.

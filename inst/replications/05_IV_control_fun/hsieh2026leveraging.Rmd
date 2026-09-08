@@ -1,0 +1,1206 @@
+---
+title: "Replication: Leveraging Large-Scale Granular Single-Source Data for TV Advertising"
+subtitle: "An Identification Strategy with a Control Function (Hsieh, Du, and Lu, Marketing Science 2026)"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{pdflscape}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/05_IV/hsieh2026leveraging/"
+  n_hh: 25000
+  n_days: 150
+  n_boot: 50
+  n_sims: 20
+  n_threads: 4
+  n_threads_boot: 3
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(patchwork)
+library(estimatr)
+library(mlr3)
+library(mlr3learners)
+helper_path <- file.path(pkg_root, "inst", "vignette_helpers", "05_iv", "hsieh_helpers.R")
+source(helper_path)
+helper_md5 <- tools::md5sum(helper_path)
+data_path <- params$data_path
+sim_dir <- file.path(data_path, "data")
+dir.create(sim_dir, showWarnings = FALSE)
+n_hh <- params$n_hh; n_days <- params$n_days; n_boot <- params$n_boot; n_sims <- params$n_sims
+n_threads <- params$n_threads; n_threads_boot <- params$n_threads_boot
+size_key <- list(n_hh, n_days)
+size_tag <- paste0("_", n_hh, "x", n_days)
+sim_file <- function(name) file.path(sim_dir, paste0(name, size_tag, ".rds"))
+file_cached <- function(name, expr) {
+  f <- sim_file(name)
+  if (file.exists(f)) return(readRDS(f))
+  value <- expr
+  saveRDS(value, f)
+  value
+}
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+fmt0 <- function(x) formatC(x, digits = 0, format = "f", big.mark = ",")
+stars <- function(p) ifelse(is.na(p), "", ifelse(p < 0.01, "***", ifelse(p < 0.05, "**", ifelse(p < 0.10, "*", ""))))
+est_star <- function(b, se, digits = 3) ifelse(is.na(b), "---", paste0(fmt(b, digits), stars(2 * pnorm(-abs(b / se)))))
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+theme_set(theme_minimal(base_size = 10))
+term_labels <- c(
+  `(Intercept)` = "Intercept", A_stock = "Ad stock", CF_stock = "Control function", post = "Post conversion",
+  lf = "Frequency (log)", lf2 = "Frequency (log) sq.", lr = "Recency (log)", lr2 = "Recency (log) sq.",
+  `A_stock:post` = "Ad stock x post conversion", `A_stock:lf` = "Ad stock x freq (log)",
+  `A_stock:lf2` = "Ad stock x freq (log) sq.", `A_stock:lr` = "Ad stock x rec (log)",
+  `A_stock:lr2` = "Ad stock x rec (log) sq.", promo1m = "First month post-conversion promotion",
+  comp = "Competitor ad spend", z_view = "Average TV viewing", z_sports = "Sports viewing",
+  `A_stock:z_view` = "Ad stock x average TV viewing", `A_stock:z_sports` = "Ad stock x sports viewing",
+  sigma1 = "Standard deviation (intercept)", sigma2 = "Standard deviation (ad stock)", rho = "Rho"
+)
+param_labels <- c(
+  `(Intercept)` = "$\\alpha_0$", A_stock = "$\\beta_0$", CF_stock = "$\\delta$", post = "$\\alpha_{2,0}$",
+  lf = "$\\alpha_{2,1}$", lf2 = "$\\alpha_{2,2}$", lr = "$\\alpha_{2,3}$", lr2 = "$\\alpha_{2,4}$",
+  `A_stock:post` = "$\\beta_{2,0}$", `A_stock:lf` = "$\\beta_{2,1}$", `A_stock:lf2` = "$\\beta_{2,2}$",
+  `A_stock:lr` = "$\\beta_{2,3}$", `A_stock:lr2` = "$\\beta_{2,4}$", promo1m = "$\\gamma_1$", comp = "$\\gamma_2$",
+  z_view = "$\\alpha_1$", z_sports = "$\\alpha_1$", `A_stock:z_view` = "$\\beta_1$", `A_stock:z_sports` = "$\\beta_1$",
+  sigma1 = "$\\sigma_1$", sigma2 = "$\\sigma_2$", rho = "$\\rho$"
+)
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is whether linear TV advertising causes purchases, and how
+the effect changes with a household's purchase history.** Hsieh, Du, and Lu
+(2026) link second-by-second TV viewing from 1.4 million smart-TV
+households to the daily orders of a food delivery platform over 133 days.
+TV advertising cannot be randomized at the household level, so the answer
+must come from observational exposure data.
+
+**Observed exposure is endogenous for two reasons, and controls cannot fix
+either.** Targeting bias: the brand buys shows whose audiences already
+order more. Activity bias: households that watch more TV, or watch on a
+given day, differ in demand; the same unexpected long workday lowers TV
+time and raises the chance of ordering delivery. Both operate through
+household-day unobservables, which no set of controls absorbs.
+
+**The instrument comes from an institutional feature: networks assign
+within-show ad slots quasi-randomly across advertisers.** A household that
+watches only part of a targeted show sees the focal ad only if the ad
+happens to air during the watched segment. Expected exposure is the
+integral of the network's ad-timing density over the watched segment,
+$P_{is} = \int_{View_{is}} l_s(x)\,dx$. The instrument is realized minus
+expected exposure, $IV_{is} = A_{is} - A^b_s P_{is}$, summed over the day's
+shows. It is nonzero only for partial viewers of targeted shows, mean
+zero, positively correlated with exposure, and uncorrelated with the
+confounder (Proposition 1) and with every endogenous input, the targeting
+decision, the viewing probability, and their product (Proposition 2). The
+last property gives falsification checks from observables.
+
+**The purchase model is a probit with an ad stock and a control-function
+stock.** Utility is $U_{it} = \alpha_{it} + \beta_{it} AS_{it} + \gamma X_{it} + \delta\, CFS_{it} + \varepsilon_{it}$
+with $AS_{it} = \sum_l \lambda_A^l A_{i,t-l}$. Baseline propensity
+$\alpha_{it}$ and ad responsiveness $\beta_{it}$ are quadratic in log
+purchase frequency and log recency after conversion, shift with household
+traits, and carry random effects. The first stage regresses daily exposure
+on the instrument and the controls; its residual is accumulated into
+$CFS_{it} = \sum_l \lambda_{CF}^l \hat\varepsilon_{i,t-l}$. The coefficient
+$\delta$ tests exogeneity. Standard errors come from 50 household
+bootstraps, and the two decay rates from an out-of-sample grid search.
+
+**Two findings.** Ignoring endogeneity overstates ad elasticities by 55
+percent (same-day 0.072 against 0.045, 30-day 0.222 against 0.143). Ad
+responsiveness is an inverted U in purchase frequency and a U in recency,
+so early repeat buyers and lapsed buyers respond most.
+
+**The replication package holds no data.** The authors can share only a
+simulated data-generating process (DGP) with a known truth and the
+estimation code. This note reruns their scripts, matches them with the
+package's control-function functions, adds the show level that their
+scripts omit so that every table and figure of the paper has a counterpart
+in the published layout, and then asks what the design would look like
+under violations of its assumptions.
+
+# The design, step by step {#sec-design}
+
+## The DGP the identification rests on
+
+**Purchases respond to exposure and to a demand shock the analyst does not
+see.** For household $i$ on day $t$,
+$Y_{it} = f(\alpha + \beta A_{it} + \gamma X_{it} + u_{it})$ with
+$A_{it} = \sum_{s \in S_t} A_{is}$ (Equation 1). Endogeneity means
+$A_{it}$ is correlated with $u_{it}$.
+
+**Exposure is the product of three decisions made by three parties.** The
+brand targets show $s$, $A^b_s = f_b(X_s, u_s)$ (Equation 2); the household
+watches segments $View_{is} = f_v(X_{is}, u_{is}) \subseteq [0, 1]$
+(Equation 3); the network draws the airing time $T^b_s \sim l_s(x)$
+(Equation 4). Exposure is $A_{is} = A^b_s\, 1(T^b_s \in View_{is})$
+(Equation 5). The first two decisions may depend on the demand shock, which
+is where targeting bias and activity bias enter. The third does not, which
+is the exogenous variation.
+
+**Two assumptions make the third decision usable.** Quasi-random ordering:
+$l_s$ does not depend on the brand or the household, so it can be estimated
+from every brand's ads on that network. Nonstrategic viewership:
+$View_{is}$ does not depend on $T^b_s$, so a household does not switch
+channels because the focal ad is about to air. Each has an empirical check:
+compare focal and nonfocal airing-time distributions, and compare
+ad-completion rates for focal and nonfocal ads.
+
+## The instrument
+
+**Decompose realized exposure into an expected part and a shifter.**
+$A_{is} = A^b_s P_{is} + A^b_s (1(T^b_s \in View_{is}) - P_{is})$
+(Equation 7). The first term collects everything endogenous; the second is
+a centered Bernoulli draw, $1 - P_{is}$ with probability $P_{is}$ and
+$-P_{is}$ otherwise, whose mean is zero given the targeting and viewing
+decisions. That second term is the instrument (Equation 8).
+
+**Why the mean-zero property matters for practice.** Because $E[IV_{is} \mid A^b_s, View_{is}] = 0$,
+the instrument is uncorrelated with $u_{is}$, with $A^b_s$, with $P_{is}$,
+and with $A^b_s P_{is}$. The first is exogeneity and cannot be tested; the
+other three can, and a rejection of any of them means expected exposure was
+mis-estimated. The instrument is a residual from a known assignment
+process, not from a fitted model of exposure, so its validity does not
+depend on a propensity model being right.
+
+## The response model and the control function
+
+**Ad effects accumulate and depend on purchase history.** Equations 9 to
+15: an ad stock with daily decay $\lambda_A$; $\alpha_{it}$ and $\beta_{it}$
+each equal to a base level, a shift after the first purchase, a quadratic
+in log frequency and log recency, a linear index in household traits
+$Z_i$, and a household random effect. The log and squared-log terms let
+both curves bend, which is what Figure 4 of the paper reports.
+
+**A nonlinear second stage needs a control function, not two-stage least
+squares.** Equations 16 to 19: regress $A_{it}$ on $IV_{it}$ and the
+controls, keep the residual $\hat\varepsilon^f_{it}$, accumulate it with
+decay $\lambda_{CF}$ into $CFS_{it}$, and add $CFS_{it}$ to the probit.
+Conditioning on the residual removes the part of the demand shock that is
+correlated with the ad stock; $\delta = 0$ is the exogeneity test
+(Wooldridge 2015). The stock is needed because the endogenous regressor is
+itself a stock: if the confounder persists, so must its control, and the
+two decays need not be equal.
+
+**Inference must account for the generated regressor.** The second stage
+treats $CFS_{it}$ as data. The paper resamples households, 50 times, and
+re-runs both stages.
+
+# What the replication package allows {#sec-package}
+
+**The data are under a nondisclosure agreement; the package simulates
+them.** Table \@ref(tab:files) lists the four scripts. Their DGP is a
+household-day panel with a known truth. It keeps the two biases of the
+paper, an unobservable that drives targeting, viewing, and purchase, but
+it has no show level: no airing-time density, no viewing segments, no other
+brands' ads.
+
+```{r files, echo = FALSE}
+tibble(
+  Script = c("Step1 - AdExposureSimulation.R", "Step2 - PurchaseSimulation.R", "Step3 - BootstrapEstimate.R", "Step4 - ModelEstimation.R"),
+  Content = c("25,000 households x 150 days; $u_{endo}$ drives the targeting probability of three shows a day and the watched portion; exposure = Bernoulli(portion) x targeting; expected exposure; ad stock with decay 0.7",
+              "probit utility with $\\alpha_0 = -2.5$, $\\beta_0 = 0.012$, state terms, a 30-day promotion after the first purchase, competitor spend, and a confounder that accumulates $u_{endo}$ with decay 0.95",
+              "50 household resamples; first stage, control-function stock with decay 0.95, probit",
+              "naive probit and control-function probit; a table with the true parameters"),
+  `Used for` = c("benchmark panel, rerun with seed 1107", "benchmark outcomes, rerun with seed 123", "benchmark standard errors", "benchmark point estimates")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, caption = "The replication package and its role in this note.") %>%
+  tab_style() %>% column_spec(1, width = "3.6cm") %>% column_spec(2, width = "8.2cm") %>% column_spec(3, width = "3.2cm")
+```
+
+**Three points where the scripts and the paper part ways.** First, the
+scripts' expected exposure uses the targeting probabilities, which are
+functions of the unobservable; an analyst never sees them. The paper's
+expected treatment conditions on the realized targeting decision and the
+watched portion. Both are mean zero given the unobservable, so both are
+valid in the simulation, but only the second can be computed from data.
+Second, the bootstrap keeps each sampled household once
+(`filter(hh %in% boot_hh)`), so every "bootstrap" sample is a 63 percent
+subsample without replacement, and its standard deviation is about
+$\sqrt{1/0.632 - 1} = 0.76$ of a cluster bootstrap in expectation. Third,
+the scripts have no show level, so Figures 2 and 3 and the
+household-show half of Table 2 cannot be produced from them.
+
+**What this note does with each.** Section \@ref(sec-benchmark) reruns
+the scripts and matches them with `cf_residuals()` and a cluster
+bootstrap that keeps duplicates, reporting both instruments and both
+standard errors. Sections \@ref(sec-data) to \@ref(sec-hte) add a show
+level, networks with their own airing-time densities, viewing segments,
+nonfocal ads, on top of the authors' purchase model, and reproduce the
+paper's tables and figures in their layouts. Section \@ref(sec-robust)
+reruns the paper's robustness checks, and Section \@ref(sec-extensions)
+asks what the diagnostics catch when the assumptions fail.
+
+# Benchmark: the authors' scripts, rerun and matched {#sec-benchmark}
+
+## The scripts, verbatim
+
+**The helper file reproduces Steps 1 and 2 line by line, with seeds 1107
+and 123.** Random streams inside `future_lapply(future.seed = TRUE)` do not
+depend on the number of workers, so the panel equals the one the authors
+would obtain. The vectorized purchase simulation used later in this note
+is checked against the authors' household loop on the same panel.
+
+```{r authors-data}
+fs_file <- sim_file("fs_ready"); ss_file <- sim_file("ss_ready")
+if (file.exists(ss_file)) {
+  ss <- readRDS(ss_file)
+} else {
+  fs <- authors_step1(N_hh = n_hh, T_day = n_days, workers = n_threads)
+  saveRDS(fs, fs_file)
+  ss <- authors_step2(fs, workers = n_threads)
+  saveRDS(ss, ss_file)
+}
+ours <- simulate_purchases(ss[order(ss$hh, ss$t), c("hh", "t", "A", "A_stock", "u_endo", "u_exo", "comp")], purchase_par(FALSE, FALSE))
+c(rows = nrow(ss), purchase_rate = mean(ss$purchase), converted = mean(tapply(ss$purchase, ss$hh, max)),
+  same_purchases = all(ours$purchase == ss$purchase),
+  same_states = all(ours$freq == ss$freq & ours$rec == ss$rec & ours$promo1m == ss$promo1m))
+```
+
+```{r authors-desc, echo = FALSE}
+conv_share <- mean(tapply(ss$purchase, ss$hh, max))
+```
+
+The authors' purchase parameters convert `r fmt(100 * conv_share, 1)` percent
+of households within 150 days, against 3.8 percent in the paper; the daily
+conversion rate of an unconverted household, $\Phi(-2.5) = 0.62$ percent,
+is fifty times the paper's 0.012 percent. The confounder enters utility
+with weight 0.005 on a stock whose standard deviation is about 3.2, so the
+endogeneity is mild. We keep every value as shipped.
+
+## Step 4 with the package
+
+**The first stage is `cf_residuals()`, the stock is a two-line
+recursion, and the second stage is `glm()`.** `cf_residuals()` returns the
+data with the residual appended and the first-stage strength of
+`iv_first_stage()` as an attribute. The stock $CFS_{it}$ is accumulated
+within household with `adstock_by()`, defined in the helper file.
+
+```{r adstock-def, eval = FALSE}
+adstock <- function(x, lambda) as.numeric(stats::filter(x, lambda, method = "recursive"))
+adstock_by <- function(x, id, lambda) as.numeric(stats::ave(x, id, FUN = function(v) adstock(v, lambda)))
+```
+
+```{r authors-match}
+s4 <- authors_step4(ss)
+bench <- add_states(ss)
+spec_bench <- col_spec(lambda_A = 0.7, cf = TRUE, lambda_CF = 0.95, interactions = TRUE, traits = FALSE)
+ours_bench <- fit_column(bench, spec_bench)
+fs_strength <- attr(ours_bench$data, "first_stage")$strength
+cf_authors <- rename_authors(coef(s4$full)); cf_naive <- rename_authors(coef(s4$naive))
+terms_b <- names(cf_authors)
+ours_cf <- coef(ours_bench$fit)[terms_b]
+bench_model_se <- summary(ours_bench$fit)$coefficients[terms_b, "Std. Error"]
+c(max_abs_diff = max(abs(cf_authors - ours_cf)), F_first_stage = fs_strength$F, F_robust = fs_strength$F_robust)
+rm(s4, ours_bench); invisible(gc())
+```
+
+```{r authors-boot}
+boot_file <- sim_file(paste0("bench_boot_", n_boot))
+if (file.exists(boot_file)) {
+  bb <- readRDS(boot_file)
+} else {
+  b_authors5 <- authors_step3(ss, B = min(5L, n_boot), seed = 1107, workers = n_threads_boot)
+  bench_cols <- c("hh", "t", "purchase", "A", "IV", controls_base, "freq", "rec")
+  b_unique <- cluster_bootstrap(bench[, bench_cols], spec_bench, n_boot = n_boot, seed = 1107, unique_only = TRUE,
+                                workers = n_threads_boot)
+  b_cluster <- cluster_bootstrap(bench[, bench_cols], spec_bench, n_boot = n_boot, seed = 1107, unique_only = FALSE,
+                                 workers = n_threads_boot)
+  bb <- list(authors5 = b_authors5, unique = b_unique, cluster = b_cluster)
+  saveRDS(bb, boot_file)
+}
+auth_draws <- rename_authors(bb$authors5$draws)
+n5 <- min(nrow(auth_draws), nrow(bb$unique$draws))
+c(first_draws_max_diff = max(abs(auth_draws[seq_len(n5), ] - bb$unique$draws[seq_len(n5), colnames(auth_draws)])))
+```
+
+```{r bench-table, echo = FALSE}
+truth_b <- authors_truth[terms_b]
+model_se <- bench_model_se
+bench_tab <- tibble(
+  Term = term_labels[terms_b], True = ifelse(is.na(truth_b), "---", fmt(truth_b, 3)),
+  `Naive` = fmt(cf_naive[terms_b], 4), `Control function` = fmt(ours_cf, 4),
+  `Model SE` = fmt(model_se, 4), `Authors' bootstrap SE` = fmt(bb$unique$se[terms_b], 4), `Cluster bootstrap SE` = fmt(bb$cluster$se[terms_b], 4),
+  `t (cluster)` = fmt(ours_cf / bb$cluster$se[terms_b], 2)
+)
+bench_tab$Naive[terms_b == "CF_stock"] <- "---"
+kbl(bench_tab, booktabs = TRUE, linesep = "", escape = FALSE, align = "lrrrrrrr",
+    caption = paste0("The authors' Step 4 table on their DGP (", fmt0(n_hh), " households, ", n_days, " days): true parameters, naive probit, control-function probit, and three standard errors. The authors' bootstrap keeps each sampled household once; the cluster bootstrap keeps duplicates. ", n_boot, " draws each.")) %>%
+  tab_style("scale_down")
+```
+
+```{r bench-numbers, echo = FALSE}
+b_naive <- cf_naive["A_stock"]; b_cf <- ours_cf["A_stock"]
+ratio_se <- mean(bb$unique$se[terms_b] / bb$cluster$se[terms_b])
+```
+
+**What the benchmark shows.** The package reproduces the authors' point
+estimates to `r format(signif(max(abs(cf_authors - ours_cf)), 2))`, and its
+`unique_only` bootstrap reproduces their first five draws exactly, so the
+50-draw column labelled "authors' bootstrap" is what their Step 3 returns.
+The naive ad-stock coefficient is `r fmt(b_naive, 4)` against a truth of
+0.012 and a corrected `r fmt(b_cf, 4)`. The control-function coefficient
+is `r fmt(ours_cf["CF_stock"], 4)` with cluster t statistic
+`r fmt(ours_cf["CF_stock"] / bb$cluster$se["CF_stock"], 2)`. The authors' bootstrap
+standard errors average `r fmt(ratio_se, 2)` of the cluster bootstrap's,
+close to the 0.76 that a 63 percent subsample implies, and the model-based
+standard errors that treat the stock as data are smaller still for the
+ad-stock terms. Table \@ref(tab:bench-instruments) compares the scripts'
+oracle instrument with the paper's.
+
+```{r bench-instruments, echo = FALSE}
+iv_rows <- function(iv, label) {
+  f <- fit_column(bench, modifyList(spec_bench, list(iv = iv)))
+  st <- attr(f$data, "first_stage")$strength
+  tibble(Instrument = label, `Mean` = fmt(mean(bench[[iv]]), 4), `Corr with $A$` = fmt(cor(bench$A, bench[[iv]]), 3),
+         `Corr with $u_{endo}$` = fmt(cor(bench$u_endo, bench[[iv]]), 4), `First-stage F` = fmt0(st$F),
+         `$\\beta_0$` = fmt(coef(f$fit)["A_stock"], 4), `$\\delta$` = fmt(coef(f$fit)["CF_stock"], 4))
+}
+two_ivs <- file_cached("bench_instruments", bind_rows(iv_rows("IV", "Scripts: $A - \\sum_k P_k\\, p^{target}_k$ (oracle)"),
+                                                     iv_rows("IV_paper", "Paper: $A - \\sum_k A^b_k P_k$")))
+kbl(two_ivs, booktabs = TRUE, linesep = "", escape = FALSE, caption = "Two instruments on the authors' DGP. The scripts subtract the expected exposure computed from the targeting probabilities; the paper subtracts the expected exposure given the realized targeting decisions.") %>%
+  tab_style()
+rm(bench, ss, ours); invisible(gc())
+```
+
+Both instruments are mean zero and orthogonal to the unobservable, and
+both correct the naive estimate. The paper's version is the one an analyst
+can build, and the rest of the note uses it.
+
+# A show level for the authors' DGP {#sec-data}
+
+## What is added, and why
+
+**The paper's construction needs shows, densities, and segments.** The
+helper simulates, for each household-day, three shows on three networks.
+Each network has its own airing-time density on $[0, 1]$: trimodal like
+MTV in the paper's Figure 2, bimodal, and close to uniform. The brand
+targets each show with the authors' probabilities, rising in the
+household-day shock. The household watches a segment whose length follows
+the authors' rule (a 30 percent chance of not watching, otherwise a length
+rising in the shock) plus two standardized traits, average viewing and
+sports viewing, the latter acting on the second network only. The focal ad
+airs at a time drawn from the network's density; nonfocal ads are drawn
+from the same density. Exposure follows Equation 5. Expected exposure
+integrates the empirical distribution of nonfocal ads over the segment,
+and the instrument is Equation 8. A second brand with no effect on
+purchases is exposed through the same viewing process for the placebo
+check. The purchase model is the authors' with two additions for Table 4
+columns 5 and 6 and Table 5: the two traits enter $\alpha_{it}$
+($-0.05$, $0.03$) and $\beta_{it}$ ($-0.004$, $0.004$), and household random
+effects have $\sigma_1 = 0.2$, $\sigma_2 = 0.01$, $\rho = -0.3$.
+
+**Two of the authors' values are changed, and why.** The intercept is
+$-3.0$ instead of $-2.5$: with $-2.5$ two thirds of households convert
+within 150 days and repeat buyers reach purchase frequencies at which the
+quadratic in log frequency turns the ad effect negative on average; with
+$-3.0$ about a quarter convert, still far above the paper's 3.8 percent
+but with an average ad effect of the paper's sign. The weight of the
+confounder is 0.015 instead of 0.005: with the authors' value the naive
+bias in $\beta_0$ is about 0.003, below the standard error at this sample
+size, so the comparison that Table 4 is built to show would sit inside
+sampling noise. Both changes are to the purchase model only; the exposure
+process is the authors' with a show level added, and the benchmark of
+Section \@ref(sec-benchmark) uses the authors' values throughout.
+
+```{r show-data}
+show_file <- sim_file("show_panel")
+if (file.exists(show_file)) {
+  sim <- readRDS(show_file)
+} else {
+  par_b <- purchase_par(traits = TRUE, random = TRUE, a0 = -3.0, delta = 0.015)
+  sim <- simulate_exposure(n_hh = n_hh, n_days = n_days, seed = 1107, par = par_b)
+  sim$panel <- add_states(simulate_purchases(sim$panel, sim$par))
+  saveRDS(sim, show_file)
+}
+pan <- sim$panel
+set.seed(1107)
+sub_hh <- sort(sample(unique(pan$hh), min(5000L, n_hh)))
+pan_sub <- pan[pan$hh %in% sub_hh, ]
+c(rows = nrow(pan), purchase_rate = mean(pan$purchase), converted = mean(tapply(pan$purchase, pan$hh, max)),
+  exposures_per_day = mean(pan$A), partial_share = sum(pan$n_partial) / sum(pan$n_target))
+```
+
+## Table 1: descriptives
+
+**The paper's Table 1 tells the reader how rare exposures and purchases
+are.** Ours reports the same five quantities for the simulated panel; show
+length is one hour.
+
+```{r table1, echo = FALSE}
+conv <- pan %>% group_by(hh) %>% summarise(n = sum(purchase), first = suppressWarnings(min(t[purchase == 1])), .groups = "drop") %>% filter(n > 0)
+ipt <- pan %>% filter(purchase == 1) %>% group_by(hh) %>% reframe(gap = diff(t))
+t1 <- bind_rows(
+  quantile_row(pan$view_hr, "TV viewing per household per day (hr)"),
+  quantile_row(pan$targeted_hr, "Targeted show viewing per household per day (hr)"),
+  quantile_row(pan$A, "Number of focal brand ad exposures per household per day"),
+  quantile_row(conv$n, "Purchase frequency per converted household"),
+  quantile_row(ipt$gap, "Interpurchase time per converted household (days)")
+)
+t1 %>% mutate(across(-Variable, ~ fmt(.x, 2))) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("", "Mean", "SD", "5\\%", "25\\%", "50\\%", "75\\%", "95\\%"), escape = FALSE,
+      caption = paste0("Descriptive statistics (the layout of Table 1). Simulated TV viewing and purchase behavior for ", fmt0(n_hh), " households over ", n_days, " days.")) %>%
+  tab_style() %>% footnote(general = paste0(fmt0(nrow(conv)), " households (", fmt(100 * nrow(conv) / n_hh, 1), " percent) converted."), general_title = "Note. ", footnote_as_chunk = TRUE)
+```
+
+## Figure 1: model-free evidence
+
+**The paper plots purchase probability against frequency, recency, and
+same-day exposures before fitting anything.** The first two panels motivate
+the state-dependence terms; the third is the naive association that the
+instrument is meant to shrink. The same three panels for the simulated
+panel:
+
+```{r fig1, echo = FALSE, fig.cap = "Daily purchase probability by prior purchase frequency, purchase recency, and same-day ad exposures (the layout of Figure 1). Means with 95 percent confidence intervals.", fig.width = 9, fig.height = 3}
+mf <- function(df, var, xlab, maxv) {
+  df %>% filter(.data[[var]] <= maxv) %>% group_by(x = .data[[var]]) %>%
+    summarise(p = mean(purchase), se = sqrt(p * (1 - p) / n()), .groups = "drop") %>%
+    ggplot(aes(x, p)) + geom_errorbar(aes(ymin = p - 1.96 * se, ymax = p + 1.96 * se), width = 0.2, colour = "grey50") +
+    geom_point() + geom_line() + scale_y_continuous(labels = scales::percent) + labs(x = xlab, y = "Daily purchase probability")
+}
+(mf(pan, "freq", "Purchase frequency", 10) + ggtitle("(a) Frequency")) +
+  (mf(filter(pan, post == 1), "rec", "Purchase recency (days)", 30) + ggtitle("(b) Recency")) +
+  (mf(pan, "A", "Same-day ad exposures", 3) + ggtitle("(c) Same-day exposures"))
+```
+
+Converted households buy every `r fmt(t1$Mean[5], 1)` days here against 11.3
+in the paper, and `r fmt(t1$Mean[4], 1)` times over the window against 2.4,
+because the post-conversion shift of 1.5 in the authors' utility is large
+relative to the paper's baseline. Exposures per day (`r fmt(t1$Mean[3], 2)`)
+are the authors' and about four times the paper's 0.14.
+
+Panel (a) rises with frequency because of habit formation in the DGP
+($\alpha_{2,1} = 0.45$, $\alpha_{2,2} = -0.06$). Panel (b) falls with recency
+($\alpha_{2,3} = -0.10$, $\alpha_{2,4} = -0.03$); the paper's weekly spikes
+are absent because the DGP has no day-of-week reordering. Panel (c) is
+positive, and part of it is activity bias.
+
+# Validating the instrument {#sec-iv}
+
+## Figure 2: is the focal brand scheduled like everyone else?
+
+**The quasi-random ordering assumption is checked by comparing airing-time
+distributions.** If the network gave the focal brand a special slot, the
+focal distribution would differ from the nonfocal one, and the density
+estimated from all ads would mis-state expected exposure. The paper shows
+MTV; we show the first network, whose density is trimodal by construction,
+and the Kolmogorov-Smirnov test for every network (Online Appendix E.2).
+
+```{r fig2, echo = FALSE, fig.cap = "Within-show airing-time distributions of focal and nonfocal ads on the first network (the layout of Figure 2). Left: densities. Right: cumulative distributions. Airing times are normalized by show duration.", fig.width = 8, fig.height = 3.2}
+at1 <- filter(sim$ad_times, network == 1)
+ks1 <- ks_by_network(at1)
+p_pdf <- ggplot(at1, aes(time, colour = type)) + geom_line(stat = "density", adjust = 0.8, linewidth = 0.7) +
+  labs(x = "Normalized airing time", y = "Density", colour = NULL)
+p_cdf <- ggplot(at1, aes(time, colour = type)) + stat_ecdf(linewidth = 0.7) +
+  labs(x = "Normalized airing time", y = "Cumulative distribution", colour = NULL)
+(p_pdf + p_cdf) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+```{r ks-table, echo = FALSE}
+ks_all <- ks_by_network(sim$ad_times)
+ks_all %>% mutate(D = fmt(D, 3), p = fmt(p, 3)) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Network", "Focal ads", "Nonfocal ads", "KS statistic", "p-value"),
+      caption = "Kolmogorov-Smirnov tests of focal against nonfocal airing-time distributions by network (the check of Online Appendix E.2).") %>%
+  tab_style()
+```
+
+The focal and nonfocal distributions coincide on every network because the
+DGP draws both from the same density; the KS p-values are
+`r paste(fmt(ks_all$p, 2), collapse = ", ")`. The paper reports 0.545 for
+MTV. Section \@ref(sec-violations) shows what the test does when the
+assumption fails.
+
+## Figure 3: expected exposure as an area under the curve
+
+**The paper's Figure 3 turns the definition of $P_{is}$ into a picture.**
+The left panel is the network's density; the right panel shades the
+household's viewing window and reports the area, which is the probability
+that a focal ad on that network airs while the household is watching.
+
+```{r fig3, echo = FALSE, fig.cap = "Airing-time density of the first network and the expected exposure of a household that watched part of a targeted show (the layout of Figure 3). The shaded area is the estimated probability of exposure, the dashed line the realized airing time of the focal ad.", fig.width = 8, fig.height = 3.2}
+ex <- sim$show_sample %>% filter(network == 1, A_b == 1, len > 0.3, len < 0.7) %>% slice(1)
+grid_x <- seq(0, 1, by = 0.005)
+dens1 <- tibble(x = grid_x, d = sim$densities[[1]]$d(grid_x))
+p_left <- ggplot(dens1, aes(x, d)) + geom_area(fill = "grey80", colour = "grey30") + labs(x = "Normalized show time", y = "Density of ad airing")
+p_right <- ggplot(dens1, aes(x, d)) + geom_area(fill = "grey85", colour = "grey30") +
+  geom_area(data = filter(dens1, x >= ex$start, x <= ex$end), fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = ex$T_focal, linetype = "dashed") +
+  labs(x = "Normalized show time", y = "Density of ad airing") +
+  annotate("label", x = 0.5, y = max(dens1$d) * 0.95, size = 3,
+           label = paste0("View = [", fmt(ex$start, 2), ", ", fmt(ex$end, 2), "], P = ", fmt(ex$P_hat, 2), ", A = ", ex$A, ", IV = ", fmt(ex$IV, 2)))
+p_left + p_right
+```
+
+The household in the right panel watched
+`r fmt(100 * ex$len, 0)` percent of a targeted show and had an expected
+exposure of `r fmt(ex$P_hat, 2)`; its realized exposure was `r ex$A`, so its
+instrument is `r fmt(ex$IV, 2)`. The uniform-density shortcut would have
+used `r fmt(ex$len, 2)`, the viewed share, instead.
+
+## Table 2 and the falsification checks
+
+**Table 2 of the paper reports the moments that Propositions 1 and 2
+predict.** Realized and expected exposure should have the same mean, so
+the instrument is mean zero; the instrument should correlate with realized
+exposure and not with the targeting decision, the exposure probability, or
+their product. Household-show rows are those in which a household watched
+any part of a targeted show, as in the paper; our household-show
+quantiles use a `r fmt(100 * 0.02, 0)` percent sample of those rows while the means, standard
+deviations, and correlations use all of them.
+
+```{r table2, echo = FALSE}
+mom <- show_moments(sim$moments)
+ss_rows <- sim$show_sample %>% filter(A_b == 1, len > 0) %>% mutate(A_exp = A_b * P_hat)
+t2_show <- bind_rows(quantile_row(ss_rows$A, "Realized ad exposure ($A_{is}$)"),
+                     quantile_row(ss_rows$A_exp, "Expected ad exposure ($A^b_s \\hat P_{is}$)"),
+                     quantile_row(ss_rows$IV, "Proposed IV ($\\widehat{IV}_{is}$)"))
+t2_show$Mean <- mom$mean[c("A", "A_exp", "IV")]; t2_show$SD <- mom$sd[c("A", "A_exp", "IV")]
+t2_day <- bind_rows(quantile_row(pan$A, "Realized ad exposure ($A_{it}$)"),
+                    quantile_row(pan$A_exp, "Expected ad exposure ($\\sum_s A^b_s \\hat P_{is}$)"),
+                    quantile_row(pan$IV, "Proposed IV ($\\widehat{IV}_{it}$)"))
+bind_rows(t2_show, t2_day) %>% mutate(across(-Variable, ~ fmt(.x, 3))) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("", "Mean", "SD", "5\\%", "25\\%", "50\\%", "75\\%", "95\\%"),
+      caption = "Summary statistics of realized ad exposure, expected ad exposure, and the instrument (the layout of Table 2).") %>%
+  pack_rows("Household-show level", 1, 3) %>% pack_rows("Household-day level", 4, 6) %>% tab_style() %>%
+  footnote(general = paste0("Based on ", fmt0(mom$n), " household-show observations in which the household watched part of a targeted show, and ", fmt0(nrow(pan)), " household-day observations."), general_title = "Note. ", footnote_as_chunk = TRUE, threeparttable = TRUE)
+```
+
+```{r falsification, echo = FALSE}
+tt_show <- mom$mean["IV"] / (mom$sd["IV"] / sqrt(mom$n)); tt_day <- t.test(pan$IV)$statistic
+fals <- tibble(
+  Check = c("Mean of the IV (t statistic)", "corr(IV, realized exposure)", "corr(IV, targeting decision $A^b_s$)",
+            "corr(IV, exposure probability $\\hat P_{is}$)", "corr(IV, expected exposure $A^b_s \\hat P_{is}$)", "corr(IV, $u_{endo}$), unobservable in practice"),
+  `Household-show` = c(paste0(fmt(mom$mean["IV"], 4), " (", fmt(tt_show, 2), ")"), fmt(mom$corr["IV", "A"], 3), fmt(mom$corr_iv_target_all, 4),
+                       fmt(mom$corr["IV", "P_hat"], 4), fmt(mom$corr["IV", "A_exp"], 4), fmt(cor(sim$show_sample$IV, sim$show_sample$u_endo), 4)),
+  `Household-day` = c(paste0(fmt(mean(pan$IV), 4), " (", fmt(tt_day, 2), ")"), fmt(cor(pan$IV, pan$A), 3), fmt(cor(pan$IV, pan$n_target), 4),
+                      "---", fmt(cor(pan$IV, pan$A_exp), 4), fmt(cor(pan$IV, pan$u_endo), 4)),
+  Paper = c("$-0.002$; $-0.004$", "0.42; 0.36", "$-0.001$; $-0.006$", "$-0.001$; $-0.007$", "$-0.009$; $-0.009$", "not observable")
+)
+kbl(fals, booktabs = TRUE, linesep = "", escape = FALSE, caption = "Relevance and falsification checks of the instrument (Propositions 1 and 2), with the paper's values.") %>% tab_style()
+```
+
+**Reading the checks.** Realized and expected exposure have the same mean
+to three decimals, so the instrument is mean zero; it correlates with
+realized exposure at `r fmt(cor(pan$IV, pan$A), 2)` on the day level
+(0.36 in the paper) and with nothing endogenous. The last row cannot be
+computed with real data and is the reason the design works: the
+instrument does not move with the demand shock even though exposure does
+(corr($A_{it}$, $u_{endo}$) = `r fmt(cor(pan$A, pan$u_endo), 2)`).
+
+# First stage {#sec-first-stage}
+
+**Table 3 shows that the instrument moves exposure one for one and that
+purchase history does not, once the instrument is in the regression.** The
+coefficient on the instrument is close to one because
+$A_{it} = \text{expected} + IV_{it}$ and the expected part is absorbed by
+the controls only in part. `cf_residuals()` runs this regression and
+returns the residual and the strength statistics.
+
+```{r table3, echo = FALSE}
+spec4 <- col_spec(lambda_A = 0.7, cf = TRUE, lambda_CF = 0.95, interactions = FALSE, traits = TRUE, trait_slopes = FALSE)
+aug4 <- first_stage(pan, spec4)
+fs_fit <- attr(aug4, "first_stage")$fit
+fs_strength <- attr(aug4, "first_stage")$strength
+fs_rob <- lm_robust(formula(fs_fit), data = pan, clusters = hh, se_type = "stata")
+ar_set <- iv_ar_confidence_set(pan_sub, y = "purchase", d = "A", z = "IV", x = c(controls_base, controls_traits), cluster = "hh",
+                               theta_grid = seq(-0.02, 0.04, length.out = 601))
+fs_terms <- c("(Intercept)", "IV", "post", "lf", "lf2", "lr", "lr2", "promo1m", "comp", "z_view", "z_sports")
+fs_labels <- c("Intercept", "$\\widehat{IV}_{it}$", "Post conversion", "Frequency (log)", "Frequency (log) squared", "Recency (log)", "Recency (log) squared",
+               "First month post-conversion promotion", "Competitor ad spend", "Average TV viewing", "Sports viewing")
+fs_params <- c("$\\alpha^f_0$", "$\\phi^f$", "$\\alpha^f_{2,0}$", "$\\alpha^f_{2,1}$", "$\\alpha^f_{2,2}$", "$\\alpha^f_{2,3}$", "$\\alpha^f_{2,4}$", "$\\gamma^f_1$", "$\\gamma^f_2$", "$\\alpha^f_1$", "$\\alpha^f_1$")
+tibble(`Model component` = fs_labels, Parameter = fs_params,
+       Estimate = est_star(coef(fs_rob)[fs_terms], fs_rob$std.error[fs_terms], 4), `Standard error` = fmt(fs_rob$std.error[fs_terms], 4)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, caption = "Parameter estimates from the first-stage model (the layout of Table 3). Standard errors clustered by household.") %>%
+  tab_style() %>% footnote(general = paste0("The DV is daily household focal brand ad exposures. First-stage F = ", fmt0(fs_strength$F), " (robust F = ", fmt0(fs_strength$F_robust), "). ***p < 0.01; **p < 0.05; *p < 0.1."), general_title = "Note. ", footnote_as_chunk = TRUE, escape = FALSE, threeparttable = TRUE)
+```
+
+The first-stage F is `r fmt0(fs_strength$F)` (the paper: 1,902,996), so
+weak-instrument inference is not a concern here; on a 5,000-household
+subsample the Anderson-Rubin 95 percent set for the linear-probability
+effect of exposure,
+[`r fmt(ar_set$intervals$lower, 4)`, `r fmt(ar_set$intervals$upper, 4)`],
+equals the Wald interval
+[`r fmt(ar_set$wald["lower"], 4)`, `r fmt(ar_set$wald["upper"], 4)`]. The
+purchase-history terms do not predict exposure given the instrument, as
+in the paper's Table 3, because the DGP routes all endogeneity through the
+unobservable rather than through the observed states.
+
+# Second stage {#sec-second-stage}
+
+## Table 4: six columns, with and without the control function
+
+**The paper builds the model up in three steps and adds the control
+function at each step.** Columns 1 and 2 have no carryover; columns 3 and
+4 add the two decays; columns 5 and 6 add the moderation of ad
+responsiveness by purchase history and by household traits and the
+household random effects. Comparing each pair isolates what the control
+function does at that level of richness. Columns 5 and 6 are estimated
+with a household random intercept and random slope on the ad stock through
+`lme4::glmer()` (Laplace approximation, `nAGQ = 0`) instead of the
+paper's simulated maximum likelihood. Bootstrap standard errors use
+`r n_boot` household draws with duplicates kept; for column 6 the
+coefficient rows are bootstrapped without the random effects (each
+random-effects fit takes about twenty minutes at this size) and the three
+random-effect rows on the 5,000-household subsample with 20 draws.
+
+```{r table4-fits}
+specs <- list(
+  c1 = col_spec(0,   FALSE, 0,    FALSE, TRUE, FALSE),
+  c2 = col_spec(0,   TRUE,  0,    FALSE, TRUE, FALSE),
+  c3 = col_spec(0.7, FALSE, 0,    FALSE, TRUE, FALSE),
+  c4 = col_spec(0.7, TRUE,  0.95, FALSE, TRUE, FALSE),
+  c5 = col_spec(0.7, FALSE, 0,    TRUE,  TRUE, TRUE, random = TRUE),
+  c6 = col_spec(0.7, TRUE,  0.95, TRUE,  TRUE, TRUE, random = TRUE)
+)
+fits_file <- sim_file("table4_fits")
+if (file.exists(fits_file)) {
+  t4 <- readRDS(fits_file)
+} else {
+  t4 <- lapply(specs, function(s) {
+    f <- fit_column(pan, s)
+    se <- if (inherits(f$fit, "merMod")) sqrt(diag(as.matrix(vcov(f$fit)))) else summary(f$fit)$coefficients[, 2]
+    list(coef = coef_vector(f$fit), se = se)
+  })
+  saveRDS(t4, fits_file)
+}
+sapply(t4, function(x) x$coef[c("A_stock", "CF_stock")])
+```
+
+```{r table4-boot}
+boot4_file <- sim_file(paste0("table4_boot_", n_boot))
+if (file.exists(boot4_file)) {
+  b4 <- readRDS(boot4_file)
+} else {
+  boot_cols <- c("hh", "t", "purchase", "A", "IV", controls_base, controls_traits, "freq", "rec")
+  b4 <- list(
+    c2 = cluster_bootstrap(pan[, boot_cols], specs$c2, n_boot = n_boot, seed = 1107, workers = n_threads_boot),
+    c4 = cluster_bootstrap(pan[, boot_cols], specs$c4, n_boot = n_boot, seed = 1107, workers = n_threads_boot),
+    c6 = cluster_bootstrap(pan[, boot_cols], modifyList(specs$c6, list(random = FALSE)), n_boot = n_boot, seed = 1107,
+                           workers = n_threads_boot),
+    c6_re = cluster_bootstrap(pan_sub[, boot_cols], specs$c6, n_boot = min(n_boot, 20L), seed = 1107,
+                              workers = n_threads_boot)
+  )
+  b4$c6$se[c("sigma1", "sigma2", "rho")] <- b4$c6_re$se[c("sigma1", "sigma2", "rho")]
+  saveRDS(b4, boot4_file)
+}
+sapply(b4[c("c2", "c4", "c6")], function(b) c(b$se[c("A_stock", "CF_stock")], failed = b$n_failed))
+```
+
+```{r table4, echo = FALSE}
+rows4 <- c("(Intercept)", "A_stock", "CF_stock", "post", "lf", "lf2", "lr", "lr2", "A_stock:post", "A_stock:lf", "A_stock:lf2", "A_stock:lr", "A_stock:lr2",
+           "promo1m", "comp", "z_view", "z_sports", "A_stock:z_view", "A_stock:z_sports", "sigma1", "sigma2", "rho")
+truth4 <- c(-2.5, 0.012, NA, 1.5, 0.45, -0.06, -0.1, -0.03, 0, 0.02, -0.01, 0, 0.005, 0.2, 0.02, sim$par$a_view, sim$par$a_sports, sim$par$b_view, sim$par$b_sports, sim$par$sigma1, sim$par$sigma2, sim$par$rho)
+col_pair <- function(j) {
+  cf <- t4[[j]]$coef; se <- if (j %in% names(b4)) b4[[j]]$se else t4[[j]]$se
+  b <- cf[rows4]; s <- se[rows4]
+  est <- ifelse(is.na(b), "---", ifelse(rows4 %in% c("sigma1", "sigma2", "rho"), fmt(b, 3), est_star(b, s, 3)))
+  se_txt <- ifelse(is.na(b) | is.na(s), "---", fmt(s, 3))
+  tibble(est, se_txt)
+}
+t4_tab <- bind_cols(tibble(Parameter = term_labels[rows4], Symbol = param_labels[rows4], True = ifelse(is.na(truth4), "---", fmt(truth4, 3))),
+                    setNames(bind_cols(lapply(names(specs), col_pair)), paste0(rep(c("est", "se"), 6), rep(1:6, each = 2))))
+extra_rows <- tibble(Parameter = c("Carryover $\\lambda_A / \\lambda_{CF}$", "Household characteristics", "HH characteristics x ad stock"),
+                     Symbol = c("", "$\\alpha_1$", "$\\beta_1$"), True = c("0.7 / 0.95", "Yes", "Yes"),
+                     est1 = c("0 / 0", "Yes", "---"), se1 = "", est2 = c("0 / 0", "Yes", "---"), se2 = "", est3 = c("0.7 / 0", "Yes", "---"), se3 = "",
+                     est4 = c("0.7 / 0.95", "Yes", "---"), se4 = "", est5 = c("0.7 / 0", "Yes", "Yes"), se5 = "", est6 = c("0.7 / 0.95", "Yes", "Yes"), se6 = "")
+t4_out <- bind_rows(t4_tab[1:15, ], extra_rows, t4_tab[16:22, ])
+kbl(t4_out, booktabs = TRUE, linesep = "", escape = FALSE, align = c("l", "c", "r", rep("r", 12)),
+    col.names = c("", "", "True", rep(c("Est.", "SE"), 6)),
+    caption = paste0("Second-stage estimation results for the ad response model (the layout of Table 4), simulated panel of ", fmt0(n_hh), " households. Columns 1 and 2 assume no carryover, no evolution of ad responsiveness, and no unobserved heterogeneity; columns 3 and 4 add carryover; columns 5 and 6 add moderation by purchase history and household traits and household random effects. Columns 2, 4, and 6 use the control function; their standard errors come from ", n_boot, " household bootstrap draws. ***p < 0.01; **p < 0.05; *p < 0.1.")) %>%
+  add_header_above(c(" " = 3, "No carryover or moderation, without CF (1)" = 2, "No carryover or moderation, with CF (2)" = 2, "No moderation, without CF (3)" = 2,
+                     "No moderation, with CF (4)" = 2, "Full model, without CF (5)" = 2, "Full model, with CF (6)" = 2)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 7) %>% landscape()
+```
+
+```{r table4-numbers, echo = FALSE}
+b0 <- sapply(t4, function(x) unname(x$coef["A_stock"])); d0 <- sapply(t4, function(x) unname(x$coef["CF_stock"]))
+```
+
+**Reading the table against the paper.** In the paper the ad-stock
+coefficient falls when the control function enters at every level (0.023
+to 0.010, 0.016 to 0.007, 0.018 to 0.012), and $\delta$ is positive and
+significant throughout. Here the moves are `r fmt(b0["c1"], 4)` to
+`r fmt(b0["c2"], 4)`, `r fmt(b0["c3"], 4)` to `r fmt(b0["c4"], 4)`, and
+`r fmt(b0["c5"], 4)` to `r fmt(b0["c6"], 4)` against a truth of 0.012 in
+the full model, with $\delta$ equal to `r fmt(d0["c2"], 4)`,
+`r fmt(d0["c4"], 4)`, and `r fmt(d0["c6"], 4)`. Columns 1 to 4 have no
+single true value: they fit one coefficient to an effect that the DGP
+makes vary with purchase history, so their $\beta_0$ is an average over
+states. The random-effect rows return $\sigma_1 = `r fmt(t4$c6$coef["sigma1"], 3)`$
+(DGP 0.2), $\sigma_2 = `r fmt(t4$c6$coef["sigma2"], 3)`$ (0.01) and
+$\rho = `r fmt(t4$c6$coef["rho"], 2)`$ ($-0.3$); the slope variance and the
+correlation have subsample bootstrap standard errors as large as the
+estimates, as in the paper, where neither is significant.
+
+## Elasticities: the headline number
+
+**The paper converts coefficients into elasticities to compare with the
+advertising literature.** We define the same-day elasticity as the percent
+change in purchases when every household's same-day exposures rise by one
+percent, $E[\partial P_{it}/\partial AS_{it} \cdot A_{it}] / E[P_{it}]$,
+with the derivative from `cf_ape()`, and the 30-day elasticity as the
+same-day value times $\sum_{l=0}^{29} \lambda_A^l$, the cumulative
+carryover of one day's exposures.
+
+```{r elasticities}
+f5 <- fit_column(pan, modifyList(specs$c5, list(random = FALSE)))
+f6 <- fit_column(pan, modifyList(specs$c6, list(random = FALSE)))
+el <- rbind(naive = elasticities(f5$fit, f5$data), corrected = elasticities(f6$fit, f6$data))
+true_ape <- mean(dnorm(pan$index) * pan$beta_it)
+el
+```
+
+```{r elasticity-table, echo = FALSE}
+tibble(Model = c("Naive (column 5, fixed effects)", "Control function (column 6, fixed effects)", "Truth (DGP)"),
+       `Average partial effect of the ad stock` = fmt(c(el[, "ape"], true_ape), 5),
+       `Same-day elasticity` = c(fmt(el[, "same_day"], 3), "---"), `30-day elasticity` = c(fmt(el[, "long_run"], 3), "---")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Average partial effects and elasticities, naive against control function. The paper reports 0.072 and 0.222 without correction and 0.045 and 0.143 with it.") %>% tab_style()
+```
+
+The naive same-day elasticity overstates the corrected one by
+`r fmt(100 * (el["naive", "same_day"] / el["corrected", "same_day"] - 1), 0)` percent (55 percent in
+the paper). The corrected average partial effect,
+`r fmt(el["corrected", "ape"], 5)`, is within sampling error of the DGP's
+`r fmt(true_ape, 5)`.
+
+# Ad responsiveness and purchase history {#sec-hte}
+
+**Figure 4 is the paper's substantive result: who responds to TV ads.**
+It plots $\beta_{it}$ implied by the column-6 estimates against frequency
+at fixed recency and against recency at fixed frequency. The bands come
+from the bootstrap draws.
+
+```{r fig4, echo = FALSE, fig.cap = "Ad responsiveness by purchase frequency and recency (the layout of Figure 4). Solid: control function (column 6) with 95 percent bootstrap bands; dashed: naive (column 5); dotted: the DGP.", fig.width = 8, fig.height = 3.4}
+truth_cf <- c(A_stock = 0.012, `A_stock:post` = 0, `A_stock:lf` = 0.02, `A_stock:lf2` = -0.01, `A_stock:lr` = 0, `A_stock:lr2` = 0.005)
+curve_df <- function(x, freq, rec, label) {
+  cf6 <- as.list(t4$c6$coef); cf5 <- as.list(t4$c5$coef)
+  draws <- b4$c6$draws
+  band <- apply(draws, 1, function(r) beta_curve(as.list(r), freq, rec))
+  tibble(x = x, cf = beta_curve(cf6, freq, rec), naive = beta_curve(cf5, freq, rec), truth = beta_curve(as.list(truth_cf), freq, rec),
+         lo = apply(band, 1, quantile, 0.025), hi = apply(band, 1, quantile, 0.975), panel = label)
+}
+cd <- bind_rows(curve_df(1:10, 1:10, 7, "(a) Purchase frequency (recency = 7 days)"), curve_df(1:30, 1, 1:30, "(b) Purchase recency (frequency = 1)"))
+ggplot(cd, aes(x)) + geom_ribbon(aes(ymin = lo, ymax = hi), fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = cf), colour = "steelblue4", linewidth = 0.8) + geom_line(aes(y = naive), linetype = "dashed") + geom_line(aes(y = truth), linetype = "dotted") +
+  facet_wrap(~ panel, scales = "free_x") + labs(x = NULL, y = expression(beta[it]))
+```
+
+```{r targeting-table, echo = FALSE}
+p_state <- function(freq, rec) pnorm(alpha_curve(as.list(t4$c6$coef), freq, rec))
+states <- tibble(State = c("One prior purchase, 7 days ago", "Two prior purchases, 7 days ago", "Five prior purchases, 7 days ago", "One prior purchase, 1 day ago", "One prior purchase, 14 days ago", "One prior purchase, 28 days ago"),
+                 freq = c(1, 2, 5, 1, 1, 1), rec = c(7, 7, 7, 1, 14, 28))
+states <- states %>% mutate(beta = beta_curve(as.list(t4$c6$coef), freq, rec), base = p_state(freq, rec),
+                            elasticity = dnorm(qnorm(base)) * beta * mean(pan$A[pan$post == 1]) / base)
+states %>% transmute(State, `Baseline daily purchase probability` = paste0(fmt(100 * base, 2), "\\%"), `Ad responsiveness $\\beta_{it}$` = fmt(beta, 4), `Same-day elasticity` = fmt(elasticity, 3)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, caption = "Baseline propensity and ad responsiveness by purchase state, column 6 estimates. The paper reports same-day elasticities of 0.040, 0.056, and 0.046 after one, two, and five purchases, and 0.040, 0.027, and 0.078 one day, one week, and four weeks after the last purchase.") %>% tab_style()
+```
+
+**What the curves say.** The DGP puts an inverted U in frequency
+($\beta_{2,1} = 0.02$, $\beta_{2,2} = -0.01$) and a U in recency
+($\beta_{2,4} = 0.005$), the paper's two shapes. The control-function curve
+tracks the DGP within the band; the naive curve sits above it where the
+bias concentrates. The table is the paper's targeting argument in numbers:
+lapsed households have a low baseline propensity and a high
+responsiveness, so they are worth an ad but only if it comes before the
+recency trap closes.
+
+## Table 5: observed household heterogeneity
+
+**Table 5 of the paper reports how the traits shift baseline propensity
+($\alpha_1$) and ad responsiveness ($\beta_1$).** Heavy TV viewers order
+less and respond less; sports viewers order more and respond more. The DGP
+puts the same signs in with the same order of magnitude.
+
+```{r table5, echo = FALSE}
+t5_terms <- list(view = c("z_view", "A_stock:z_view"), sports = c("z_sports", "A_stock:z_sports"))
+t5_truth <- c(z_view = sim$par$a_view, z_sports = sim$par$a_sports, `A_stock:z_view` = sim$par$b_view, `A_stock:z_sports` = sim$par$b_sports)
+cf6 <- t4$c6$coef; se6 <- b4$c6$se
+tibble(Trait = c("Average TV viewing", "Sports viewing"),
+       `True` = fmt(t5_truth[c("z_view", "z_sports")], 3), Estimate = est_star(cf6[c("z_view", "z_sports")], se6[c("z_view", "z_sports")], 3), `Standard error` = fmt(se6[c("z_view", "z_sports")], 3),
+       `True ` = fmt(t5_truth[c("A_stock:z_view", "A_stock:z_sports")], 3), `Estimate ` = est_star(cf6[c("A_stock:z_view", "A_stock:z_sports")], se6[c("A_stock:z_view", "A_stock:z_sports")], 3),
+       `Standard error ` = fmt(se6[c("A_stock:z_view", "A_stock:z_sports")], 3)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, caption = paste0("Parameter estimates for observed household heterogeneity (the layout of Table 5), column 6. Standard errors from ", n_boot, " bootstrap draws. ***p < 0.01; **p < 0.05; *p < 0.1.")) %>%
+  add_header_above(c(" " = 1, "Baseline purchase propensity ($\\\\alpha_1$)" = 3, "Ad responsiveness ($\\\\beta_1$)" = 3), escape = FALSE) %>% tab_style()
+```
+
+The paper's traits are nine viewing shares calibrated on the month before
+the study; the DGP has two. Their coefficients are recovered with the
+signs and sizes put in, the responsiveness shifts less precisely because
+they multiply a stock whose effect is small.
+
+# The robustness checks the paper runs {#sec-robust}
+
+## The two decay rates (footnote 17)
+
+**The paper picks $\lambda_A$ and $\lambda_{CF}$ separately by out-of-sample
+fit.** It estimates on the first 120 days, scores the log-likelihood on
+the remaining 13, and searches a grid. The two decays need not agree: the
+ad effect decays at the rate at which exposures are forgotten, the control
+function at the rate at which the confounder persists. The DGP sets 0.7
+and 0.95. We run the grid on a subsample of 5,000 households.
+
+```{r decay-grid}
+grid_res <- file_cached("decay_grid", decay_grid(pan_sub, grid = c(0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95), train_days = n_days - 30,
+                                                 spec = col_spec(interactions = FALSE, traits = TRUE, trait_slopes = FALSE)))
+grid_res[which.max(grid_res$loglik), ]
+```
+
+```{r fig-grid, echo = FALSE, fig.cap = "Out-of-sample log-likelihood over the grid of decay rates (the search of footnote 17); the cross marks the maximum, the DGP uses 0.7 and 0.95.", fig.width = 5, fig.height = 3.6}
+best <- grid_res[which.max(grid_res$loglik), ]
+ggplot(grid_res, aes(factor(lambda_A), factor(lambda_CF), fill = loglik - max(loglik))) + geom_tile() +
+  geom_point(data = best, shape = 4, size = 4) + scale_fill_viridis_c(name = "Log-likelihood\nminus maximum") +
+  labs(x = expression(lambda[A]), y = expression(lambda[CF]))
+```
+
+The maximum is at $\lambda_A = `r best$lambda_A`$, $\lambda_{CF} = `r best$lambda_CF`$,
+against the DGP's 0.7 and 0.95, and the whole grid spans
+`r fmt(max(grid_res$loglik) - min(grid_res$loglik), 1)` log-likelihood points on
+`r fmt0(sum(pan_sub$t > n_days - 30))` held-out observations. The criterion
+is flat near the top: a slower ad stock also proxies the slow-moving
+confounder when the specification omits the moderation terms, so the
+out-of-sample fit trades the two decays against each other. The paper's
+search faces the same weak identification, which is why it fixes the
+pair before comparing specifications rather than re-estimating it in each
+column.
+
+## Collinearity of the two stocks (footnote 18)
+
+**A stock and its control are built from the same daily series, so the
+paper reports variance inflation factors.** Theirs are 2.42 and 2.27.
+
+```{r vif}
+f4 <- fit_column(pan, specs$c4)
+v <- car::vif(f4$fit)
+c(cor_AS_CFS = cor(f4$data$A_stock, f4$data$CF_stock), vif_AS = unname(v["A_stock"]), vif_CFS = unname(v["CF_stock"]))
+```
+
+The two stocks correlate at `r fmt(cor(f4$data$A_stock, f4$data$CF_stock), 2)`
+(0.72 in the paper) and the variance inflation factors are
+`r fmt(v["A_stock"], 2)` and `r fmt(v["CF_stock"], 2)`, below the paper's and
+far from the threshold of 10 that footnote 18 cites.
+
+## Placebo: another brand's ads (footnote 19, Online Appendix E.4)
+
+**If viewing is the confounder, any brand's exposures will predict
+purchases in a naive model.** The paper replaces the focal brand's ads
+with a car maker's and finds no effect after correction. The simulated
+second brand reaches households through the same viewing process and has
+no effect on purchases.
+
+```{r placebo}
+pan_pl <- pan; pan_pl$A <- pan_pl$A_pl; pan_pl$IV <- pan_pl$IV_pl
+pl_naive <- fit_column(pan_pl, specs$c3); pl_cf <- fit_column(pan_pl, specs$c4)
+pl <- rbind(naive = summary(pl_naive$fit)$coefficients["A_stock", 1:2],
+            control_function = summary(pl_cf$fit)$coefficients["A_stock", 1:2])
+pl
+```
+
+The naive coefficient on the placebo stock is `r fmt(pl["naive", 1], 4)`
+(standard error `r fmt(pl["naive", 2], 4)`); with the control function it
+is `r fmt(pl["control_function", 1], 4)` (standard error
+`r fmt(pl["control_function", 2], 4)`). Activity bias alone produces an
+"effect" of ads that do not work, and the control function removes
+`r fmt(100 * (1 - pl["control_function", 1] / pl["naive", 1]), 0)` percent of it. What
+remains is the approximation in the method: the confounder enters exposure
+through two nonlinear decisions, and a linear function of the first-stage
+residual captures most but not all of it.
+
+## Functional form of the history terms (Online Appendix E.1)
+
+**The paper compares four ways to let propensity and responsiveness bend
+with frequency and recency.** Log plus squared log wins on AIC and BIC in
+their data; it is also the DGP's form here.
+
+```{r fform}
+aug6 <- f6$data
+base <- "purchase ~ A_stock + CF_stock + post + promo1m + comp + z_view + z_sports + A_stock:post"
+forms <- list(
+  linear = paste(base, "+ freq + rec + A_stock:freq + A_stock:rec"),
+  quadratic = paste(base, "+ freq + I(freq^2) + rec + I(rec^2) + A_stock:freq + A_stock:I(freq^2)",
+                    "+ A_stock:rec + A_stock:I(rec^2)"),
+  log = paste(base, "+ lf + lr + A_stock:lf + A_stock:lr"),
+  log_squared = paste(base, "+ lf + lf2 + lr + lr2 + A_stock:lf + A_stock:lf2 + A_stock:lr + A_stock:lr2")
+)
+ff <- file_cached("functional_forms", t(sapply(forms, function(f) {
+  m <- glm(as.formula(f), data = aug6, family = binomial("probit"))
+  c(loglik = as.numeric(logLik(m)), AIC = AIC(m), BIC = BIC(m), beta0 = unname(coef(m)["A_stock"]))
+})))
+cbind(round(ff[, 1:3], 1), beta0 = round(ff[, 4], 4))
+```
+
+Log plus squared log has the lowest AIC and BIC here as well, by
+`r fmt0(ff["log", "BIC"] - ff["log_squared", "BIC"])` BIC points over the
+log specification; the ad-stock coefficient is the same to three decimals
+across the four forms.
+
+# Extensions {#sec-extensions}
+
+## The instrument is a recentered instrument {#sec-recentering}
+
+**Realized minus expected treatment under a known assignment process is
+the recentering of Borusyak and Hull (2023).** Their point is that a
+shock-driven instrument is valid only after subtracting its expectation
+under the assignment process, because the expectation carries the
+nonrandom exposure. The paper's instrument is that construction with the
+network's ad-timing density as the process. The consequence is that the
+density must be right: Table \@ref(tab:three-ivs) compares the paper's
+instrument, a version that assumes uniform timing (expected exposure
+equals the viewed share), and the scripts' oracle.
+
+```{r three-ivs, echo = FALSE}
+iv_variants <- c(`Paper: empirical density` = "IV", `Uniform timing (viewed share)` = "IV_unif", `Oracle: targeting probabilities` = "IV_oracle")
+three <- file_cached("three_ivs", bind_rows(lapply(names(iv_variants), function(nm) {
+  iv <- iv_variants[[nm]]
+  f <- fit_column(pan, modifyList(specs$c6, list(iv = iv, random = FALSE)))
+  st <- attr(f$data, "first_stage")$strength
+  tibble(Instrument = nm, `Mean (t)` = paste0(fmt(mean(pan[[iv]]), 4), " (", fmt(t.test(pan[[iv]])$statistic, 1), ")"),
+         `corr with $A$` = fmt(cor(pan[[iv]], pan$A), 3), `corr with expected exposure` = fmt(cor(pan[[iv]], pan$A_exp), 4),
+         `corr with $u_{endo}$` = fmt(cor(pan[[iv]], pan$u_endo), 4), `First-stage F` = fmt0(st$F),
+         `$\\beta_0$` = fmt(coef(f$fit)["A_stock"], 4), `$\\delta$` = fmt(coef(f$fit)["CF_stock"], 4))
+})))
+kbl(three, booktabs = TRUE, linesep = "", escape = FALSE, caption = "Three instruments on the show-level panel: the paper's, one that assumes uniform within-show timing, and the scripts' oracle. Full model (column 6 without random effects). True $\\beta_0 = 0.012$.") %>% tab_style("scale_down")
+```
+
+The uniform version fails the falsification checks: its mean is not zero
+(t statistic of `r three[["Mean (t)"]][2]`) and it correlates with expected
+exposure at `r three[["corr with expected exposure"]][2]` and with the
+unobservable at `r three[["corr with $u_{endo}$"]][2]`, because the viewed
+share is not the exposure probability when the density is trimodal. Its
+second stage lands at `r three[["$\\beta_0$"]][2]` against
+`r three[["$\\beta_0$"]][1]` for the paper's instrument, so at this size the
+leaked correlation is small enough for the control function to absorb;
+the check fails before the estimate does, which is the point of having a
+check. The oracle is valid but uses the targeting probabilities that no
+analyst observes.
+
+## What the diagnostics catch when the assumptions fail {#sec-violations}
+
+**Each identifying assumption has a diagnostic, and the Monte Carlo asks
+whether the diagnostic fires before the estimate is wrong.** Strategic
+viewership: partial viewers with a positive demand shock skip the focal ad
+with probability $\pi$. Nonrandom ordering: the network puts the focal ad
+in the first pod with probability $\pi$. Small panels
+(`r fmt0(2000)` households, 90 days), `r n_sims` replications each.
+
+```{r violation-mc}
+mc_grid <- expand.grid(type = c("skip", "order"), pi = c(0, 0.25, 0.5), stringsAsFactors = FALSE)
+mc_grid <- mc_grid[!(mc_grid$pi == 0 & mc_grid$type == "order"), ]
+mc <- file_cached(paste0("violation_mc_", n_sims), bind_rows(lapply(seq_len(nrow(mc_grid)), function(i) {
+  violation_mc(n_sims = n_sims, n_hh = 2000, n_days = 90, type = if (mc_grid$pi[i] == 0) "none" else mc_grid$type[i],
+               pi = mc_grid$pi[i], seed = i, workers = n_threads)
+})))
+mc_sum <- mc %>% mutate(type = ifelse(pi == 0, "none", type)) %>% group_by(type, pi) %>%
+  summarise(n = n(), sd_cf = sd(beta_cf), beta_naive = mean(beta_naive), beta_cf = mean(beta_cf),
+            ape_naive = mean(ape_naive), ape_cf = mean(ape_cf), ape_true = mean(ape_true), delta = mean(delta),
+            iv_mean = mean(iv_mean), iv_t = mean(iv_t), corr_iv_exp = mean(corr_iv_exp),
+            ks_reject = mean(ks_p_min < 0.05 / 3), .groups = "drop")
+mc_sum
+```
+
+```{r mc-table, echo = FALSE}
+mc_sum %>% mutate(Violation = c(none = "None", skip = "Strategic viewership", order = "Nonrandom ordering")[type]) %>%
+  transmute(Violation, `$\\pi$` = fmt(pi, 2), `Naive $\\beta_0$` = fmt(beta_naive, 4), `CF $\\beta_0$` = fmt(beta_cf, 4),
+            `SD of CF $\\beta_0$` = ifelse(is.na(sd_cf), "---", fmt(sd_cf, 4)),
+            `APE naive / CF / true ($\\times 10^4$)` = paste(fmt(1e4 * ape_naive, 2), fmt(1e4 * ape_cf, 2), fmt(1e4 * ape_true, 2), sep = " / "),
+            `IV mean (t)` = paste0(fmt(iv_mean, 4), " (", fmt(iv_t, 1), ")"), `corr(IV, expected)` = fmt(corr_iv_exp, 3), `KS rejects (share)` = fmt(ks_reject, 2)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, caption = "Monte Carlo under violations of the identifying assumptions: estimates of the ad-stock coefficient (full model without traits; true value 0.012), average partial effects, and the diagnostics the paper proposes. Means over replications; the KS test rejects at 5 percent with a Bonferroni correction over the three networks.") %>% tab_style("scale_down")
+```
+
+```{r mc-numbers, echo = FALSE}
+mc_get <- function(ty, p, col) mc_sum[[col]][mc_sum$type == ty & mc_sum$pi == p]
+```
+
+**Reading the table.** Without a violation the corrected coefficient
+averages `r fmt(mc_get("none", 0, "beta_cf"), 4)` (truth 0.012, standard
+deviation across replications `r fmt(mc_get("none", 0, "sd_cf"), 4)`) and the
+naive one `r fmt(mc_get("none", 0, "beta_naive"), 4)`. Under strategic
+skipping, exposure falls short of its expectation for high-demand
+households, so the instrument's mean turns negative with a t statistic of
+`r fmt(mc_get("skip", 0.5, "iv_t"), 0)` at $\pi = 0.5$; the KS test cannot see
+it because the network did nothing. Under nonrandom ordering the KS test
+rejects in every replication and the mean-zero check also fails, because
+the density estimated from other brands no longer describes the focal ad.
+The corrected coefficient moves to `r fmt(mc_get("skip", 0.5, "beta_cf"), 4)`
+under skipping and `r fmt(mc_get("order", 0.5, "beta_cf"), 4)` under
+reordering at $\pi = 0.5$. This is why the paper reports both checks and
+not one.
+
+**A direct effect of the instrument is the violation that no check
+detects.** If the shifter affected purchases other than through exposure,
+the instrument would still be mean zero. Conley, Hansen, and Rossi (2012)
+bound the estimate under such a violation of size $\gamma$;
+`iv_plausibly_exogenous()` does this for the linear-probability version.
+
+```{r plausibly}
+pe <- iv_plausibly_exogenous(pan_sub, y = "purchase", d = "A", z = "IV", x = c(controls_base, controls_traits),
+                             gamma_grid = c(-0.002, -0.001, 0, 0.001, 0.002), cluster = "hh")
+pe
+```
+
+A direct effect of one exposure's shifter on the purchase probability of
+$\pm 0.002$, the size of the linear-probability estimate itself, widens
+the interval from
+[`r fmt(attr(pe, "gamma_zero")[1], 4)`, `r fmt(attr(pe, "gamma_zero")[2], 4)`]
+to [`r fmt(attr(pe, "union")[1], 4)`, `r fmt(attr(pe, "union")[2], 4)`]. The
+mean-zero check cannot rule this violation out, only an argument about the
+mechanism can.
+
+## Estimators in probability units {#sec-estimators}
+
+**The paper's control-function probit is one of three ways to use the
+instrument.** Two-stage least squares on the linear-probability model
+instruments the ad stock with the instrument stock; the partially linear
+IV model of double machine learning does the same with flexible nuisance
+functions of the states and traits (`est_dml(model = "pliv")`, forests on
+a subsample); the control function gives an average partial effect through
+`cf_ape()`. All three are in probability units and can be compared with
+the DGP.
+
+```{r estimators}
+xs <- c(controls_base, controls_traits)
+xs_sum <- paste(xs, collapse = " + ")
+est_cache <- file_cached("estimators", {
+  tsls <- iv_robust(as.formula(paste("purchase ~ A_stock +", xs_sum, "| IV_stock +", xs_sum)), data = pan,
+                    clusters = hh, se_type = "stata")
+  sub2 <- pan[pan$hh %in% sub_hh[seq_len(2000L)], ]
+  rf <- lrn("regr.ranger", num.trees = 200, min.node.size = 50, num.threads = n_threads)
+  dml <- est_dml(sub2, y = "purchase", d = "A_stock", x = xs, z = "IV_stock", model = "pliv",
+                 learner_l = rf, learner_m = rf, learner_z = rf, folds = 2, seed = 1)
+  list(tsls_est = unname(coef(tsls)["A_stock"]), tsls_se = unname(tsls$std.error["A_stock"]),
+       dml_est = dml$estimate, dml_se = dml$std.error)
+})
+ape_cf <- cf_ape(f6$fit, f6$data, d = "A_stock")
+se_ape <- b4$c6$se["A_stock"] * abs(as.numeric(ape_cf) / unname(t4$c6$coef["A_stock"]))
+est_tab <- tibble(
+  Estimator = c("2SLS, linear probability (household clusters)", "DML partially linear IV, forests (2,000 households)",
+                "Control-function probit APE (column 6)", "Truth (DGP)"),
+  Estimate = c(est_cache$tsls_est, est_cache$dml_est, as.numeric(ape_cf), true_ape),
+  SE = c(est_cache$tsls_se, est_cache$dml_se, se_ape, NA)
+)
+est_tab
+```
+
+```{r estimators-table, echo = FALSE}
+est_tab %>% mutate(Estimate = fmt(Estimate, 5), SE = ifelse(is.na(SE), "---", fmt(SE, 5))) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Average effect of one unit of ad stock on the daily purchase probability, three estimators against the DGP. The control-function standard error scales the bootstrap standard error of the coefficient.") %>% tab_style()
+```
+
+```{r estimator-numbers, echo = FALSE}
+me_post <- tapply(dnorm(pan$index) * pan$beta_it, pan$post, mean)
+share_pre <- mean(pan$post == 0)
+```
+
+**The linear estimators do not estimate the average partial effect
+here.** Two-stage least squares lands at `r fmt(est_tab$Estimate[1], 5)`,
+the marginal effect of a household before conversion
+(`r fmt(me_post["0"], 5)` on average), not the DGP's `r fmt(true_ape, 5)`.
+With one coefficient on the ad stock and linear controls, 2SLS averages
+the state-specific effects with weights that put almost all mass on the
+`r fmt(100 * share_pre, 0)` percent of household-days before conversion, where
+the purchase probability and with it the effect are tiny, and the linear
+controls cannot follow a probability that jumps by a factor of a hundred at
+conversion. DML-IV on 2,000 households replaces the linear controls with
+forests but is too imprecise here to separate the two. The probit
+control function averages $\Phi'(\cdot)\,\beta_{it}$ over the observed
+states and matches the DGP. The lesson for a rare-outcome panel with state
+dependence: the estimand of a linear IV is a variance-weighted average that
+need not be the average partial effect, and the nonlinear second stage is
+not a cosmetic choice.
+
+## Inference for the two-step estimator {#sec-inference}
+
+**Three standard errors for the same coefficients.** The model-based one
+treats the control-function stock as data; the authors' bootstrap keeps
+unique households; the cluster bootstrap keeps duplicates. Table
+\@ref(tab:se-compare) puts them side by side for the benchmark of Section
+\@ref(sec-benchmark) (authors' DGP) and for column 4 of Table
+\@ref(tab:table4) (show-level panel).
+
+```{r se-compare, echo = FALSE}
+se_terms <- c("A_stock", "CF_stock", "post", "promo1m")
+se_cmp <- bind_rows(
+  tibble(Panel = "Authors' DGP (full model)", Term = term_labels[se_terms], `Model-based` = bench_model_se[se_terms],
+         `Authors' bootstrap` = bb$unique$se[se_terms], `Cluster bootstrap` = bb$cluster$se[se_terms]),
+  tibble(Panel = "Show-level panel (column 4)", Term = term_labels[se_terms], `Model-based` = t4$c4$se[se_terms],
+         `Authors' bootstrap` = NA_real_, `Cluster bootstrap` = b4$c4$se[se_terms])
+)
+se_cmp %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.x), "---", fmt(.x, 4)))) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Model-based, unique-household bootstrap, and cluster bootstrap standard errors of the control-function probit.") %>%
+  collapse_rows(1, latex_hline = "major", valign = "top") %>% tab_style()
+```
+
+The model-based standard error of the ad-stock coefficient is
+`r fmt(se_cmp[["Model-based"]][1] / se_cmp[["Cluster bootstrap"]][1], 2)` of the cluster
+bootstrap's on the authors' DGP and
+`r fmt(se_cmp[["Model-based"]][5] / se_cmp[["Cluster bootstrap"]][5], 2)` on the show-level
+panel; the generated regressor is the reason. The authors' bootstrap is
+`r fmt(mean(se_cmp[["Authors' bootstrap"]][1:4] / se_cmp[["Cluster bootstrap"]][1:4]), 2)` of the
+cluster bootstrap on average, the 0.76 of a 63 percent subsample.
+
+# What the replication teaches about the workflow {#sec-lessons}
+
+- **The instrument is a design, not a variable.** It is built from the
+  assignment process (the network's density) and the observed viewing
+  window, and it is testable in three ways that a fitted propensity score
+  is not. The mean-zero and orthogonality checks of Table 2 are the
+  evidence to show; corr with $u$ cannot be shown and is what the checks
+  stand in for.
+- **A show level is required to build it.** The authors' scripts
+  simulate the household-day outcome of the design with an oracle
+  expectation. Anyone applying the method needs second-by-second viewing
+  and all brands' airing times, not exposures alone.
+- **Control functions need stocks when regressors do.** The confounder
+  persists at its own rate, so the control gets its own decay, chosen out
+  of sample. `cf_residuals()` gives the residual; two lines accumulate it.
+- **Bootstrap the whole pipeline, by cluster, with duplicates.** The
+  model-based standard errors are too small for the generated regressor,
+  and a bootstrap that keeps unique households is a subsample. The
+  relabelling of duplicated households is what makes a stock accumulate
+  correctly inside a cluster bootstrap.
+- **The diagnostics are specific.** Strategic viewership shows in the
+  instrument's mean; nonrandom ordering shows in the KS test; a direct
+  effect shows in neither and needs a sensitivity bound.
+- **Random coefficients are the expensive part.** Columns 5 and 6 with
+  household random effects are the only fits in this note that take
+  longer than a minute; the Laplace approximation of `glmer()` reproduces
+  the structure of the paper's simulated maximum likelihood at a fraction
+  of the cost, and the bootstrap of column 6 is the compute budget of the
+  whole note.
+
+# References
+
+- Borusyak, K. and Hull, P. (2023). Nonrandom exposure to exogenous shocks. *Econometrica*, 91(6), 2155-2185.
+- Conley, T. G., Hansen, C. B., and Rossi, P. E. (2012). Plausibly exogenous. *Review of Economics and Statistics*, 94(1), 260-272.
+- Hsieh, T.-Y., Du, R. Y., and Lu, S. (2026). Leveraging large-scale granular single-source data for TV advertising: an identification strategy. *Marketing Science*, articles in advance.
+- Petrin, A. and Train, K. (2010). A control function approach to endogeneity in consumer choice models. *Journal of Marketing Research*, 47(1), 3-13.
+- Sethuraman, R., Tellis, G. J., and Briesch, R. A. (2011). How well does advertising work? Generalizations from a meta-analysis of brand advertising elasticity. *Journal of Marketing Research*, 48(3), 457-471.
+- Wooldridge, J. M. (2015). Control function methods in applied econometrics. *Journal of Human Resources*, 50(2), 420-445.

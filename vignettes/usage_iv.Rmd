@@ -1,0 +1,373 @@
+---
+title: "Using causalmetrics for instrumental variables: 2SLS, control functions, orthogonal scores, weak instruments, compliers, and marginal treatment effects"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using causalmetrics for instrumental variables: 2SLS, control functions, orthogonal scores, weak instruments, compliers, and marginal treatment effects}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4,
+                      message = FALSE, warning = FALSE)
+library(causalmetrics)
+library(estimatr)
+library(fixest)
+library(mlr3)
+library(mlr3learners)
+lgr::get_logger("mlr3")$set_threshold("warn")
+set.seed(1)
+run_mlogit <- requireNamespace("mlogit", quietly = TRUE) && requireNamespace("dfidx", quietly = TRUE)
+run_ranger <- requireNamespace("ranger", quietly = TRUE)
+```
+
+## What the package adds to iv_robust and feols
+
+Two-stage least squares (2SLS), its first stage and reduced form, robust and
+clustered standard errors, and fixed effects are the job of
+`estimatr::iv_robust()` and `fixest::feols()`. `causalmetrics` adds what
+those do not give in one place:
+
+| Task | Function |
+|---|---|
+| Effective first-stage F (Montiel Olea-Pflueger) next to the usual ones | `iv_first_stage()` |
+| Weak-instrument-robust confidence sets (Anderson-Rubin) | `iv_ar_confidence_set()`, `plot_ar_set()` |
+| Plausibly exogenous instruments (Conley-Hansen-Rossi) | `iv_plausibly_exogenous()` |
+| Control functions: first-stage or generalized residuals, two-step bootstrap, average partial effects | `cf_residuals()`, `cf_bootstrap()`, `cf_ape()` |
+| Partially linear IV with machine-learned controls; the LATE with doubly robust scores | `est_dml(model = "pliv")`, `est_dml(model = "iivm")` |
+| Complier shares and characteristics (Abadie's kappa) | `complier_profile()` |
+| Complier CATE and policies for compliers | `late_scores()`, `late_blp()` |
+| What 2SLS with several instruments estimates | `iv_late_weights()` |
+| Leave-out leniency instruments | `leniency_instrument()` |
+| Marginal treatment effects and policy-relevant averages | `mte_curve()`, `plot_mte()` |
+| Shift-share diagnostics: Rotemberg weights, shock-level regression | `ssiv_rotemberg()`, `ssiv_shock_level()` |
+| Bounds on the ATE with a binary instrument | `iv_ate_bounds()` |
+| Sensitivity to unobserved confounding when there is no instrument | `dml_sensitivity()`, `plot_dml_sensitivity()` |
+| Simulated designs with known truth | `sim_iv()` |
+
+All examples use simulated data.
+
+## The standard toolkit, once
+
+The `"linear"` design has a treatment `d` driven by an instrument `z`, an
+unobserved confounder, and nonlinear functions of five covariates; the true
+effect is 1. The instrument is excluded only conditional on `x1^2` and
+`sin(2 x2)`, so these sections include those terms as controls; the DML
+section below shows what happens when the functional form is not known.
+
+```{r tsls}
+dat <- sim_iv(2000, dgp = "linear", seed = 1)
+x <- paste0("x", 1:5)
+# the instrument is excluded conditional on x1^2 and sin(2 x2); include them
+dat$x1sq <- dat$x1^2
+dat$s2x2 <- sin(2 * dat$x2)
+xc <- c("x1sq", "s2x2", "x3", "x4", "x5")
+ols <- lm_robust(y ~ d + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+first <- lm_robust(d ~ z + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+rf <- lm_robust(y ~ z + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+tsls <- iv_robust(y ~ d + x1sq + s2x2 + x3 + x4 + x5 | z + x1sq + s2x2 + x3 + x4 + x5, data = dat)
+c(ols = coef(ols)[["d"]], first_stage = coef(first)[["z"]], reduced_form = coef(rf)[["z"]],
+  wald = coef(rf)[["z"]] / coef(first)[["z"]], tsls = coef(tsls)[["d"]])
+```
+
+With `fixest`, the same regression and its first-stage statistics:
+
+```{r fixest}
+fe <- feols(y ~ x1sq + s2x2 + x3 + x4 + x5 | d ~ z, data = dat, vcov = "hetero")
+coef(fe)["fit_d"]
+fitstat(fe, type = c("ivf", "ivwald"))
+```
+
+`iv_first_stage()` adds the effective F, which is the statistic to compare
+with weak-instrument thresholds when errors are heteroskedastic or
+clustered:
+
+```{r first-stage}
+iv_first_stage(dat, d = "d", z = "z", x = xc)
+```
+
+## Weak instruments
+
+The `"weak"` design sets the first-stage coefficient so that the
+concentration parameter is small. The Wald interval is then unreliable; the
+Anderson-Rubin set is not.
+
+```{r weak}
+weak <- sim_iv(500, dgp = "weak", concentration = 2, seed = 2)
+ar <- iv_ar_confidence_set(weak, "y", "d", "z", x = paste0("x", 1:3))
+ar
+plot_ar_set(ar)
+```
+
+The set can be unbounded or the whole line, which is the honest answer when
+the data cannot rule out a zero first stage. With a strong instrument it is
+close to the Wald interval:
+
+```{r ar-strong}
+iv_ar_confidence_set(dat, "y", "d", "z", x = xc)$intervals
+```
+
+If the exclusion restriction is only approximately true, the union of
+intervals over a range of direct effects of the instrument shows how much
+that costs:
+
+```{r plausexog}
+iv_plausibly_exogenous(dat, "y", "d", "z", x = xc, gamma_grid = seq(-0.2, 0.2, by = 0.1))
+```
+
+## Control functions
+
+Adding the first-stage residual to the second stage reproduces 2SLS in the
+linear model. The coefficient on the residual is the endogeneity parameter
+and its t test is the Wu-Hausman test.
+
+```{r cf-linear}
+cf <- cf_residuals(dat, d = "d", z = "z", x = xc)
+cf_ols <- lm_robust(y ~ d + x1sq + s2x2 + x3 + x4 + x5 + v_hat, data = cf)
+c(control_function = coef(cf_ols)[["d"]], tsls = coef(tsls)[["d"]])
+tidy(cf_ols)[tidy(cf_ols)$term == "v_hat", c("estimate", "std.error", "p.value")]
+```
+
+The point of the control function is the nonlinear second stage. In the
+`"probit_cf"` design the outcome is binary and the endogenous regressor is
+continuous. Plugging the fitted first stage into a probit (the "forbidden
+regression") is wrong; the control function is right, and the object to
+report is the average partial effect computed from the average structural
+function. Standard errors come from bootstrapping both stages.
+
+```{r cf-probit}
+dp <- sim_iv(2000, dgp = "probit_cf", rho = 0.6, seed = 3)
+first_stage <- function(df) cf_residuals(df, d = "d", z = "z", x = "x1")
+second_stage <- function(df) glm(y ~ d + x1 + v_hat, data = df, family = binomial("probit"))
+aug <- first_stage(dp)
+fit_cf <- second_stage(aug)
+naive <- glm(y ~ d + x1, data = dp, family = binomial("probit"))
+c(truth = attr(dp, "ape"), control_function = as.numeric(cf_ape(fit_cf, aug, d = "d")),
+  naive_probit = as.numeric(cf_ape(naive, dp, d = "d")))
+cf_bootstrap(dp, first_stage, second_stage, n_boot = 199, seed = 1,
+             ape = function(fit, df) cf_ape(fit, df, d = "d"))
+```
+
+For a binary endogenous regressor the linear residual is not the right
+control; `family = "probit"` returns the generalized residual of a probit
+first stage instead:
+
+```{r cf-binary}
+dp$d_binary <- as.integer(dp$d > 0)
+head(cf_residuals(dp, d = "d_binary", z = "z", x = "x1", family = "probit")$v_hat)
+```
+
+### Price endogeneity in a discrete-choice demand model (Petrin and Train)
+
+Petrin and Train (2010) apply the control function to multinomial logit
+demand: regress price on cost shifters, put the residual in the utility.
+We simulate `T` markets with `J` products, an unobserved product-market
+quality shock that raises both price and demand, and a cost shifter `w`
+that moves price only. The true price coefficient is `-1`.
+
+```{r pt-data, eval = run_mlogit}
+library(mlogit)
+library(dfidx)
+n_markets <- 150; J <- 3; n_per_market <- 40
+mk <- expand.grid(market = seq_len(n_markets), alt = seq_len(J))
+mk$xi <- rnorm(nrow(mk), sd = 0.6)                      # unobserved quality shock
+mk$w <- rnorm(nrow(mk))                                  # cost shifter
+mk$price <- 2 + 0.6 * mk$w + 0.8 * mk$xi + rnorm(nrow(mk), sd = 0.3)
+mk$beta_j <- c(0, 0.3, -0.2)[mk$alt]
+# consumers
+cons <- expand.grid(market = seq_len(n_markets), id = seq_len(n_per_market))
+cons$cid <- seq_len(nrow(cons))
+long <- merge(cons, mk, by = "market")
+long <- long[order(long$cid, long$alt), ]
+long$util <- long$beta_j - 1 * long$price + long$xi + -log(-log(runif(nrow(long))))
+long$choice <- ave(long$util, long$cid, FUN = function(u) as.integer(u == max(u)))
+```
+
+The control function is estimated at the product-market level (the level
+at which price is set) and merged back to the consumer-alternative rows.
+
+```{r pt-cf, eval = run_mlogit}
+mk_cf <- cf_residuals(transform(mk, alt2 = as.integer(alt == 2), alt3 = as.integer(alt == 3)),
+                      d = "price", z = "w", x = c("alt2", "alt3"))
+long <- merge(long, mk_cf[, c("market", "alt", "v_hat")], by = c("market", "alt"))
+long <- long[order(long$cid, long$alt), ]
+dd <- dfidx(long, idx = c("cid", "alt"))
+naive_logit <- mlogit(choice ~ price | 1, data = dd)
+cf_logit <- mlogit(choice ~ price + v_hat | 1, data = dd)
+rbind(naive = coef(naive_logit)[c("price")], control_function = coef(cf_logit)[c("price")])
+coef(cf_logit)["v_hat"]
+```
+
+The naive logit attributes part of the demand shock to price and
+understates price sensitivity; the control function recovers the true
+coefficient of `-1`. Standard errors for the two-step estimator come from
+`cf_bootstrap()` with the market as the bootstrap cluster:
+
+```{r pt-boot, eval = run_mlogit}
+pt_first <- function(df) {
+  mk_b <- unique(df[, c("market", "alt", "price", "w")])
+  mk_b <- transform(mk_b, alt2 = as.integer(alt == 2), alt3 = as.integer(alt == 3))
+  mk_b <- cf_residuals(mk_b, d = "price", z = "w", x = c("alt2", "alt3"))
+  df$v_hat <- NULL
+  out <- merge(df, mk_b[, c("market", "alt", "v_hat")], by = c("market", "alt"))
+  out[order(out$cid, out$alt), ]
+}
+pt_second <- function(df) {
+  df$cid2 <- as.integer(factor(paste(df$cid, df$.boot_draw)))
+  coef(mlogit(choice ~ price + v_hat | 1, data = dfidx(df, idx = c("cid2", "alt"))))
+}
+# cluster bootstrap by market; consumers within a resampled market keep their rows
+boot_pt <- function(n_boot, seed) {
+  set.seed(seed)
+  markets <- unique(long$market)
+  draws <- replicate(n_boot, {
+    pick <- sample(markets, length(markets), replace = TRUE)
+    df <- do.call(rbind, lapply(seq_along(pick), function(k) {
+      d <- long[long$market == pick[k], ]; d$market <- k; d$.boot_draw <- k; d
+    }))
+    pt_second(pt_first(df))[c("price", "v_hat")]
+  })
+  apply(draws, 1, sd)
+}
+boot_pt(30, seed = 1)
+```
+
+## Orthogonal scores: machine-learned controls
+
+`est_dml(model = "pliv")` residualizes the outcome, the treatment, and the
+instrument on the covariates with cross-fitted learners and runs IV on the
+residuals. Suppose we did not know that `x1^2` and `sin(2 x2)` are the right
+controls and passed the raw covariates: linear learners leave bias that
+forests remove.
+
+```{r pliv, eval = run_ranger}
+rf <- lrn("regr.ranger", num.trees = 300, min.node.size = 20)
+pliv_lin <- est_dml(dat, "y", "d", x, z = "z", model = "pliv", seed = 1, weak_iv = TRUE)
+pliv_rf <- est_dml(dat, "y", "d", x, z = "z", model = "pliv",
+                   learner_l = rf, learner_m = rf, learner_z = rf, seed = 1, weak_iv = TRUE)
+pliv_rf
+rbind(tidy(pliv_lin), tidy(pliv_rf))
+```
+
+`weak_iv = TRUE` adds the Anderson-Rubin set computed from the cross-fitted
+score, which remains valid however weak the residualized instrument is.
+
+## The LATE with doubly robust scores
+
+With a binary instrument and a binary treatment, `model = "iivm"` estimates
+the local average treatment effect as the ratio of two AIPW-type scores. The
+`"late"` design has always-takers, never-takers, and compliers whose effect
+is `2 + x1`.
+
+```{r iivm}
+dl <- sim_iv(3000, dgp = "late", seed = 4)
+late <- est_dml(dl, "y", "d", c("x1", "x2"), z = "z", model = "iivm", seed = 1)
+late
+c(true_late = attr(dl, "late"), true_ate = attr(dl, "ate"))
+```
+
+Who are the compliers? `complier_profile()` reports the compliance-group
+shares and covariate means with Abadie's kappa weights:
+
+```{r compliers}
+complier_profile(dl, d = "d", z = "z", covariates = c("x1", "x2"), x = "x1", n_boot = 99, seed = 1)
+```
+
+The two score components are pseudo-outcomes, so the heterogeneity tools
+apply to compliers. `late_blp()` projects both on a dictionary and forms
+the ratio, the complier CATE:
+
+```{r late-blp}
+ls <- late_scores(late)
+late_blp(ls, ~ x1, newdata = data.frame(x1 = c(-1, 0, 1)))[, c("x1", "estimate", "std.error", "conf.low", "conf.high")]
+```
+
+## Several instruments
+
+Two-stage least squares with several instruments is a weighted average of
+the instrument-specific Wald estimates. The weights can be negative:
+
+```{r late-weights}
+dat$z2 <- dat$z + rnorm(nrow(dat))
+dat$z3 <- rnorm(nrow(dat))
+iv_late_weights(dat, "y", "d", c("z", "z2", "z3"), x = xc)
+```
+
+## Judge leniency
+
+Examiner designs use the leave-out mean decision of the assigned examiner
+as the instrument:
+
+```{r judge}
+dj <- sim_iv(6000, dgp = "judge", n_judges = 40, seed = 5)
+dj <- leniency_instrument(dj, examiner = "judge", d = "d", x = "x1")
+iv_first_stage(dj, d = "d", z = "leniency", x = "x1", cluster = "judge")
+coef(iv_robust(y ~ d + x1 | leniency + x1, data = dj, clusters = judge))[["d"]]
+```
+
+## Marginal treatment effects
+
+With a continuous instrument, `mte_curve()` estimates the propensity score,
+fits the outcome as a function of the propensity, and differentiates. The
+weights turn the curve into the ATE, ATT, ATU, a LATE for a shift in the
+propensity, and a policy-relevant effect.
+
+```{r mte}
+dm <- sim_iv(4000, dgp = "mte", seed = 6)
+m <- mte_curve(dm, "y", "d", "z", x = "x1", degree = 3, late_range = c(0.3, 0.7),
+               policy = function(p) pmin(p + 0.1, 0.99), n_boot = 49, seed = 1)
+m
+c(true_ate = attr(dm, "ate"), true_att = attr(dm, "att"))
+plot_mte(m)
+plot_mte(m, "weights")
+```
+
+## Shift-share instruments
+
+For a Bartik instrument, `ssiv_rotemberg()` reports which shocks carry the
+estimate and `ssiv_shock_level()` the equivalent shock-level regression with
+shock-level standard errors:
+
+```{r ssiv}
+ds <- sim_iv(600, dgp = "shift_share", n_industries = 15, seed = 7)
+shares <- paste0("s", 1:15)
+ssiv_rotemberg(ds, "y", "d", shares = shares, shocks = attr(ds, "shocks"), x = "x1")
+ssiv_shock_level(ds, "y", "d", shares = shares, shocks = attr(ds, "shocks"), x = "x1")
+```
+
+## Bounds and sensitivity
+
+Without the LATE assumptions, the instrument still bounds the ATE of a
+binary outcome:
+
+```{r bounds}
+dl$y_binary <- as.integer(dl$y > 1)
+iv_ate_bounds(dl, "y_binary", "d", "z", n_boot = 99, seed = 1)
+```
+
+And without any instrument, `dml_sensitivity()` bounds the omitted-confounder
+bias of a partially linear DML estimate in terms of partial R-squareds:
+
+```{r sensitivity}
+fit_plr <- est_dml(dat, "y", "d", xc, seed = 1)
+s <- dml_sensitivity(fit_plr, r2_y = 0.05, r2_d = 0.03)
+s
+plot_dml_sensitivity(s, benchmarks = data.frame(r2_d = 0.03, r2_y = 0.05, label = "benchmark"))
+```
+
+## References
+
+- Abadie, A. (2003). Semiparametric instrumental variable estimation of treatment response models. *Journal of Econometrics*, 113(2).
+- Andrews, I., Stock, J. H., and Sun, L. (2019). Weak instruments in instrumental variables regression. *Annual Review of Economics*, 11.
+- Borusyak, K., Hull, P., and Jaravel, X. (2022). Quasi-experimental shift-share research designs. *Review of Economic Studies*, 89(1).
+- Chernozhukov, V., Hansen, C., Kallus, N., Spindler, M., and Syrgkanis, V. (2026). *Applied Causal Inference Powered by ML and AI*, chapters 12-13.
+- Conley, T. G., Hansen, C. B., and Rossi, P. E. (2012). Plausibly exogenous. *Review of Economics and Statistics*, 94(1).
+- Goldsmith-Pinkham, P., Sorkin, I., and Swift, H. (2020). Bartik instruments: what, when, why, and how. *American Economic Review*, 110(8).
+- Heckman, J. J. and Vytlacil, E. (2005). Structural equations, treatment effects, and econometric policy evaluation. *Econometrica*, 73(3).
+- Mogstad, M., Torgovitsky, A., and Walters, C. R. (2021). The causal interpretation of two-stage least squares with multiple instrumental variables. *American Economic Review*, 111(11).
+- Montiel Olea, J. L. and Pflueger, C. (2013). A robust test for weak instruments. *Journal of Business & Economic Statistics*, 31(3).
+- Petrin, A. and Train, K. (2010). A control function approach to endogeneity in consumer choice models. *Journal of Marketing Research*, 47(1).
+- Wooldridge, J. M. (2015). Control function methods in applied econometrics. *Journal of Human Resources*, 50(2).

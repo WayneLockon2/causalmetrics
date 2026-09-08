@@ -1,0 +1,72 @@
+# Extracted from test-hte-policy.R:270
+
+# prequel ----------------------------------------------------------------------
+skip_if_not_installed("mlr3")
+skip_if_not_installed("mlr3learners")
+x5 <- paste0("x", 1:5)
+
+# test -------------------------------------------------------------------------
+dat <- sim_hte(3000, dgp = "policy", seed = 8)
+sc <- dr_scores(dat, "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true")
+sc$x <- x5
+oracle <- as.numeric(dat$tau_true > 0)
+pv <- policy_value(sc, list(oracle = oracle, all = rep(1, 3000), none = rep(0, 3000)))
+expect_equal(pv$estimate[1], mean(oracle * sc$score))
+expect_equal(pv$estimate[3], 0)
+expect_equal(pv$diff_vs_first[2], pv$estimate[2] - pv$estimate[1])
+pv_boot <- policy_value(sc, list(oracle = oracle, none = rep(0, 3000)), n_boot = 200, seed = 1)
+B <- attr(pv_boot, "boot")
+expect_equal(dim(B), c(200, 2))
+expect_equal(pv_boot$boot.low[1], unname(quantile(B[, 1], 0.025)))
+expect_lt(abs(pv_boot$boot.se[1] - pv_boot$std.error[1]) / pv_boot$std.error[1], 0.35)
+expect_equal(unname(pv_boot$boot.se[2]), 0)
+expect_equal(dim(attr(pv_boot, "boot_diff")), c(200, 2))
+w <- 1 / seq_len(3000)^0.5
+pv_w <- policy_value(sc, list(oracle = oracle, none = rep(0, 3000)), weights = w, n_boot = 50, seed = 1)
+c_i <- oracle * sc$score
+expect_equal(pv_w$estimate[1], sum(w * c_i) / sum(w))
+expect_equal(pv_w$std.error[1], sqrt(sum(w^2 * (c_i - pv_w$estimate[1])^2)) / sum(w))
+expect_equal(pv_w$diff_vs_first[2], -pv_w$estimate[1])
+expect_equal(dim(attr(pv_w, "boot")), c(50, 2))
+expect_error(policy_value(sc, oracle, weights = -w), "weights")
+pv_all <- policy_value(sc, oracle, baseline = "all")
+expect_equal(pv_all$estimate, mean((oracle - 1) * sc$score))
+expect_equal(policy_value(sc, oracle, cost = 0.5)$estimate, mean(oracle * (sc$score - 0.5)))
+pol <- policy_learn(sc, method = "tree", depth = 2, seed = 1)
+expect_s3_class(pol, "cm_policy")
+expect_equal(pol$rule$var, "x1")
+expect_lt(abs(pol$rule$threshold), 0.1)
+expect_gt(mean(pol$assign == oracle), 0.95)
+expect_equal(nrow(pol$value), 2)
+expect_equal(predict(pol, dat), pol$assign)
+expect_output(print(pol), "Treatment policy")
+expect_s3_class(plot_policy_tree(pol), "ggplot")
+expect_equal(tidy(pol), pol$value)
+p1 <- policy_learn(sc, x = "x1", depth = 1, holdout = 0)
+g <- sc$score
+brute <- max(sapply(sort(unique(dat$x1)), function(t) {
+    l <- dat$x1 <= t
+    max(sum(g[l]), 0) + max(sum(g[!l]), 0)
+  }), max(sum(g), 0))
+expect_equal(p1$rule$value, brute, tolerance = 1e-10)
+expect_equal(p1$value$value_vs_none, brute / 3000, tolerance = 1e-10)
+for (m in c("linear", "classifier")) {
+    p <- policy_learn(sc, method = m, seed = 1)
+    expect_true(all(p$assign %in% c(0, 1)))
+    expect_gt(p$value$value_vs_none[2], 0)
+  }
+expect_s3_class(policy_learn(sc, method = "linear", seed = 1)$model, "glm")
+expect_true(inherits(policy_learn(sc, method = "classifier", seed = 1)$model, "Learner"))
+expect_equal(pol$model$var, "x1")
+m_dr <- cate_learner(scores = sc, x_het = x5, method = "dr")
+pb <- policy_learn(sc, method = "budget", budget = 0.3, tau_hat = m_dr, seed = 1)
+expect_lt(abs(mean(pb$assign) - 0.3), 0.05)
+expect_error(policy_learn(sc, method = "budget"), "budget")
+expect_error(policy_learn(sc, depth = 3), "depth 1 or 2")
+wi <- c(rep(2, 400), rep(1, 800))
+sc_w <- dr_scores(dat[1:1200, ], "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true")
+sc_dup <- dr_scores(dat[c(1:1200, 1:400), ], "y", "d", p_hat = "p_true", mu0_hat = "mu0_true", mu1_hat = "mu1_true")
+tw <- policy_learn(sc_w, x = c("x1", "x2", "x3"), depth = 2, holdout = 0, weights = wi, max_root_splits = 1e6)
+td <- policy_learn(sc_dup, x = c("x1", "x2", "x3"), depth = 2, holdout = 0, max_root_splits = 1e6)
+expect_equal(tw$rule$threshold, td$rule$threshold)
+expect_equal(tw$rule$value * mean(wi), td$rule$value, tolerance = 1e-8)

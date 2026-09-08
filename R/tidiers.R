@@ -13,7 +13,8 @@
 #' `modelsummary`.
 #'
 #' @param x A `cm_aipw`, `cm_dml`, `cm_scores`, `cm_blp`, `cm_gate`, `cm_cate`,
-#'   `cm_cate_score`, or `cm_policy` object.
+#'   `cm_cate_score`, `cm_policy`, `cm_ar_set`, `cm_mte`, `cm_cf_boot`,
+#'   `cm_compliers`, or `cm_late_weights` object.
 #' @param conf.int Logical. Include confidence limits (default `TRUE`).
 #' @param conf.level Confidence level; defaults to the level stored in the
 #'   object and is recomputed from the standard error otherwise.
@@ -132,6 +133,15 @@ tidy.cm_scores <- function(x, conf.int = TRUE, conf.level = 0.95, ...) {
 
 #' @rdname cm_tidiers
 #' @export
+tidy.cm_scores_multi <- function(x, ...) {
+  a <- x$ate$arms
+  data.frame(term = paste0("arm ", a$arm), estimate = a$estimate, std.error = a$std.error,
+             statistic = a$estimate / a$std.error, p.value = 2 * stats::pnorm(-abs(a$estimate / a$std.error)),
+             stringsAsFactors = FALSE)
+}
+
+#' @rdname cm_tidiers
+#' @export
 tidy.cm_blp <- function(x, conf.int = TRUE, conf.level = x$conf_level, ...) {
   out <- x$coefficients[, c("term", "estimate", "std.error", "statistic", "p.value")]
   if (conf.int) {
@@ -140,6 +150,13 @@ tidy.cm_blp <- function(x, conf.int = TRUE, conf.level = x$conf_level, ...) {
     out$conf.high <- out$estimate + crit * out$std.error
   }
   out
+}
+
+#' @rdname cm_tidiers
+#' @export
+glance.cm_blp <- function(x, ...) {
+  data.frame(nobs = x$n, r.squared = x$r.squared, adj.r.squared = x$adj.r.squared,
+             df = x$df, crit_val = x$crit_val, vcov.type = "HC1", stringsAsFactors = FALSE)
 }
 
 #' @rdname cm_tidiers
@@ -176,4 +193,121 @@ glance.cm_scores <- function(x, ...) {
   data.frame(nobs = x$n, treated_share = mean(x$d), folds = length(unique(x$fold_id)),
              learner_p = x$learners$p, learner_mu0 = x$learners$mu0, learner_mu1 = x$learners$mu1,
              stringsAsFactors = FALSE)
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_dml_structured <- function(x, ...) {
+  out <- x$estimates[x$estimates$fold == "pooled", c("target", "estimate", "plugin", "std.error", "conf.low", "conf.high")]
+  names(out)[1] <- "term"
+  out$statistic <- out$estimate / out$std.error
+  out$p.value <- 2 * stats::pnorm(-abs(out$statistic))
+  rownames(out) <- NULL
+  out
+}
+
+# Instrumental variables ---------------------------------------------------------
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_ar_set <- function(x, ...) {
+  data.frame(term = "theta", estimate = x$estimate, std.error = x$std.error,
+             conf.low = x$intervals$lower[1], conf.high = x$intervals$upper[nrow(x$intervals)],
+             method = "Anderson-Rubin", type = x$type, stringsAsFactors = FALSE)
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_mte <- function(x, ...) {
+  out <- x$effects
+  names(out)[names(out) == "estimand"] <- "term"
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_cf_boot <- function(x, ...) x$table
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_compliers <- function(x, ...) {
+  out <- x$shares
+  names(out)[names(out) == "group"] <- "term"
+  names(out)[names(out) == "share"] <- "estimate"
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_late_weights <- function(x, ...) {
+  out <- x$table
+  names(out)[names(out) == "instrument"] <- "term"
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_mediation <- function(x, ...) x$effects
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_med_dml <- function(x, ...) x$effects
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_med_cde <- function(x, ...) x$effects
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_med_iv <- function(x, ...) x$effects
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_front_door <- function(x, ...) x$effects
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_gelbach <- function(x, ...) {
+  out <- x$contributions
+  names(out)[names(out) == "covariate"] <- "term"
+  names(out)[names(out) == "contribution"] <- "estimate"
+  out
+}
+
+#' @rdname cm_tidiers
+#' @export
+tidy.cm_med_sensitivity <- function(x, ...) {
+  out <- x$curve
+  names(out)[names(out) == "nie"] <- "estimate"
+  out$term <- "nie"
+  out
+}
+
+#' @export
+tidy.cm_synth <- function(x, ...) {
+  if (x$mode == "separate") {
+    z <- stats::qnorm(0.975)
+    return(data.frame(term = "average post-treatment effect", estimate = x$estimate, std.error = x$std.error,
+                      statistic = x$estimate / x$std.error, p.value = 2 * stats::pnorm(-abs(x$estimate / x$std.error)),
+                      conf.low = x$estimate - z * x$std.error, conf.high = x$estimate + z * x$std.error,
+                      stringsAsFactors = FALSE))
+  }
+  e <- x$effects[x$effects$post, ]
+  data.frame(term = c(as.character(e$time), "average post-treatment effect"),
+             estimate = c(e$gap, x$estimate), std.error = NA_real_, statistic = NA_real_, p.value = NA_real_,
+             stringsAsFactors = FALSE)
+}
+
+#' @export
+glance.cm_synth <- function(x, ...) {
+  s <- x$settings
+  if (x$mode == "separate") {
+    return(data.frame(n_treated = x$N1, estimator = if (s$demean) "demeaned synthetic control" else "synthetic control",
+                      augment = s$augment, mode = "separate", stringsAsFactors = FALSE))
+  }
+  data.frame(nobs = length(x$unit_names) * length(x$time_values), n_donors = x$N0, n_treated = x$N1,
+             t_pre = x$T0, t_post = x$T1, pre_rmspe = x$pre_rmspe, post_rmspe = x$post_rmspe,
+             l2 = unname(x$concentration[["l2"]]), effective_donors = unname(x$concentration[["effective_donors"]]),
+             estimator = if (s$demean) "demeaned synthetic control" else "synthetic control",
+             v = if (is.numeric(s$v)) "user" else s$v, augment = s$augment, stringsAsFactors = FALSE)
 }

@@ -44,6 +44,7 @@ Then:
 | Validation: heterogeneity test, calibration, TOC and QINI curves, AUTOC | `cate_validate()` |
 | Value of a treatment rule; learning rules (trees, linear, classifiers, budgets) | `policy_value()`, `policy_learn()` |
 | Targeting impact versus deprivation for a planner with curvature | `policy_frontier()` |
+| Multi-arm scores, off-policy evaluation, and trees over arms | `dr_scores()` with several arms, `contrast_scores()`, `policy_value()`, `policy_learn()` |
 | Simulated designs with a known CATE | `sim_hte()` |
 
 Learners come from `mlr3`, causal forests from `grf`, exact policy trees of
@@ -243,7 +244,41 @@ mean(predict(pol_pt, pol_dat) == predict(pol, pol_dat))
 
 Other classes: linear rules (`method = "linear"`), any weighted `mlr3`
 classifier (`method = "classifier"`), and the budgeted rule that treats the
-top share of a CATE model (`method = "budget"`, with `tau_hat`).
+top share of a CATE model (`method = "budget"`, with `tau_hat`). The fitted
+object behind a rule is in `$model`, so the usual inspection tools apply:
+for a gradient-boosting classifier, the variable importance of the policy.
+
+```{r classifier-model, eval = requireNamespace("xgboost", quietly = TRUE)}
+xgb <- lrn("classif.xgboost", predict_type = "prob", nrounds = 100, max_depth = 3)
+pol_xgb <- policy_learn(sc_pol, method = "classifier", learner = xgb, seed = 1)
+pol_xgb$value
+head(xgboost::xgb.importance(model = pol_xgb$model$model), 5)
+```
+
+Unit weights enter both functions through `weights`: survey weights, or the
+time-decaying weights `h_t` that policy learning with adaptively collected
+data requires (Zhan, Ren, Athey, and Zhou 2024). The objective becomes
+`sum(w_i Gamma_i pi_i) / sum(w_i)` and the standard error is the adaptively
+weighted one, `sqrt(sum(w_i^2 (c_i - value)^2)) / sum(w_i)`.
+
+```{r policy-weights}
+h <- 1 / seq_len(nrow(pol_dat))^0.5
+pol_w <- policy_learn(sc_pol, method = "tree", depth = 2, weights = h, seed = 1)
+pol_w$value
+policy_value(sc_pol, list(weighted = pol_w, unweighted = pol), weights = h)
+```
+
+Bootstrap percentile intervals for policy values, the construction used in
+much of the targeting literature, are one argument away. The resampled
+estimates are kept in the `"boot"` attribute so any other level can be read
+off, for instance a 75 percent interval next to the 95 percent one.
+
+```{r policy-boot}
+pv <- policy_value(sc_pol, list(tree = pol, treat_all = rep(1, nrow(pol_dat))),
+                   n_boot = 500, seed = 1)
+pv[, c("policy", "estimate", "std.error", "conf.low", "conf.high", "boot.low", "boot.high")]
+apply(attr(pv, "boot"), 2, quantile, probs = c(0.125, 0.875))
+```
 
 ## Step 8: targeting impact versus deprivation
 
@@ -257,6 +292,62 @@ fr <- policy_frontier(sc_test, ens, y0_hat = sc_test$nuisance$mu0, budget = 0.3,
                       utility = "cara", curvature = c(0, 0.5, 2, 10))
 fr
 plot_policy_frontier(fr, curvature = 2)
+```
+
+## Step 9: more than two arms
+
+Many experiments compare several treatments. With a treatment column that
+has more than two values, `dr_scores()` returns the multi-arm score matrix
+`Gamma[i, k] = mu_k(x_i) + 1{W_i = k}(Y_i - mu_k(x_i)) / e_k(x_i)`, one
+column per arm: its column means are the expected outcomes under each arm,
+and `Gamma[i, pi(x_i)]` averaged over units is the expected outcome under
+any arm-valued policy `pi`. That is the object of multi-action policy
+learning (Athey and Wager 2021; the `policytree` package) and of off-policy
+evaluation: with `type = "ipw"` the score is `1{W_i = k} Y_i / e_k(x_i)`
+and `policy_value()` returns the inverse-propensity-score reward.
+
+```{r multi-arm}
+set.seed(3)
+n <- 3000
+arm <- sample(c("7", "14", "30"), n, replace = TRUE, prob = c(0.15, 0.15, 0.7))
+skill <- sample(c("beginner", "mixed", "expert"), n, replace = TRUE, prob = c(0.6, 0.25, 0.15))
+x1 <- rnorm(n)
+mu <- cbind(`7` = 0.14 + 0.04 * (skill == "beginner"), `14` = 0.14 + 0.04 * (skill == "mixed"),
+            `30` = 0.14 + 0.04 * (skill == "expert")) + 0.02 * x1
+y <- rbinom(n, 1, mu[cbind(seq_len(n), match(arm, colnames(mu)))])
+trial <- data.frame(y, arm, x1, beginner = as.integer(skill == "beginner"), mixed = as.integer(skill == "mixed"))
+# a randomized design: the propensities are the assignment shares
+e <- matrix(rep(c(0.15, 0.15, 0.7), each = n), n, dimnames = list(NULL, c("7", "14", "30")))
+sc3 <- dr_scores(trial, "y", "arm", c("x1", "beginner", "mixed"), arms = c("7", "14", "30"),
+                 p_hat = e, seed = 1)
+sc3
+```
+
+A policy is a vector of arm labels. `policy_value()` prices it against a
+uniform policy that gives one arm to everyone:
+
+```{r multi-arm-value}
+rule <- ifelse(trial$beginner == 1, "7", ifelse(trial$mixed == 1, "14", "30"))
+policy_value(sc3, list(by_skill = rule, all_7 = rep("7", n)), baseline = "30")
+```
+
+`policy_learn()` searches trees whose leaves are arms, exactly for depth
+one and two and through `policytree` for any depth, and reports the
+held-out expected outcome and gain:
+
+```{r multi-arm-tree}
+pol3 <- policy_learn(sc3, x = c("x1", "beginner", "mixed"), depth = 2, baseline = "30", seed = 1)
+pol3
+```
+
+Every binary tool applies to one pair of arms through `contrast_scores()`,
+which builds the binary score object of a pair from the stored nuisances
+(rows of the two arms, pairwise propensity `e_t / (e_t + e_c)`):
+
+```{r multi-arm-contrast}
+sc_7_30 <- contrast_scores(sc3, treat = "7", control = "30")
+# the pair object keeps only the rows of the two arms, so build groups from its data
+cate_gate(sc_7_30, ifelse(sc_7_30$data$beginner == 1, "beginner", "other"), n_boot = 199)
 ```
 
 ## External nuisances
@@ -280,4 +371,5 @@ sc_py <- dr_scores(train_with_predictions, "y", "d", x,
 - Künzel, S. R., Sekhon, J. S., Bickel, P. J., and Yu, B. (2019). Metalearners for estimating heterogeneous treatment effects using machine learning. *PNAS*, 116(10).
 - Nie, X. and Wager, S. (2021). Quasi-oracle estimation of heterogeneous treatment effects. *Biometrika*, 108(2).
 - Semenova, V. and Chernozhukov, V. (2021). Debiased machine learning of conditional average treatment effects and other causal functions. *The Econometrics Journal*, 24(2).
+- Zhan, R., Ren, Z., Athey, S., and Zhou, Z. (2024). Policy learning with adaptively collected data. *Management Science*, 70(8).
 - Yadlowsky, S., Fleming, S., Shah, N., Brunskill, E., and Wager, S. (2021). Evaluating treatment prioritization rules via rank-weighted average treatment effects. arXiv:2111.07966.

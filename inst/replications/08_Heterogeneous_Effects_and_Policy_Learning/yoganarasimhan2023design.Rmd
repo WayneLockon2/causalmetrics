@@ -1,0 +1,1128 @@
+---
+title: "Replication: Design and Evaluation of Optimal Free Trials"
+subtitle: "Yoganarasimhan, Barzegary, and Pani (Management Science, 2023)"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/08_Heterogeneous_Treatment_Effects_and_Policy_Learning/yoganarasimhan2023design/"
+  n_users: 337724
+  sim_seed: 2023
+  n_trees: 500
+  n_lasso_reps: 5
+  n_boot_rounds: 10
+  n_threads: 8
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(mlr3)
+library(mlr3learners)
+library(glmnet)
+data_path <- params$data_path
+n_users <- params$n_users
+sim_seed <- params$sim_seed
+n_trees <- params$n_trees
+n_threads <- params$n_threads
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+fmt0 <- function(x) formatC(x, digits = 0, format = "f", big.mark = ",")
+pct <- function(x, digits = 2) paste0(fmt(100 * x, digits), "\\%")
+stars <- function(p) ifelse(p < 0.01, "***", ifelse(p < 0.05, "**", ifelse(p < 0.10, "*", "")))
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+arms <- c(7, 14, 30)
+arm_lab <- paste0(arms, " days")
+covs <- c("region", "os", "channel", "job", "skill", "segment")
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is how long a free trial should be, and whether the answer
+should differ across users.** A SaaS firm that sold a 30-day trial ran a
+field experiment on 337,724 new users, randomizing them to 7-, 14-, or
+30-day trials (15 / 15 / 70 percent), and followed subscriptions,
+subscription length, and revenue for two years. Six categorical variables
+describe each user before the trial: region, operating system, sign-up
+channel, job, skill, and business segment.
+
+**The average answer is surprising: the shortest trial wins.** Seven days
+raises subscriptions by about 5 percent over 30 days (Table 5 of the
+paper), and also retention and revenue (Tables 9 and 10). The authors
+spend Sections 4 and 6 on the mechanism, because the theory literature
+predicts the opposite: longer trials increase usage, but they increase
+dormancy at the end of the trial even more, and dormant users do not
+subscribe (Figures 2 and 3, Tables 6 and 7).
+
+**The personalized answer is built from an outcome model and evaluated
+with an unbiased reward.** A lasso of the outcome on covariate dummies,
+arm dummies, and their interactions predicts each user's outcome under
+each arm; the policy assigns the arm with the highest prediction (equation
+3). Any policy is then priced on a held-out test set with the
+inverse-propensity-score (IPS) reward
+$$
+\hat R_{\text{IPS}}(\pi) = \frac{1}{N} \sum_{i=1}^{N} \frac{\mathbb{1}\{W_i = \pi(X_i)\}\, Y_i}{\hat e_{\pi(X_i)}(W_i)},
+$$
+which is unbiased because the experiment fixes the propensities. The
+lasso policy gains 6.8 percent over 30-for-all and beats the best uniform
+policy, 7-for-all (Table 8).
+
+**The paper's second message is a warning.** Policies from linear
+regression and random forests look best on the training data and worst on
+the test data; CART and causal trees collapse to 7-for-all; causal forests
+find too little heterogeneity (Table 8, Figure 5). Predictive accuracy is
+not policy quality, and a uniform policy is a strong benchmark.
+
+## What the replication package contains
+
+**The public data carry no information: every column was replaced by
+independent random draws.** The authors' `dataRandomizer.py` overwrites
+each column except the user id with uniform random integers. The check
+below, on the shipped `cleanDataset.csv`, shows a subscription rate of one
+half in every arm, equal arm shares, and no relationship between any two
+variables. The paper's numbers cannot be reproduced from these files, and
+neither can its descriptives.
+
+```{r shipped-check}
+shipped <- read.csv(file.path(data_path, "cleanDataset.csv"))
+shipped_check <- tibble(
+  quantity = c("Users", "Subscription rate", "Share in 7-day arm", "Share in 30-day arm",
+               "R2 of subscription on arm and covariates", "Largest |correlation| among outcomes and arm"),
+  paper = c("337,724", "0.148", "0.151", "0.698", "small but positive", "positive"),
+  shipped = c(fmt0(nrow(shipped)), fmt(mean(shipped$subscribed)), fmt(mean(shipped$trial_length == 0)),
+              fmt(mean(shipped$trial_length == 2)),
+              fmt(summary(lm(subscribed ~ factor(trial_length) + factor(country) + factor(skill) + factor(job), data = shipped))$r.squared, 5),
+              fmt(max(abs(cor(shipped[, c("subscribed", "total_revenue", "total_month", "trial_length")])[upper.tri(diag(4))])), 4))
+)
+```
+
+```{r tab-shipped, echo = FALSE}
+kbl(shipped_check, booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Quantity", "Paper", "Shipped data"),
+    caption = "The shipped data after the authors' randomization: no moment of the paper survives.") %>%
+  tab_style()
+```
+
+**What the package does give, completely, is the procedure.** The Python
+and R scripts specify every table and figure, the IPS estimator, the
+argmax rule, the lasso specification with inverse-share weights and
+repeated cross-validation, and the causal-forest setup with the propensity
+fixed at the arm share. Two of the paper's arguments do not depend on the
+firm's data at all: the IPS reward is unbiased under randomization, and a
+policy from an overfitted outcome model looks best on training data and
+worst on test data. Those are the arguments this note reproduces.
+
+**Strategy.** Section \@ref(sec-population) builds a population that
+matches every moment the paper publishes (sample size, arm shares,
+covariate structure, subscription rates, the segment story of Section 6,
+the usage regressions of Table 6, and the long-run outcomes), with the
+true potential outcomes of every user known. The paper's procedure and our
+package are then run on identical inputs: the authors' estimators are
+matched numerically, each table is laid out as in the paper with the truth
+as an extra column, and the shipped data are run once more at the end to
+show what noise returns.
+
+# A population calibrated to the paper {#sec-population}
+
+## The simulator
+
+**Each user has a subscription probability under each of the three
+arms, and everything else is generated around it.** The baseline
+probability depends on region, operating system, channel, and job (and on
+a latent engagement that also drives usage). The arm effects follow the
+paper's Section 6: beginners and students respond best to 7 days,
+mixed-skill users and business professionals in the largest region to 14
+days, experienced users to 30 days. Usage variables are drawn by arm and
+skill so that Table 6's regressions reappear; subscription length and
+revenue follow the paper's decomposition (equations 5 and 6): months
+conditional on subscribing, times a monthly price that is lower for
+students.
+
+```{r simulator}
+simulate_free_trial <- function(n, seed, par = list()) {
+  set.seed(seed)
+  p <- modifyList(list(
+    base = -2.0,
+    d7 = c(beginner = 0.10, mixed = -0.05, experienced = -0.12, unknown = 0.05, intermediate = 0.02),
+    d14 = c(beginner = 0.00, mixed = 0.15, experienced = -0.08, unknown = 0.00, intermediate = 0.03),
+    business14 = 0.13, student7 = 0.17, lat_sub = 0.35, lat_use = 0.25
+  ), par)
+  arm <- sample(arms, n, TRUE, c(0.1511, 0.1511, 0.6978))
+  region <- sample(1:6, n, TRUE, c(55.02, 13.66, 9.12, 8.83, 8.0, 5.37))
+  os <- sample(1:8, n, TRUE, c(28.97, 21.4, 14.04, 13.98, 9, 6, 4, 2.61))
+  channel <- sample(1:42, n, TRUE, c(81.56, 8.14, 3.47, 0.81, rep(6.02 / 38, 38)))
+  job_lab <- c("student", "business", "hobbyist", "designer", "photographer", "educator", "developer",
+               "manager", "marketer", "artist", "engineer", "writer", "other", "unknown")
+  job <- sample(job_lab, n, TRUE, c(28.20, 21.90, 20.34, 8.46, 4, 3, 3, 2.5, 2, 1.5, 1.2, 1, 1, 1.9))
+  skill <- sample(c("beginner", "mixed", "experienced", "unknown", "intermediate"), n, TRUE,
+                  c(69.05, 12.75, 10.77, 7.38, 0.05))
+  segment <- sample(1:7, n, TRUE, c(35.41, 32.74, 18.40, 7.81, 3, 1.8, 0.84))
+  latent <- rnorm(n)
+  base_x <- p$base + 0.15 * (region == 1) - 0.1 * (region == 4) + 0.08 * (os %in% 1:2) +
+    0.25 * (job == "business") - 0.15 * (job == "student") + 0.1 * (job == "designer") - 0.1 * (channel == 2) +
+    0.2 * (skill == "mixed") + 0.15 * (skill == "experienced") + p$lat_sub * latent
+  delta7 <- p$d7[skill] + p$student7 * (job == "student" & skill == "experienced")
+  delta14 <- p$d14[skill] + p$business14 * (job == "business" & region == 1)
+  pr_mat <- cbind(plogis(base_x + delta7), plogis(base_x + delta14), plogis(base_x))
+  colnames(pr_mat) <- paste0("pr_", arms)
+  act_mean <- list(beginner = c(1.55, 1.95, 2.55), mixed = c(2.4, 3.9, 6.2), experienced = c(2.0, 2.9, 4.4),
+                   intermediate = c(1.9, 2.7, 3.9), unknown = c(1.7, 2.3, 3.2))
+  am <- t(sapply(skill, function(s) act_mean[[s]])) * exp(p$lat_use * latent)
+  u_use <- runif(n); u_pois <- runif(n); e_log <- rnorm(n, 0, 2.3); u_beta <- rbeta(n, 2.2, 1.05)
+  usage <- lapply(seq_along(arms), function(k) {
+    len <- arms[k]
+    use <- as.integer(u_use < 0.828 + c(0, 0.004, 0.009)[k] + 0.03 * latent)
+    active <- pmin(use * (1 + qpois(u_pois, pmax(am[, k] - 1, 0.05))), len)
+    logu <- ifelse(use == 1, pmax(0, 4.35 + 0.24 * active + e_log), 0)
+    dorm <- ifelse(use == 1, round(len * u_beta * (1 - 0.15 * pmin(pmax(latent, -2), 2))), len)
+    list(use = use, active = active, logu = logu, dorm = pmin(pmax(dorm, 0), len))
+  })
+  k <- match(arm, arms)
+  pick <- function(field) { M <- sapply(usage, `[[`, field); M[cbind(seq_len(n), k)] }
+  sub_mat <- (runif(n) < pr_mat) * 1L
+  subscribed <- sub_mat[cbind(seq_len(n), k)]
+  months <- ifelse(subscribed == 1, pmin(round(rgamma(n, shape = 3.6, scale = 4.2) + 0.3 * (arm == 7)), 108), 0)
+  price <- exp(rnorm(n, log(33), 0.45)) * ifelse(job == "student", 0.65, 1) * ifelse(segment == 1, 1.15, 1)
+  revenue <- ifelse(subscribed == 1, round(months * price, 2), 0)
+  d <- data.frame(user_id = seq_len(n), arm, region, os, channel, job, skill, segment,
+                  use_software = pick("use"), active_days = pick("active"), log_usage = pick("logu"),
+                  dormancy = pick("dorm"), subscribed, months, revenue)
+  d <- cbind(d, pr_mat)
+  d$best_arm <- arms[max.col(pr_mat)]
+  d
+}
+pop <- simulate_free_trial(n_users, sim_seed)
+pop$training <- as.integer(runif(n_users) < 0.7)
+train <- pop[pop$training == 1, ]
+test <- pop[pop$training == 0, ]
+```
+
+## Targets and achieved moments
+
+**Table \@ref(tab:tab-targets) lists every published moment the
+simulator was tuned to and what the simulated population delivers.** The
+point of the table is honesty about what "calibrated" means: the arm
+shares, covariate shares, and usage regressions are matched by
+construction; the subscription rates, effects, segment shares, and
+long-run outcomes are matched by the choice of a dozen parameters and are
+close but not exact.
+
+```{r targets, echo = FALSE}
+sub_by_arm <- tapply(pop$subscribed, pop$arm, mean)
+true_share <- prop.table(table(factor(pop$best_arm, levels = arms)))
+usage_coef <- function(v) coef(lm(pop[[v]] ~ factor(pop$arm)))
+targets <- tibble(
+  Moment = c("Users", "Share 7 / 14 / 30 days", "Subscription rate", "7-day minus 30-day subscription rate",
+             "14-day minus 30-day subscription rate", "Share of users whose best arm is 7 / 14 / 30",
+             "Months subscribed, subscribers (mean, sd)", "Revenue, subscribers (mean, sd)", "Revenue, all users",
+             "Active days: intercept, 14-day, 30-day", "Dormancy: intercept, 14-day, 30-day"),
+  Paper = c("337,724", "15.1 / 15.1 / 69.8", "0.148", "0.006 to 0.008", "0.002 to 0.005",
+            "68.9 / 23.2 / 7.9 (lasso policy)", "16.02, 8.43", "568, 552", "79.1",
+            "1.75, 0.63, 1.71", "4.63, 5.14, 16.43"),
+  Simulated = c(fmt0(nrow(pop)),
+                paste(fmt(100 * prop.table(table(pop$arm)), 1), collapse = " / "),
+                fmt(mean(pop$subscribed)),
+                fmt(mean(pop$pr_7 - pop$pr_30), 4), fmt(mean(pop$pr_14 - pop$pr_30), 4),
+                paste(fmt(100 * as.numeric(true_share), 1), collapse = " / "),
+                paste0(fmt(mean(pop$months[pop$subscribed == 1]), 2), ", ", fmt(sd(pop$months[pop$subscribed == 1]), 2)),
+                paste0(fmt(mean(pop$revenue[pop$subscribed == 1]), 0), ", ", fmt(sd(pop$revenue[pop$subscribed == 1]), 0)),
+                fmt(mean(pop$revenue), 1),
+                paste(fmt(usage_coef("active_days"), 2), collapse = ", "),
+                paste(fmt(usage_coef("dormancy"), 2), collapse = ", "))
+)
+```
+
+```{r tab-targets, echo = FALSE}
+kbl(targets, booktabs = TRUE, linesep = "", escape = FALSE,
+    caption = "Published moments used to calibrate the simulated population, and the values the simulation delivers. The best-arm shares are the shares of users whose true subscription probability is highest under each arm; the paper reports the shares its lasso policy assigns.") %>%
+  tab_style() %>% column_spec(1, width = "6.2cm")
+```
+
+## The paper's descriptive tables
+
+**Tables 1 and 2 of the paper establish the design before any analysis:
+who got which arm and how the covariates are distributed.** Table 1 is
+read down the columns: shares of observations and of subscriptions by arm
+track each other, which is the first sign of small effects. Table 2 reports
+only the number of subcategories and the top four shares, because
+forty-two channels do not fit on a page.
+
+```{r tab-design, echo = FALSE}
+t1 <- pop %>% group_by(arm) %>% summarise(n = n(), subs = sum(subscribed), rate = mean(subscribed), .groups = "drop") %>%
+  mutate(pct_obs = n / sum(n), pct_subs = subs / sum(subs))
+t1_tab <- tibble(
+  Row = c("Number of observations (N)", "Percent of total observations", "Number of subscriptions",
+          "Percent of total subscriptions", "Subscription rate within group (in %)"),
+  `7-day trial` = c(fmt0(t1$n[1]), fmt(100 * t1$pct_obs[1], 2), fmt0(t1$subs[1]), fmt(100 * t1$pct_subs[1], 2), fmt(100 * t1$rate[1], 2)),
+  `14-day trial` = c(fmt0(t1$n[2]), fmt(100 * t1$pct_obs[2], 2), fmt0(t1$subs[2]), fmt(100 * t1$pct_subs[2], 2), fmt(100 * t1$rate[2], 2)),
+  `30-day trial` = c(fmt0(t1$n[3]), fmt(100 * t1$pct_obs[3], 2), fmt0(t1$subs[3]), fmt(100 * t1$pct_subs[3], 2), fmt(100 * t1$rate[3], 2)),
+  Total = c(fmt0(sum(t1$n)), "100", fmt0(sum(t1$subs)), "100", fmt(100 * mean(pop$subscribed), 2))
+)
+kbl(t1_tab, booktabs = TRUE, linesep = "", col.names = c("", names(t1_tab)[-1]),
+    caption = "Summary statistics of treatment assignment and subscription rates in the simulated population (the layout of the paper's Table 1).") %>%
+  tab_style()
+```
+
+```{r tab-covariates, echo = FALSE}
+t2 <- bind_rows(lapply(c(region = "region", os = "os", channel = "channel", job = "job", skill = "skill", segment = "segment"), function(v) {
+  sh <- sort(prop.table(table(pop[[v]])), decreasing = TRUE)
+  tibble(n_cat = length(sh), first = sh[1], second = sh[2], third = sh[3], fourth = sh[4])
+}), .id = "variable") %>%
+  mutate(variable = c(region = "Geographic region", os = "Operating system", channel = "Signup channel",
+                      job = "Job", skill = "Skill", segment = "Business segment")[variable])
+t2 %>% mutate(across(first:fourth, ~ pct(.x))) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Variable", "Number of subcategories", "First", "Second", "Third", "Fourth"),
+      caption = "Summary statistics for the pretreatment categorical variables (the layout of the paper's Table 2): number of subcategories and shares of the four largest.") %>%
+  add_header_above(c(" " = 2, "Share of top subcategories" = 4)) %>% tab_style()
+```
+
+**Table 3 of the paper reports the outcomes for all users and for
+subscribers separately, because the long-run outcomes are zero for the 85
+percent who never subscribe.** The subscriber rows are the ones that
+carry the retention and revenue information.
+
+```{r tab-outcomes, echo = FALSE}
+desc <- function(x) c(mean = mean(x), sd = sd(x), min = min(x), q25 = unname(quantile(x, .25)), q50 = median(x), q75 = unname(quantile(x, .75)), max = max(x), n = length(x))
+t3 <- rbind(
+  "Subscription" = desc(pop$subscribed),
+  "Subscription length (all)" = desc(pop$months),
+  "Subscription length (subscribers)" = desc(pop$months[pop$subscribed == 1]),
+  "Revenue (all)" = desc(pop$revenue),
+  "Revenue (subscribers)" = desc(pop$revenue[pop$subscribed == 1])
+)
+t3 <- as.data.frame(t3); t3$Variable <- rownames(t3); rownames(t3) <- NULL
+t3 %>% select(Variable, everything()) %>%
+  mutate(across(c(mean, sd, min, q25, q50, q75, max), ~ fmt(.x, 2)), n = fmt0(n)) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Variable", "Mean", "Standard deviation", "Minimum", "25%", "50%", "75%", "Maximum", "Number of observations"),
+      caption = "Summary statistics of subscription, subscription length, and revenue outcomes (the layout of the paper's Table 3).") %>%
+  tab_style(c("scale_down"))
+```
+
+# Average effects and mechanism {#sec-effects}
+
+## Average treatment effects
+
+**Table 5 of the paper is a difference in means with a t-statistic and a
+percentage gain over the 30-day baseline, reported for training and test
+data separately.** In a randomized experiment nothing more is needed
+(their footnote 5: regression-adjusted estimates are indistinguishable).
+The split into training and test data appears already here because every
+later policy comparison is made on the test data, and the reader must
+know the test-set baseline.
+
+```{r ate-table}
+ate_panel <- function(d, var, digits = 4, mult = 1) {
+  ctrl <- d[[var]][d$arm == 30] * mult
+  bind_rows(lapply(arms, function(a) {
+    y <- d[[var]][d$arm == a] * mult
+    tt <- if (a == 30) NULL else t.test(y, ctrl)
+    tibble(Treatment = paste0(a, " days"), rate = mean(y),
+           diff = if (a == 30) NA else mean(y) - mean(ctrl),
+           t = if (a == 30) NA else unname(tt$statistic),
+           gain = if (a == 30) NA else 100 * (mean(y) - mean(ctrl)) / mean(ctrl))
+  }))
+}
+t5 <- bind_rows(Training = ate_panel(train, "subscribed"), Test = ate_panel(test, "subscribed"), .id = "Data")
+```
+
+```{r tab-ate, echo = FALSE}
+show_ate <- function(tab, caption, digits = 4, col1 = "Subscription rate", col2 = "Subscription rate difference") {
+  tab %>% mutate(rate = fmt(rate, digits), diff = ifelse(is.na(diff), "---", fmt(diff, digits)),
+                 t = ifelse(is.na(t), "---", fmt(t, 2)), gain = ifelse(is.na(gain), "---", fmt(gain, 2))) %>%
+    kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+        col.names = c("Data", "Treatment", col1, col2, "t statistics", "Percentage gain over baseline"),
+        caption = caption) %>%
+    tab_style() %>% collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+}
+show_ate(t5, "Average effect of the 7- and 14-day treatments on subscription compared with the control condition of the 30-day free trial (the layout of the paper's Table 5).")
+```
+
+**The doubly robust score with the known propensity gives the same
+answer with a covariate adjustment.** The experiment fixes
+`e_k = P(W = k)`, so `dr_scores()` with the arm shares as propensities
+returns a score matrix whose column means are the expected outcomes under
+each arm; their differences are the ATEs of Table
+\@ref(tab:tab-ate) with a regression adjustment for the covariates, which
+changes the estimates by less than a standard error, as the paper's
+footnote 5 reports for its regression-adjusted version.
+
+```{r ate-dr, cache = TRUE, cache.extra = list(sim_seed, n_users)}
+design_e <- function(d) matrix(rep(prop.table(table(factor(d$arm, levels = arms))), each = nrow(d)), nrow(d),
+                               dimnames = list(NULL, arms))
+add_dummies <- function(d) {
+  mm <- model.matrix(~ factor(region) + factor(os) + factor(channel) + factor(job) + factor(skill) + factor(segment), d)[, -1]
+  colnames(mm) <- paste0("z", seq_len(ncol(mm)))
+  cbind(d, mm)
+}
+train_d <- add_dummies(train)
+test_d <- add_dummies(test)
+zcols <- grep("^z", names(train_d), value = TRUE)
+sc_train <- dr_scores(train_d, "subscribed", "arm", zcols, arms = arms, p_hat = design_e(train_d),
+                      learner_mu = lrn("regr.lm"), folds = 2, seed = 1)
+sc_test <- dr_scores(test_d, "subscribed", "arm", zcols, arms = arms, p_hat = design_e(test_d),
+                     learner_mu = lrn("regr.lm"), folds = 2, seed = 2)
+sc_test$ate$contrasts
+```
+
+## Randomization check
+
+**The paper regresses the arm on all covariate dummies and tests them
+jointly, rather than showing a table of means, because six categorical
+variables with up to 42 levels do not fit in a balance table.** The F
+test below does the same on the simulated population for the 7-day and
+the 14-day indicators; the arms were assigned at random, so the covariates
+predict neither at the 5 percent level.
+
+```{r randomization-check}
+pop_d <- add_dummies(pop)
+sapply(c(`7-day arm` = 7, `14-day arm` = 14), function(a) {
+  f <- summary(lm(I(pop_d$arm == a) ~ as.matrix(pop_d[, zcols])))$fstatistic
+  c(F = unname(f[1]), p = unname(pf(f[1], f[2], f[3], lower.tail = FALSE)))
+})
+```
+
+## Heterogeneity by region, skill, and job
+
+**Figure 4 of the paper shows subscription rates by arm within
+categories to motivate personalization before any model is fitted.** Bars
+by arm inside each category, with stars where the 7- or 14-day rate
+differs from the 30-day rate, let the reader see that beginners respond
+to 7 days and mixed-skill users to 14 days. The reader also sees the
+category shares under the bars, because a segment that responds
+differently only matters if it is large.
+
+```{r fig-heterogeneity, echo = FALSE, fig.height = 5.5, fig.cap = "Heterogeneity in users' response to the three trial lengths within region, skill, and job (the layout of the paper's Figure 4). Bars are subscription rates by arm; stars mark 7- or 14-day rates that differ from the 30-day rate in the same category (* p < 0.10, ** p < 0.05, *** p < 0.01); the share of users in each category is printed under its label."}
+het_frame <- function(d, var, top = 8) {
+  cats <- names(sort(table(d[[var]]), decreasing = TRUE))[seq_len(min(top, length(unique(d[[var]]))))]
+  bind_rows(lapply(cats, function(cat) {
+    sub <- d[d[[var]] == cat, ]
+    ctrl <- sub$subscribed[sub$arm == 30]
+    bind_rows(lapply(arms, function(a) {
+      y <- sub$subscribed[sub$arm == a]
+      p <- if (a == 30 || length(y) < 30) NA else t.test(y, ctrl)$p.value
+      tibble(category = paste0(cat, "\n(", fmt(100 * nrow(sub) / nrow(d), 1), "%)"), arm = a, rate = mean(y), p = p)
+    }))
+  })) %>% mutate(star = ifelse(is.na(p), "", stars(p)), variable = var)
+}
+het <- bind_rows(het_frame(pop, "region"), het_frame(pop, "skill"), het_frame(pop, "job", top = 8)) %>%
+  mutate(variable = factor(variable, levels = c("region", "skill", "job"),
+                           labels = c("Geographic region", "Skill", "Job")),
+         arm = factor(arm, levels = arms, labels = arm_lab))
+ggplot(het, aes(category, rate, fill = arm)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = star, y = rate + 0.004), position = position_dodge(width = 0.8), size = 2.8) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 1) +
+  scale_fill_manual(values = c("#4D4D4D", "#999999", "#D9D9D9"), name = NULL) +
+  labs(x = NULL, y = "Subscription rate") +
+  theme_minimal(base_size = 9) + theme(legend.position = "bottom", axis.text.x = element_text(size = 7))
+```
+
+## Mechanism: usage and dormancy
+
+**Table 6 of the paper regresses each usage variable on the arm to show
+that longer trials raise usage, but sublinearly, and raise dormancy
+sharply.** Because the arm is randomized these regressions are causal, so
+the table is the causal half of Figure 3; the second half, from usage to
+subscription, is only an association, which the paper marks by presenting
+Table 7 as suggestive (its footnote 8).
+
+```{r tab-usage, echo = FALSE}
+usage_vars <- c(use_software = "Indicator for software use", active_days = "Number of active days",
+                log_usage = "Log usage during trial", dormancy = "Dormancy length")
+t6 <- bind_rows(lapply(names(usage_vars), function(v) {
+  m <- lm(pop[[v]] ~ factor(pop$arm))
+  s <- summary(m)$coefficients
+  tibble(Outcome = usage_vars[[v]],
+         Intercept = paste0(fmt(s[1, 1], 3), " (", fmt(s[1, 2], 3), ")"),
+         `14-day trial` = paste0(fmt(s[2, 1], 3), " (", fmt(s[2, 2], 3), ")"),
+         `30-day trial` = paste0(fmt(s[3, 1], 3), " (", fmt(s[3, 2], 3), ")"),
+         R2 = fmt(summary(m)$r.squared, 3), N = fmt0(nrow(pop)))
+}))
+kbl(t6, booktabs = TRUE, linesep = "", col.names = c("Outcome variable", "Intercept", "14-day trial", "30-day trial", "R2", "N"),
+    caption = "Regression of usage features on trial length (the layout of the paper's Table 6). Standard errors in parentheses.") %>%
+  tab_style()
+```
+
+**Figure 2 of the paper plots the subscription rate against activity for
+each arm, and the pattern it wants the reader to see is that at the same
+activity level shorter trials convert better.** The left panel uses the
+number of active days; the right panel uses the last active day, so that
+dormancy, which is the trial length minus the last active day, is visible
+as distance from the right end of each curve.
+
+```{r fig-usage, echo = FALSE, fig.height = 3.4, fig.cap = "Relationship between usage and subscription rate for the three trial lengths (the layout of the paper's Figure 2). Left: by the number of active days. Right: by the last active day (trial length minus dormancy)."}
+u1 <- pop %>% filter(active_days <= 14) %>% group_by(arm, active_days) %>%
+  summarise(rate = mean(subscribed), n = n(), .groups = "drop") %>% filter(n >= 200) %>%
+  mutate(panel = "(a) Total active days", x = active_days)
+u2 <- pop %>% mutate(last_active = arm - dormancy) %>% group_by(arm, last_active) %>%
+  summarise(rate = mean(subscribed), n = n(), .groups = "drop") %>% filter(n >= 200) %>%
+  mutate(panel = "(b) Last active day", x = last_active)
+bind_rows(u1, u2) %>% mutate(arm = factor(arm, levels = arms, labels = arm_lab)) %>%
+  ggplot(aes(x, rate, colour = arm)) + geom_line() + geom_point(size = 1) +
+  facet_wrap(~ panel, scales = "free_x") +
+  scale_colour_manual(values = c("#B22222", "#E69F00", "#0072B2"), name = NULL) +
+  labs(x = NULL, y = "Subscription rate") + theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+```
+
+**Table 7 of the paper is a logit of subscription on the arm, the usage
+variables, and the covariates, and its purpose is to show that dormancy
+has a negative coefficient once usage is held fixed.** With usage held
+fixed the arm coefficients turn positive for the longer trials: the
+longer trial is not harmful in itself, its dormancy is.
+
+```{r tab-logit, echo = FALSE}
+lg <- glm(subscribed ~ factor(arm) + active_days + log_usage + dormancy + use_software +
+            factor(region) + factor(skill) + factor(job) + factor(os), data = pop, family = binomial())
+lg_s <- summary(lg)$coefficients
+rows <- c("factor(arm)14", "factor(arm)30", "active_days", "log_usage", "dormancy", "use_software")
+tibble(Variable = c("14-day trial", "30-day trial", "Number of active days", "Log usage during trial", "Dormancy length", "Indicator for software use"),
+       Coefficient = fmt(lg_s[rows, 1], 4), `Standard error` = fmt(lg_s[rows, 2], 4), z = fmt(lg_s[rows, 3], 2),
+       p = fmt(lg_s[rows, 4], 3)) %>%
+  kbl(booktabs = TRUE, linesep = "",
+      caption = "Logit of subscription on trial length and usage features, with region, skill, job, and operating system as controls (the layout of the paper's Table 7; the covariate rows are omitted as in the paper).") %>%
+  tab_style()
+```
+
+# Policy design {#sec-design}
+
+## The authors' lasso policy
+
+**The paper's policy is an outcome model, not a treatment-effect model:
+predict the subscription probability under each arm and assign the best
+arm (equation 3).** The model is a lasso of the outcome on arm dummies,
+covariate dummies, and all arm-by-covariate interactions, so that each
+arm can have its own coefficient on each category. Two details matter.
+Observations are weighted by the inverse of their arm share, because the
+30-day arm has five times more users and would otherwise dominate the
+interaction coefficients of the other two arms. The penalty is chosen by
+five-fold cross-validation and the whole procedure is repeated (50 times
+in the paper), because the selected penalty varies across folds; the paper
+reports the run with the median test-set value.
+
+```{r lasso-design}
+to_factors <- function(d) {
+  for (v in covs) d[[v]] <- factor(d[[v]], levels = sort(unique(pop[[v]])))
+  d$arm <- factor(d$arm, levels = arms)
+  d
+}
+lasso_formula <- ~ arm * (region + os + channel + job + skill + segment) - 1
+lasso_X <- function(d) Matrix::sparse.model.matrix(lasso_formula, to_factors(d))
+arm_share <- function(d) prop.table(table(factor(d$arm, levels = arms)))
+train$e <- as.numeric(arm_share(train)[as.character(train$arm)])
+test$e <- as.numeric(arm_share(test)[as.character(test$arm)])
+predict_arms <- function(pred_fun, d) {
+  out <- sapply(arms, function(a) { d$arm <- a; pred_fun(d) })
+  colnames(out) <- arms
+  out
+}
+argmax_policy <- function(pred) arms[max.col(pred, ties.method = "first")]
+fit_lasso_policy <- function(train, test, y = "subscribed", reps = 1, seed = 1) {
+  Xtr <- lasso_X(train)
+  lapply(seq_len(reps), function(r) {
+    set.seed(seed + r)
+    cv <- cv.glmnet(Xtr, train[[y]], weights = 1 / train$e, alpha = 1, nfolds = 5, type.measure = "mse")
+    fit <- glmnet(Xtr, train[[y]], weights = 1 / train$e, alpha = 1, lambda = cv$lambda.min)
+    pf <- function(d) as.numeric(predict(fit, lasso_X(d)))
+    list(lambda = cv$lambda.min, n_nonzero = sum(coef(fit) != 0),
+         pred_train = predict_arms(pf, train), pred_test = predict_arms(pf, test))
+  })
+}
+```
+
+```{r lasso-fit, cache = TRUE, cache.extra = list(sim_seed, n_users, params$n_lasso_reps)}
+lasso_runs <- fit_lasso_policy(train, test, reps = params$n_lasso_reps, seed = 100)
+```
+
+**Repeated cross-validation selects a slightly different penalty each
+time, and the paper reports the median run to avoid picking a lucky
+one.** The runs below differ in the penalty and in the number of nonzero
+coefficients; the test-set value of each run's policy is computed in
+Section \@ref(sec-evaluation) and the median run is carried forward.
+
+```{r lasso-runs, echo = FALSE}
+lasso_summary <- tibble(run = seq_along(lasso_runs),
+                        lambda = sapply(lasso_runs, `[[`, "lambda"),
+                        nonzero = sapply(lasso_runs, `[[`, "n_nonzero"),
+                        share_7_test = sapply(lasso_runs, function(r) mean(argmax_policy(r$pred_test) == 7)))
+kbl(lasso_summary, booktabs = TRUE, linesep = "", digits = c(0, 6, 0, 3),
+    col.names = c("Run", "Selected penalty", "Nonzero coefficients", "Share assigned 7 days (test)"),
+    caption = "Repeated cross-validated lasso fits of the authors' specification.") %>% tab_style()
+```
+
+## Alternative outcome models
+
+**The paper fits the same outcome model with four other learners, to
+show that the choice of learner is a choice of policy.** Linear regression
+is the lasso without the penalty. CART is a single regression tree pruned
+by cross-validation. The random forest and XGBoost use the authors' tuned
+settings (1,000 trees with a minimum leaf of 70; boosted trees of depth 6
+with the logistic objective). All four get the arm as a feature together
+with the covariate dummies and predict each user's outcome under each arm.
+
+```{r outcome-models, cache = TRUE, cache.extra = list(sim_seed, n_users, n_trees)}
+feat <- c("arm", zcols)
+mlr3_policy <- function(learner, train_d, test_d) {
+  d <- train_d[, c("subscribed", feat)]
+  task <- as_task_regr(d, target = "subscribed")
+  learner$train(task)
+  pf <- function(dd) learner$predict_newdata(dd[, feat])$response
+  list(pred_train = predict_arms(pf, train_d), pred_test = predict_arms(pf, test_d))
+}
+set.seed(1)
+fit_reg <- {
+  m <- lm(update(lasso_formula, subscribed ~ .), data = to_factors(train), weights = 1 / e)
+  pf <- function(d) as.numeric(predict(m, newdata = to_factors(d)))
+  list(pred_train = predict_arms(pf, train), pred_test = predict_arms(pf, test))
+}
+fit_cart <- {
+  d <- to_factors(train)[, c("subscribed", "arm", covs)]
+  tr <- rpart::rpart(subscribed ~ ., data = d, method = "anova", control = rpart::rpart.control(xval = 5, cp = 0, minbucket = 100))
+  tr <- rpart::prune(tr, cp = tr$cptable[which.min(tr$cptable[, "xerror"]), "CP"])
+  pf <- function(dd) as.numeric(predict(tr, newdata = to_factors(dd)[, c("arm", covs)]))
+  list(pred_train = predict_arms(pf, train), pred_test = predict_arms(pf, test), tree = tr)
+}
+fit_rf <- mlr3_policy(lrn("regr.ranger", num.trees = n_trees, min.node.size = 70, num.threads = n_threads, seed = 1), train_d, test_d)
+fit_xgb <- mlr3_policy(lrn("regr.xgboost", objective = "reg:logistic", eta = 0.4995, alpha = 0.7245, subsample = 0.8,
+                           colsample_bytree = 0.9, max_depth = 6, nrounds = 200, nthread = n_threads), train_d, test_d)
+```
+
+## Treatment-effect models
+
+**The paper also derives policies from pairwise treatment-effect
+estimates, because the marketing literature increasingly uses causal
+trees and forests for targeting.** For each pair of arms the training
+users of those two arms form a binary experiment with a known propensity
+(the ratio of the two shares), a causal forest estimates the pairwise
+effect, and the policy chooses the arm that wins its comparisons. The
+package builds the pairwise objects from the three-arm scores with
+`contrast_scores()`; the DR-learner and a pruned regression tree on the
+doubly robust score (the closest single-tree analogue of the paper's
+causal tree available without the archived `causalTree` package) are fitted
+on the same objects.
+
+```{r cate-models}
+pairs <- list(c(7, 30), c(14, 30))
+pair_scores <- lapply(pairs, function(p) contrast_scores(sc_train, treat = p[1], control = p[2]))
+pair_test <- lapply(pairs, function(p) contrast_scores(sc_test, treat = p[1], control = p[2]))
+rf_final <- lrn("regr.ranger", num.trees = n_trees, min.node.size = 200, num.threads = n_threads, seed = 1)
+dr_models <- lapply(pair_scores, function(s) cate_learner(scores = s, x_het = zcols, method = "dr", learner_final = rf_final))
+cf_models <- lapply(seq_along(pairs), function(j) {
+  s <- pair_scores[[j]]
+  grf::causal_forest(as.matrix(s$data[, zcols]), s$y, s$d, W.hat = s$nuisance$p, Y.hat = s$nuisance$l,
+                     num.trees = n_trees, honesty = TRUE, num.threads = n_threads, seed = 1)
+})
+ct_models <- lapply(pair_scores, function(s) {
+  d <- to_factors(s$data)[, covs]; d$score <- s$score
+  tr <- rpart::rpart(score ~ ., data = d, method = "anova", control = rpart::rpart.control(xval = 5, cp = 0, minbucket = 500))
+  rpart::prune(tr, cp = tr$cptable[which.min(tr$cptable[, "xerror"]), "CP"])
+})
+tau_pairs <- function(models, d, pred) cbind(`7` = pred(models[[1]], d), `14` = pred(models[[2]], d), `30` = 0)
+pred_dr <- function(m, d) as.numeric(predict(m, d))
+pred_cf <- function(m, d) as.numeric(predict(m, as.matrix(d[, zcols]))$predictions)
+pred_ct <- function(m, d) as.numeric(predict(m, newdata = to_factors(d)[, covs]))
+fit_dr <- list(pred_train = tau_pairs(dr_models, train_d, pred_dr), pred_test = tau_pairs(dr_models, test_d, pred_dr))
+fit_cf <- list(pred_train = tau_pairs(cf_models, train_d, pred_cf), pred_test = tau_pairs(cf_models, test_d, pred_cf))
+fit_ct <- list(pred_train = tau_pairs(ct_models, train, pred_ct), pred_test = tau_pairs(ct_models, test, pred_ct))
+```
+
+## What each method assigns
+
+**Table A8 of the paper reports the share of users each policy sends
+to each arm, and it is the fastest way to see that the methods disagree
+about who should get what.** CART and the single tree on the score
+prescribe 7 days for everyone (the paper's footnote to Table 8), while
+the forests spread users across the three arms the most; the lasso sends
+about two thirds of users to 7 days and a quarter to 14 days, close to the
+paper's 68.9 and 23.2 percent.
+
+```{r policies}
+lasso_pick <- 1L   # replaced by the median run in the next section
+fits <- list(reg = fit_reg, cart = fit_cart, r_forest = fit_rf, xgboost = fit_xgb, dr_learner = fit_dr, c_forest = fit_cf, c_tree = fit_ct)
+policies_from <- function(fits, lasso_run, which = "pred_test", n) {
+  c(list(`7` = rep(7, n), `14` = rep(14, n), `30` = rep(30, n), lasso = argmax_policy(lasso_run[[which]])),
+    lapply(fits, function(f) argmax_policy(f[[which]])))
+}
+```
+
+```{r tab-shares, echo = FALSE}
+share_tab <- function(pols) t(sapply(pols, function(p) 100 * prop.table(table(factor(p, levels = arms)))))
+pol_names <- c(`7` = "$\\pi_7$", `14` = "$\\pi_{14}$", `30` = "$\\pi_{30}$", lasso = "$\\pi_{lasso}$", reg = "$\\pi_{reg}$",
+               cart = "$\\pi_{cart}$", r_forest = "$\\pi_{r\\_forest}$", xgboost = "$\\pi_{xgboost}$",
+               dr_learner = "$\\pi_{dr\\_learner}$", c_forest = "$\\pi_{c\\_forest}$", c_tree = "$\\pi_{c\\_tree}$")
+sh_tr <- share_tab(policies_from(fits, lasso_runs[[lasso_pick]], "pred_train", nrow(train)))
+sh_te <- share_tab(policies_from(fits, lasso_runs[[lasso_pick]], "pred_test", nrow(test)))
+tibble(Policy = pol_names[rownames(sh_tr)], tr7 = sh_tr[, 1], tr14 = sh_tr[, 2], tr30 = sh_tr[, 3],
+       te7 = sh_te[, 1], te14 = sh_te[, 2], te30 = sh_te[, 3]) %>%
+  filter(!Policy %in% pol_names[1:3]) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, digits = 2,
+      col.names = c("Policy", "7 days", "14 days", "30 days", "7 days", "14 days", "30 days"),
+      caption = "Share of users (in percent) assigned to each trial length by each policy (the layout of the paper's Table A8). The lasso row uses the first cross-validation run here; the median run is selected in the next section.") %>%
+  add_header_above(c(" " = 1, "Training set" = 3, "Test set" = 3)) %>% tab_style()
+```
+
+**Figure 5 of the paper plots the distribution of the estimated 7-versus-30
+effect across test users for every method, because the amount of
+heterogeneity a method finds predicts how well its policy does.** The
+paper's reading is that CART, the causal tree, and the causal forest show
+almost no heterogeneity, so their policies cannot personalize, while the
+regression and random forest show the most and overfit. Here the true
+effect is known and drawn as the reference curve, so each method can be
+read as too flat or too spread relative to the truth; the table after the
+figure gives the spread of each curve and its correlation with the truth.
+Every learner except the lasso spreads its estimates two to five times
+more than the truth, the two trees show none, and the correlation with
+the truth ranks the methods broadly as the test-set values in Table
+\@ref(tab:tab-table8) do.
+
+```{r fig-cdf, echo = FALSE, fig.height = 3.8, fig.cap = "Cumulative distribution of the estimated effect of 7 versus 30 days across test users for each method (the layout of the paper's Figure 5), with the true effect for reference."}
+tau_test <- function(f) f$pred_test[, "7"] - f$pred_test[, "30"]
+cdf_df <- bind_rows(
+  tibble(method = "Truth", tau = test$pr_7 - test$pr_30),
+  tibble(method = "Lasso", tau = tau_test(lasso_runs[[lasso_pick]])),
+  tibble(method = "Linear regression", tau = tau_test(fit_reg)),
+  tibble(method = "CART", tau = tau_test(fit_cart)),
+  tibble(method = "Random forest", tau = tau_test(fit_rf)),
+  tibble(method = "XGBoost", tau = tau_test(fit_xgb)),
+  tibble(method = "DR-learner", tau = tau_test(fit_dr)),
+  tibble(method = "Causal forest", tau = tau_test(fit_cf)),
+  tibble(method = "Tree on DR score", tau = tau_test(fit_ct))
+) %>% mutate(method = factor(method, levels = unique(method)))
+ggplot(cdf_df, aes(tau, colour = method, linetype = method == "Truth")) + stat_ecdf(geom = "step") +
+  coord_cartesian(xlim = c(-0.08, 0.10)) + geom_vline(xintercept = 0, colour = "grey60", linetype = 3) +
+  scale_linetype_manual(values = c(`TRUE` = 1, `FALSE` = 5), guide = "none") +
+  labs(x = expression(hat(tau)[7*","*30]), y = "Cumulative share of test users", colour = NULL) +
+  theme_minimal(base_size = 10) + theme(legend.position = "right")
+```
+
+```{r tab-cdf, echo = FALSE}
+truth_tau <- test$pr_7 - test$pr_30
+cdf_df %>% group_by(method) %>%
+  summarise(sd = sd(tau), share_positive = mean(tau > 0), cor_truth = cor(tau, truth_tau), .groups = "drop") %>%
+  kbl(booktabs = TRUE, linesep = "", digits = 3,
+      col.names = c("Method", "Standard deviation", "Share positive", "Correlation with the truth"),
+      caption = "Spread of the estimated 7-versus-30 effect across test users by method, and its correlation with the true effect.") %>% tab_style()
+```
+
+# Policy evaluation {#sec-evaluation}
+
+## The IPS reward and the package's off-policy value
+
+**Every policy is priced with the same estimator on the same test set,
+because the paper's argument is that estimators must be compared on the
+value of the policies they produce, not on their fit.** The authors'
+function (their `CalculatePolicyProfit`) keeps the users whose assigned
+arm equals the arm the policy would give them, and weights each by the
+inverse of the share of that arm among the users the policy sends there.
+This is the IPS reward with the propensity estimated within each policy
+group (their footnote 10). The package computes the same quantity when
+the multi-arm score object is built with `type = "ipw"` and those
+propensities; with the design shares instead, the estimates differ in the
+fourth decimal.
+
+```{r ips}
+policy_profit <- function(d, policy, y = "subscribed") {
+  keep <- d$arm == policy
+  es <- table(factor(d$arm[keep], levels = arms)) / table(factor(policy, levels = arms))
+  sum(d[[y]][keep] / as.numeric(es[as.character(d$arm[keep])])) / nrow(d)
+}
+ipw_scores <- function(d, y = "subscribed", policy = NULL) {
+  p <- if (is.null(policy)) design_e(d) else {
+    keep <- d$arm == policy
+    es <- table(factor(d$arm[keep], levels = arms)) / table(factor(policy, levels = arms))
+    matrix(rep(as.numeric(es), each = nrow(d)), nrow(d), dimnames = list(NULL, arms))
+  }
+  dr_scores(d, y, "arm", arms = arms, p_hat = p, type = "ipw", folds = 2)
+}
+truth_value <- function(d, policy) mean(as.matrix(d[, paste0("pr_", arms)])[cbind(seq_len(nrow(d)), match(policy, arms))])
+pol_lasso_test <- argmax_policy(lasso_runs[[1]]$pred_test)
+c(paper_function = policy_profit(test, pol_lasso_test),
+  package_within_policy = policy_value(ipw_scores(test, policy = pol_lasso_test), pol_lasso_test)$estimate,
+  package_design_shares = policy_value(ipw_scores(test), pol_lasso_test)$estimate,
+  truth = truth_value(test, pol_lasso_test))
+```
+
+**The median lasso run is selected on the test-set IPS value, as in the
+paper.**
+
+```{r lasso-median}
+lasso_test_values <- sapply(lasso_runs, function(r) policy_profit(test, argmax_policy(r$pred_test)))
+lasso_pick <- order(lasso_test_values)[ceiling(length(lasso_test_values) / 2)]
+round(lasso_test_values, 5); lasso_pick
+```
+
+## Table 8: the value of each policy
+
+```{r table8}
+pols_train <- policies_from(fits, lasso_runs[[lasso_pick]], "pred_train", nrow(train))
+pols_test <- policies_from(fits, lasso_runs[[lasso_pick]], "pred_test", nrow(test))
+ips_train <- sapply(pols_train, function(p) policy_profit(train, p))
+ips_test <- sapply(pols_test, function(p) policy_profit(test, p))
+dr_val <- policy_value(sc_test, pols_test, baseline = "30")
+truth_val <- sapply(pols_test, function(p) truth_value(test, p))
+t8 <- tibble(policy = names(pols_test), ips_train = ips_train, ips_test = ips_test,
+             gain_train = 100 * (ips_train / ips_train[["30"]] - 1), gain_test = 100 * (ips_test / ips_test[["30"]] - 1),
+             dr_test = dr_val$estimate + dr_val$baseline_value, dr_gain = dr_val$gain_pct,
+             true_test = truth_val, true_gain = 100 * (truth_val / truth_val[["30"]] - 1))
+```
+
+**Table 8 of the paper has two blocks, training and test, and two
+numbers per block, the estimated subscription rate and its percentage gain
+over 30-for-all; the reader is meant to compare the two blocks row by
+row.** The lasso policy beats every uniform policy on the test set, with a
+test gain of `r fmt(t8$gain_test[["lasso"]], 2)` percent against the
+paper's 6.81. The forest-based policies (random forest, DR-learner, causal
+forest) and XGBoost show the largest training gains and the smallest test
+gains, which is the overfitting warning; the paper's random forest shows
+the same reversal. CART and the tree on the score collapse to 7-for-all,
+so their rows repeat the 7-for-all row. The two column pairs added here,
+the doubly robust value and the true value, are available only in a
+simulation and confirm that the IPS test-set numbers rank the policies
+correctly: the lasso is first on all three, and the largest gap between
+a test-set IPS estimate and the truth is
+`r fmt(100 * max(abs(t8$ips_test - t8$true_test)), 2)` percentage points.
+
+```{r tab-table8, echo = FALSE}
+t8_show <- t8 %>% mutate(policy = pol_names[policy],
+                         across(c(ips_train, ips_test, dr_test, true_test), ~ fmt(100 * .x, 2)),
+                         across(c(gain_train, gain_test, dr_gain, true_gain), ~ ifelse(abs(.x) < 1e-12, "---", fmt(.x, 2))))
+t8_show <- t8_show[c("lasso", "7", "14", "30", "reg", "cart", "r_forest", "xgboost", "dr_learner", "c_forest", "c_tree") %>% match(t8$policy), ]
+t8_show %>% mutate(category = c("Personalized based on lasso", rep("Uniform", 3), rep("Alternative personalized policies", 7))) %>%
+  select(category, policy, ips_train, ips_test, gain_train, gain_test, dr_test, dr_gain, true_test, true_gain) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Policy category", "Policy", "Training set", "Test set", "Training set", "Test set", "Estimate", "Increase", "Estimate", "Increase"),
+      caption = "Gains in subscription from implementing different counterfactual free-trial policies (the layout of the paper's Table 8). The first four numeric columns are the IPS estimates as in the paper; the doubly robust columns use the regression-adjusted scores; the true columns average each user's true subscription probability under the arm the policy assigns. Subscription rates and increases are in percent; increases are relative to the 30-day-for-all policy.") %>%
+  add_header_above(c(" " = 2, "Estimated subscription (%)" = 2, "Increase in subscription (%)" = 2, "Doubly robust, test set" = 2, "True value, test set" = 2)) %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "major") %>% tab_style(c("scale_down"))
+```
+
+**The training-versus-test reversal is the paper's central caution and
+it reappears here, in a stronger form.** The forests and XGBoost predict
+their own training rows in sample, so the argmax rule follows the noise in
+those rows and the training IPS value rewards it, because the same rows
+carry the realized outcomes. The training gains of these methods are far
+above anything a policy can deliver (the truth column caps the gain near
+8 percent), and their test gains are the smallest. The paper's random
+forest shows the same pattern at a smaller scale (18.67 percent in
+training, 1.32 in test). The lasso's penalty removes most interaction
+coefficients, so its training and test gains are close, and the true
+value confirms its test gain.
+
+```{r overfit, echo = FALSE}
+t8 %>% transmute(policy = pol_names[policy], gain_train, gain_test, gap = gain_train - gain_test, true_gain) %>%
+  filter(!policy %in% pol_names[c("7", "14", "30")]) %>% arrange(desc(gap)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, digits = 2,
+      col.names = c("Policy", "Training gain (\\%)", "Test gain (\\%)", "Training minus test", "True gain (\\%)"),
+      caption = "Overfitting of the policy: the difference between the training and test IPS gains, against the true gain.") %>% tab_style()
+```
+
+## Is the lasso policy better than 7-for-all?
+
+**The paper answers with a bootstrap over test users, because the lasso
+and the 7-for-all policies are evaluated on overlapping users and their
+difference needs a paired standard error.** The same paired difference is
+available analytically: the multi-arm `policy_value()` reports each
+policy's difference from the first policy in the list with the standard
+error of the per-user differences. The bootstrap reproduces the paper's t
+statistic (3.12 in the paper). The analytic standard errors are larger,
+for two reasons: the bootstrap re-estimates the within-policy
+propensities in every draw, which turns the IPS reward into a ratio
+estimator with a smaller variance than the per-user differences with
+fixed propensities, and ten bootstrap rounds estimate a standard error
+imprecisely. The true difference, known in the simulation, is positive
+and close to both point estimates.
+
+```{r boot-test}
+set.seed(7)
+boot_diff <- replicate(params$n_boot_rounds, {
+  i <- sample.int(nrow(test), replace = TRUE)
+  policy_profit(test[i, ], pols_test$lasso[i]) - policy_profit(test[i, ], pols_test[["7"]][i])
+})
+boot_t <- t.test(boot_diff)
+paired <- policy_value(ipw_scores(test), list(`7` = pols_test[["7"]], lasso = pols_test$lasso, `14` = pols_test[["14"]]))
+tibble(method = c(paste0("Bootstrap over test users (", params$n_boot_rounds, " rounds)"), "Paired per-user difference, IPS scores", "Paired per-user difference, doubly robust scores"),
+       difference = c(mean(boot_diff), paired$diff_vs_first[2], policy_value(sc_test, list(`7` = pols_test[["7"]], lasso = pols_test$lasso))$diff_vs_first[2]),
+       std_error = c(sd(boot_diff), paired$diff_se[2], policy_value(sc_test, list(`7` = pols_test[["7"]], lasso = pols_test$lasso))$diff_se[2])) %>%
+  mutate(t = difference / std_error) %>%
+  bind_rows(tibble(method = "True difference", difference = truth_val[["lasso"]] - truth_val[["7"]]))
+```
+
+# Long-run outcomes {#sec-longrun}
+
+## Average effects on subscription length and revenue
+
+**Tables 9 and 10 of the paper repeat the Table 5 layout for subscription
+length and revenue, because a policy that raises subscriptions could
+still lower revenue if the marginal subscribers are short-lived or cheap.**
+The paper decomposes each long-run outcome into the subscription decision
+and the outcome conditional on subscribing (equations 5 and 6), and finds
+the conditional part almost flat across arms; the gains in retention and
+revenue are therefore driven by conversions.
+
+```{r tab-table9, echo = FALSE}
+t9 <- bind_rows(Training = ate_panel(train, "months"), Test = ate_panel(test, "months"), .id = "Data")
+t10 <- bind_rows(Training = ate_panel(train, "revenue"), Test = ate_panel(test, "revenue"), .id = "Data")
+show_ate(t9, "Average effect of trial length on subscription length in months (the layout of the paper's Table 9).", digits = 3,
+         col1 = "Subscription length", col2 = "Difference")
+```
+
+```{r tab-table10, echo = FALSE}
+show_ate(t10, "Average effect of trial length on revenue in dollars (the layout of the paper's Table 10).", digits = 2,
+         col1 = "Revenue", col2 = "Difference")
+```
+
+```{r tab-conditional, echo = FALSE}
+cond <- pop %>% filter(subscribed == 1) %>% group_by(arm) %>% summarise(months = mean(months), revenue = mean(revenue), price = mean(revenue / months), .groups = "drop")
+kbl(cond, booktabs = TRUE, linesep = "", digits = 2, col.names = c("Arm", "Months, subscribers", "Revenue, subscribers", "Revenue per month"),
+    caption = "The conditional part of the decomposition in the paper's equations 5 and 6: subscription length and revenue among subscribers, by arm.") %>% tab_style()
+```
+
+## The subscription policy evaluated on long-run outcomes
+
+**Table 11 of the paper evaluates the same four policies on subscription
+length and revenue with the same IPS estimator, changing only the
+outcome, to show that the policy designed on subscriptions also raises
+the long-run outcomes.** The estimator does not need to be refitted: the
+policy is fixed and the reward function accepts any outcome. In the
+simulation the lasso policy and the 7-day uniform policy are within
+noise of each other on the long-run outcomes, because months and revenue
+are generated almost independently of the arm once a user subscribes and
+their variance is far larger than the difference between the two
+policies.
+
+```{r tab-table11, echo = FALSE}
+lr_pols_train <- pols_train[c("lasso", "7", "14", "30")]
+lr_pols_test <- pols_test[c("lasso", "7", "14", "30")]
+t11 <- bind_rows(lapply(c(months = "months", revenue = "revenue"), function(y) {
+  tr <- sapply(lr_pols_train, function(p) policy_profit(train, p, y))
+  te <- sapply(lr_pols_test, function(p) policy_profit(test, p, y))
+  tibble(policy = names(tr), est_train = tr, est_test = te,
+         inc_train = 100 * (tr / tr[["30"]] - 1), inc_test = 100 * (te / te[["30"]] - 1))
+}), .id = "outcome")
+t11 %>% pivot_wider(names_from = outcome, values_from = c(est_train, est_test, inc_train, inc_test)) %>%
+  mutate(category = c("Personalized", rep("Uniform", 3)), policy = pol_names[policy],
+         across(starts_with("inc"), ~ ifelse(abs(.x) < 1e-12, "---", fmt(.x, 2))),
+         across(starts_with("est"), ~ fmt(.x, 2))) %>%
+  select(category, policy, est_train_months, est_test_months, inc_train_months, inc_test_months,
+         est_train_revenue, est_test_revenue, inc_train_revenue, inc_test_revenue) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Category", "Policy", "Training", "Test", "Training", "Test", "Training", "Test", "Training", "Test"),
+      caption = "IPS estimates of the average subscription length and revenue under three uniform and one personalized policy (the layout of the paper's Table 11).") %>%
+  add_header_above(c(" " = 2, "Estimate (months)" = 2, "Increase (%)" = 2, "Estimate ($)" = 2, "Increase (%)" = 2)) %>%
+  add_header_above(c(" " = 2, "Subscription length" = 4, "Revenue" = 4)) %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "major") %>% tab_style(c("scale_down"))
+```
+
+## Policies optimized on long-run outcomes
+
+**Table 12 of the paper trains the same lasso on revenue and on
+subscription length and evaluates all three policies on all three
+outcomes, to answer whether a firm should wait two years to design its
+policy.** The paper's answer is no: the subscription policy does at least
+as well on every outcome, because the conditional outcomes hardly differ
+across arms, the long-run outcomes have far higher variance, and a binary
+outcome is easier to learn. The rows are the training outcome and the
+columns the evaluation outcome, so the diagonal is where each policy
+should shine if long-run training paid off. Here the three policies are
+within a few tenths of a percent of each other on every outcome; the
+revenue-trained policy is the worst on subscriptions and revenue, which is
+the paper's variance argument, and no policy gains from being trained on
+the outcome it is evaluated on.
+
+```{r lasso-longrun, cache = TRUE, cache.extra = list(sim_seed, n_users)}
+lasso_months <- fit_lasso_policy(train, test, y = "months", reps = 1, seed = 200)[[1]]
+lasso_revenue <- fit_lasso_policy(train, test, y = "revenue", reps = 1, seed = 300)[[1]]
+```
+
+```{r tab-table12, echo = FALSE}
+opt_pols <- list(Subscription = lasso_runs[[lasso_pick]], `Total revenue` = lasso_revenue, `Subscription length` = lasso_months)
+t12 <- bind_rows(lapply(c(`Training data` = "train", `Test data` = "test"), function(s) {
+  d <- if (s == "train") train else test
+  bind_rows(lapply(names(opt_pols), function(nm) {
+    p <- argmax_policy(opt_pols[[nm]][[paste0("pred_", s)]])
+    tibble(optimized_on = nm, subscription = 100 * policy_profit(d, p), revenue = policy_profit(d, p, "revenue"),
+           months = policy_profit(d, p, "months"))
+  }))
+}), .id = "data")
+t12 %>% mutate(subscription = fmt(subscription, 2), revenue = fmt(revenue, 2), months = fmt(months, 2)) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Data set", "Policy optimized on", "Subscription (%)", "Total revenue ($)", "Subscription length (months)"),
+      caption = "Expected mean of the three outcomes under policies optimizing each outcome (the layout of the paper's Table 12).") %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "major") %>% tab_style()
+```
+
+# The shipped data, once more {#sec-shipped}
+
+**Running the paper's own procedure on the shipped file shows what the
+randomized data return: a subscription rate of one half under every
+policy and gains within a fraction of a percent of zero.** The lasso is
+fitted on the shipped training rows with the authors' specification, and
+each policy is priced with the authors' IPS function. Because every column
+is independent noise, all policies have the same true value; the
+penalized fit keeps no interaction and the lasso policy collapses to a
+uniform policy.
+
+```{r shipped-run, cache = TRUE}
+sh <- shipped %>% transmute(user_id, arm = arms[trial_length + 1], region = country, os, channel = signup_app, job, skill, segment,
+                            subscribed, months = ifelse(is.na(total_month), 0, total_month), revenue = total_revenue, training)
+sh_train <- sh[sh$training == 1, ]; sh_test <- sh[sh$training == 0, ]
+sh_train$e <- as.numeric(arm_share(sh_train)[as.character(sh_train$arm)])
+sh_test$e <- as.numeric(arm_share(sh_test)[as.character(sh_test$arm)])
+sh_to_factors <- function(d) { for (v in covs) d[[v]] <- factor(d[[v]], levels = sort(unique(sh[[v]]))); d$arm <- factor(d$arm, levels = arms); d }
+sh_X <- function(d) Matrix::sparse.model.matrix(lasso_formula, sh_to_factors(d))
+set.seed(11)
+sh_cv <- cv.glmnet(sh_X(sh_train), sh_train$subscribed, weights = 1 / sh_train$e, alpha = 1, nfolds = 5)
+sh_fit <- glmnet(sh_X(sh_train), sh_train$subscribed, weights = 1 / sh_train$e, alpha = 1, lambda = sh_cv$lambda.min)
+sh_pf <- function(d) as.numeric(predict(sh_fit, sh_X(d)))
+sh_pols <- list(train = argmax_policy(predict_arms(sh_pf, sh_train)), test = argmax_policy(predict_arms(sh_pf, sh_test)))
+shipped_tab <- bind_rows(lapply(c(Training = "train", Test = "test"), function(s) {
+  d <- if (s == "train") sh_train else sh_test
+  pols <- list(lasso = sh_pols[[s]], `7` = rep(7, nrow(d)), `14` = rep(14, nrow(d)), `30` = rep(30, nrow(d)))
+  v <- sapply(pols, function(p) policy_profit(d, p))
+  tibble(policy = names(v), value = 100 * v, gain = 100 * (v / v[["30"]] - 1))
+}), .id = "data")
+```
+
+```{r tab-shipped-run, echo = FALSE}
+shipped_tab %>% pivot_wider(names_from = data, values_from = c(value, gain)) %>%
+  mutate(policy = pol_names[policy], across(starts_with("gain"), ~ ifelse(abs(.x) < 1e-12, "---", fmt(.x, 2))), across(starts_with("value"), ~ fmt(.x, 2))) %>%
+  select(policy, value_Training, value_Test, gain_Training, gain_Test) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Policy", "Training set", "Test set", "Training set", "Test set"),
+      caption = "The paper's Table 8 procedure applied to the shipped, randomized data: subscription rates and gains in percent.") %>%
+  add_header_above(c(" " = 1, "Estimated subscription (%)" = 2, "Increase in subscription (%)" = 2)) %>% tab_style()
+```
+
+# Package tools beyond the paper {#sec-tools}
+
+## Validating a CATE model before building a policy on it
+
+**The paper judges each effect estimator only through the value of its
+policy; the package can also test the estimator directly on the test-set
+scores.** `cate_validate()` takes a model of the 7-versus-30 effect and
+the test-set pair object and reports the calibration slope, the effect by
+quartile of the prediction, and the rank-weighted average effect (AUTOC)
+with a bootstrap standard error. A slope near one with a positive AUTOC
+says the model ranks users correctly, which is what a targeting policy
+needs from it. The DR-learner fails this test: its slope is near zero, the
+quartile with the highest predictions has no larger effect than the
+others, and the AUTOC is zero within its standard error. This is the
+same verdict Table \@ref(tab:tab-table8) reached through the policy
+value, obtained before any policy is built. The lasso's own implied
+effect, the difference between its two arm predictions, passes: the
+slope is not distinguishable from one, the group effects rise with the
+prediction (the predictions take few distinct values, so only three
+groups form), and the QINI area is positive at the 1 percent level; the
+AUTOC, which weights the top ranks most, is positive at the 10 percent
+level.
+
+```{r validate}
+val <- cate_validate(pair_test[[1]], tau_hat = dr_models[[1]], n_groups = 4, n_boot = 199, seed = 1)
+val
+rows_7_30 <- test$arm %in% c(7, 30)
+tau_lasso <- lasso_runs[[lasso_pick]]$pred_test[rows_7_30, "7"] - lasso_runs[[lasso_pick]]$pred_test[rows_7_30, "30"]
+val_lasso <- cate_validate(pair_test[[1]], tau_hat = tau_lasso, n_groups = 4, n_boot = 199, seed = 1)
+val_lasso
+```
+
+```{r fig-validate, echo = FALSE, fig.height = 3.2, fig.cap = "Targeting operator characteristic on the test set for 7 versus 30 days: the DR-learner (left) and the lasso's implied effect (right)."}
+gridExtra::grid.arrange(plot_cate_validation(val, what = "toc") + ggtitle("DR-learner"),
+                        plot_cate_validation(val_lasso, what = "toc") + ggtitle("Lasso"), ncol = 2)
+```
+
+## A depth-two policy tree on three arms
+
+**The paper's policies are argmax rules over black-box predictions; an
+interpretable alternative is a shallow tree whose leaves are arms, fitted
+directly on the doubly robust scores.** `policy_learn()` with
+`engine = "policytree"` runs the exact search of Zhou, Athey, and Wager
+(2023) on a 60,000-user subsample of the three-arm training scores, over
+the skill, job, and region dummies; the tree is then priced on the test
+set with `policy_value()` and against the truth. A tree with four leaves
+reaches the same true value as the lasso policy, because most of the
+simulated heterogeneity is carried by skill: the tree gives 7 days to
+users who are neither experienced nor of mixed skill, 14 days to
+mixed-skill users, and 30 days to experienced users, with one job-level
+exception in the experienced branch. It says in three lines who gets
+what.
+
+```{r policytree, cache = TRUE, cache.extra = list(sim_seed, n_users)}
+tree_x <- zcols[grep("skill|job|region", colnames(model.matrix(~ factor(region) + factor(os) + factor(channel) + factor(job) + factor(skill) + factor(segment), train))[-1])]
+set.seed(3)
+sub <- sample.int(nrow(train_d), 60000)
+sc_sub <- dr_scores(train_d[sub, ], "subscribed", "arm", zcols, arms = arms, p_hat = design_e(train_d[sub, ]),
+                    learner_mu = lrn("regr.lm"), folds = 2, seed = 1)
+pol_tree <- policy_learn(sc_sub, x = tree_x, method = "tree", depth = 2, engine = "policytree", holdout = 0, baseline = "30")
+pol_tree
+z_names <- setNames(colnames(model.matrix(~ factor(region) + factor(os) + factor(channel) + factor(job) + factor(skill) + factor(segment), train))[-1], zcols)
+split_vars <- unique(sapply(Filter(function(nd) !nd$is_leaf, pol_tree$rule$fit$nodes), `[[`, "split_variable"))
+z_names[tree_x[split_vars]]
+tree_test <- predict(pol_tree, test_d)
+policy_value(sc_test, list(tree = tree_test, lasso = pols_test$lasso), baseline = "30")[, c("policy", "estimate", "std.error", "gain_pct", "share_7", "share_14", "share_30")]
+c(truth_tree = truth_value(test, tree_test), truth_lasso = truth_value(test, pols_test$lasso))
+```
+
+# Lessons {#sec-lessons}
+
+**What was replicated.** The paper's procedure, from the descriptive
+tables through the policy design, the IPS evaluation, and the long-run
+projections, runs end to end on a population calibrated to the published
+moments, with the same table and figure layouts. The IPS reward the
+authors coded is matched exactly by the package's off-policy value once
+the within-policy propensities are supplied, and the paper's ranking of
+methods, its overfitting warning, and its finding that the subscription
+policy also wins on retention and revenue all reappear with the true
+values as a check.
+
+**What could not be replicated.** The published data are randomized,
+so no number of the paper can be recomputed from them. The causal tree
+was replaced by a pruned regression tree on the doubly robust score, and
+the random forest, boosting, and forest settings were reduced from the
+authors' tuned values to keep the note within a reasonable running time.
+
+**What the package adds.** The multi-arm score object makes the three
+arms one object, so that the IPS and doubly robust rewards, the pairwise
+contrasts, the CATE validation, and the policy tree share the same
+nuisances and the same test set. The doubly robust reward gives the same
+ranking as IPS, the paired standard error from `policy_value()` replaces
+the paper's bootstrap, `cate_validate()` rejects the DR-learner on the
+test scores before any policy is built on it, and a depth-two policy tree
+matches the lasso's true value with an interpretable rule.
+
+# References
+
+- Yoganarasimhan, H., Barzegary, E., and Pani, A. (2023). Design and
+  evaluation of optimal free trials. *Management Science*, 69(6), 3220–3240.
+- Zhou, Z., Athey, S., and Wager, S. (2023). Offline multi-action policy
+  learning: generalization and optimization. *Operations Research*, 71(1),
+  148–183.
+- Kennedy, E. H. (2023). Towards optimal doubly robust estimation of
+  heterogeneous causal effects. *Electronic Journal of Statistics*, 17(2),
+  3008–3049.
+- Athey, S. and Wager, S. (2021). Policy learning with observational
+  data. *Econometrica*, 89(1), 133–161.

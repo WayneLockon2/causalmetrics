@@ -1,0 +1,1319 @@
+---
+title: "Causal Inference in Economics and Marketing"
+subtitle: "Section 09: Synthetic Control"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.2, fig.align = "center", fig.pos = "H",
+  out.width = "95%", collapse = TRUE, comment = "#>"
+)
+# Code and output in footnotesize.
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+# This lecture lives in inst/lectures/09_sc/ of the package source. When
+# knitted from the source tree it loads the development version of the
+# package; when the package is installed it uses the installed helpers.
+helper_rel <- file.path("vignette_helpers", "09_sc", "sc_lecture_helpers.R")
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_path <- file.path(pkg_root, "inst", helper_rel)
+} else {
+  library(causalmetrics)
+  helper_path <- system.file(helper_rel, package = "causalmetrics")
+}
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+source(helper_path)
+helper_md5 <- tools::md5sum(helper_path)
+# Andersson (2019) data: git-ignored raw-data folder of the package source.
+data_path <- file.path(pkg_root, "data_raw", "09_Synthetic_Control", "andersson2019carbon")
+has_data <- file.exists(file.path(data_path, "carbontax_data.dta"))
+n_sims <- 200
+fmt <- function(x, digits = 2) formatC(x, digits = digits, format = "f")
+```
+
+# The problem {#sec-problem}
+
+## One treated unit, many donors, no parallel trends
+
+Section 07 compared groups of units before and after a policy. Its
+assumption was parallel trends: without the policy, the treated group would
+have moved like the comparison group. Many policies do not come in groups.
+A country adopts a carbon tax. A state passes a tobacco law. A region
+suffers a terrorist conflict. One treated unit, observed over many periods,
+and a pool of untreated units that may or may not resemble it.
+
+Sweden is the running example of this lecture (Andersson 2019). In 1990
+Sweden extended its value-added tax to transport fuel and in 1991 added a
+carbon tax. The question is the effect on per-capita CO2 emissions from
+transport. The data cover Sweden and 14 OECD countries from 1960 to 2005:
+30 pre-treatment years and 16 post-treatment years.
+
+```{r sweden-data, eval = has_data}
+carbon <- as.data.frame(haven::read_dta(file.path(data_path, "carbontax_data.dta")))
+carbon$treated <- as.integer(carbon$country == "Sweden" & carbon$year >= 1990)
+donor_avg <- carbon %>% filter(country != "Sweden") %>% group_by(year) %>%
+  summarise(y = mean(CO2_transport_capita), .groups = "drop") %>% mutate(series = "OECD donor average")
+sweden <- carbon %>% filter(country == "Sweden") %>%
+  transmute(year, y = CO2_transport_capita, series = "Sweden")
+```
+
+```{r fig-sweden-raw, eval = has_data, fig.height = 3.6, fig.cap = "Per-capita CO2 emissions from transport, Sweden and the average of 14 OECD donor countries. The series diverge well before 1990."}
+ggplot(bind_rows(sweden, donor_avg), aes(x = year, y = y, colour = series, linetype = series)) +
+  geom_line() + geom_vline(xintercept = 1989.5, linetype = "dotted") +
+  scale_colour_manual(values = c("Sweden" = "black", "OECD donor average" = "grey45")) +
+  labs(x = NULL, y = "Metric tons per capita", colour = NULL, linetype = NULL) + sc_theme()
+```
+
+DiD would compare Sweden with the donor average. Figure
+\@ref(fig:fig-sweden-raw) shows why that fails. Sweden's emissions rise
+faster than the average through the 1960s and fall below it in the 1980s.
+Nothing in the pre-treatment data supports parallel trends. With one
+treated unit there is also no group of treated units to average over, and
+no cluster to compute a standard error from.
+
+Synthetic control (Abadie and Gardeazabal 2003; Abadie, Diamond, and
+Hainmueller 2010) replaces the donor average by a weighted average.
+The weights are nonnegative, sum to one, and are chosen so that the
+weighted donors reproduce Sweden's pre-treatment path. The same weights
+then give the counterfactual after 1990. Two things change relative to
+DiD.
+
+- The comparison unit is chosen by the data. Parallel trends is no longer
+  assumed; it is built in the pre-treatment period and checked by eye.
+- The model behind it allows unobserved common shocks with unit-specific
+  loadings, not only additive unit and time effects. A donor mix that
+  matches Sweden's pre-treatment path also matches its exposure to those
+  shocks, if the fit is good enough.
+
+```{r sweden-sc, eval = has_data}
+sc_sweden <- synth_control(carbon, id = "country", time = "year", y = "CO2_transport_capita", d = "treated")
+did_sweden <- sdid_weights(carbon, id = "country", time = "year", y = "CO2_transport_capita", d = "treated",
+                           estimator = "did")
+sc_sweden
+c(did = did_sweden$estimate, synthetic_control = sc_sweden$estimate)
+```
+
+```{r fig-sweden-sc, eval = has_data, fig.height = 3.6, fig.cap = "Sweden and its synthetic control built from all pre-treatment outcomes. The gap after 1990 is the estimated effect."}
+plot_synth(sc_sweden, type = "path")
+```
+
+The synthetic Sweden tracks the real one closely before 1990 and diverges
+after. The average post-treatment gap is
+`r if (has_data) fmt(sc_sweden$estimate) else "about -0.28"` tons per
+capita, a reduction of roughly ten percent. DiD gives a different number,
+and Figure \@ref(fig:fig-sweden-raw) says which one to trust.
+
+Three questions follow and organize the lecture. When do such weights
+recover the counterfactual, and when do they fail? How is uncertainty
+assessed with one treated unit? And how is an application built and
+defended in practice?
+
+## One experiment, six estimators
+
+The natural model for this setting is a linear factor model (Section
+\@ref(sec-framework)):
+$$
+Y_{jt}^N = c_j + \delta_t + \lambda_t' \mu_j + \varepsilon_{jt}.
+$$
+Units differ in their fixed effects $c_j$ and in how they load ($\mu_j$)
+on common factors $\lambda_t$. DiD assumes the loadings are equal. Synthetic
+control does not. The experiment below simulates this model with
+`sim_synth_panel()`: 20 donors, 20 pre-treatment periods, 5
+post-treatment periods, two factors, a true effect of one. Two designs
+follow Ferman and Pinto (2021, Table 1).
+
+- **Design A, level in the tail.** The treated unit's fixed effect sits two
+  standard deviations above the donors'. Its loadings are ordinary. The
+  factors have mean zero after treatment, so the DiD assumption holds.
+- **Design B, loading in the tail with a break.** The treated unit loads
+  1.5 standard deviations above the donors on the first factor, and that
+  factor shifts up by one standard deviation after treatment. Treatment
+  is correlated with a time-varying unobservable.
+
+| Estimator | Weights | Intercept | Post-treatment correction |
+|---|---|---|---|
+| DiD | uniform | unit and period effects | none |
+| Synthetic control | simplex, matched on outcome levels | none | none |
+| Demeaned synthetic control | simplex, matched on outcome deviations | yes | none |
+| Augmented synthetic control | as demeaned | yes | ridge regression on the predictors |
+| Synthetic DiD | simplex unit weights and period weights | unit and period effects | none |
+| Unconstrained regression | least squares of the treated unit on the donors | yes | none |
+
+```{r sc-experiment, cache = TRUE, cache.extra = helper_md5}
+results <- run_sc_experiment(n_sims = n_sims, seed = 1)
+tab <- summarise_sc_experiment(results, effect = 1)
+pick <- function(design_prefix, estimator, column) {
+  tab[[column]][startsWith(tab$design, design_prefix) & tab$estimator == estimator]
+}
+```
+
+```{r tab-experiment, echo = FALSE}
+tab %>%
+  mutate(design = sub(":.*", "", design)) %>%
+  select(design, estimator, bias, sd, rmse, pre_rmspe, l2) %>%
+  knitr::kable(digits = 3, booktabs = TRUE,
+               col.names = c("Design", "Estimator", "Bias", "SD", "RMSE", "Pre-RMSPE", "Concentration"),
+               caption = paste0("Six estimators on the linear factor model, true effect 1, ", n_sims,
+                                " simulations per design. Pre-RMSPE is the pre-treatment root mean squared prediction error; concentration is the squared norm of the donor weights."))
+```
+
+```{r fig-experiment, fig.height = 4.6, fig.cap = "Sampling distributions of the six estimators minus the true effect, by design, truncated at plus or minus 4. Most draws of the unconstrained regression fall outside that range."}
+plot_sc_experiment(results, effect = 1)
+```
+
+## Reading the results
+
+- **DiD** is unbiased in Design A (bias `r fmt(pick("A", "DiD", "bias"))`)
+  and badly biased in Design B (`r fmt(pick("B", "DiD", "bias"))`). The
+  donor average loads less on the shifted factor than the treated unit,
+  and the shift lands on the estimate. This is the failure that motivates
+  the lecture: a comparison group with the wrong exposure to common shocks.
+- **Synthetic control** is biased in Design A (`r fmt(pick("A", "Synthetic control", "bias"))`).
+  Weights on the simplex can only reach levels inside the donors' range;
+  a treated unit above that range cannot be matched, and the level gap
+  becomes a bias. Its pre-treatment fit is visibly worse
+  (pre-RMSPE `r fmt(pick("A", "Synthetic control", "pre_rmspe"))`). In
+  Design B it reduces the bias of DiD to
+  `r fmt(pick("B", "Synthetic control", "bias"))` but does not remove it.
+- **Demeaned synthetic control** matches deviations from each unit's own
+  mean. It has no level problem in Design A (bias
+  `r fmt(pick("A", "Demeaned synthetic control", "bias"))`), and a smaller
+  standard deviation than DiD (`r fmt(pick("A", "Demeaned synthetic control", "sd"))`
+  against `r fmt(pick("A", "DiD", "sd"))`). In Design B it is biased,
+  like every estimator, because noise keeps the weights from fully
+  matching the loadings; the bias (`r fmt(pick("B", "Demeaned synthetic control", "bias"))`)
+  is a fraction of DiD's.
+- **Augmented synthetic control** adds a regression correction for the
+  remaining imbalance in the predictors. It trades bias for variance
+  (Design B bias `r fmt(pick("B", "Augmented synthetic control", "bias"))`,
+  SD `r fmt(pick("B", "Augmented synthetic control", "sd"))`). Its
+  pre-treatment fit is better by construction, because the correction is
+  fitted on those periods; that number is not a diagnostic.
+- **Synthetic DiD** combines unit weights, period weights, and two-way
+  effects (Section 07). It performs like the demeaned synthetic control
+  in Design A and somewhat better in Design B.
+- **Unconstrained regression** of the treated unit on all donors fits the
+  pre-treatment period perfectly, because there are as many donors as
+  pre-treatment periods, and then extrapolates noise. Its RMSE is the
+  largest in both designs. A perfect pre-treatment fit is not evidence of
+  a good counterfactual when the donors outnumber the periods.
+
+Three lessons carry through the lecture. Matching levels and matching
+trends are different things, and the intercept decides which one is
+asked. A good pre-treatment fit is necessary but not sufficient: it can
+come from overfitting, and it does not protect against a shock that
+treated and donors feel differently. And weight concentration is a
+diagnostic: among the simplex estimators, the ones that fail most spread
+their weights least.
+
+## When this is the right tool
+
+Synthetic control is the design for a treated aggregate unit with a long
+pre-treatment history and a pool of untreated units that are exposed to
+the same common shocks. Its requirements, in the order they are usually
+violated:
+
+- **Unaffected donors.** No spillover from the treated unit to the donors,
+  and no donor with its own policy change in the window.
+- **No anticipation.** The pre-treatment path must be a path without
+  treatment; date the treatment at its announcement if units respond
+  early.
+- **A long pre-treatment period relative to the donor pool.** With few
+  periods and many donors, the fit is achieved by chance.
+- **A treated unit inside the donors' range.** Weights on the simplex
+  interpolate; a treated unit at the extreme of the distribution cannot
+  be reproduced without extrapolation.
+- **Stable factor structure.** The relation between the treated unit and
+  its synthetic control, learned before treatment, must persist after it.
+
+When these fail, the alternatives are DiD with a justified comparison
+group, synthetic DiD, or a design that does not rely on the donors.
+
+**Roadmap.** Section \@ref(sec-framework) states the factor model, shows
+why the weights work under a perfect fit, and what breaks under an
+imperfect fit. Section \@ref(sec-build) builds the synthetic control:
+predictors, the importance weights, constraints, and augmentation.
+Section \@ref(sec-inference) covers inference with one treated unit:
+placebos, conformal tests, and the specification test. Section
+\@ref(sec-robustness) collects the robustness checks and the checklist of
+Ferman and Pinto. Section \@ref(sec-practice) turns to the applications and
+Section \@ref(sec-extensions) to the recent literature. Proofs are
+sketched in the text and completed in the Appendix.
+
+# Just enough framework {#sec-framework}
+
+## Setup and estimand {#sec-setup}
+
+Units $j = 0, 1, \dots, J$ are observed in periods $t = 1, \dots, T$.
+Unit $0$ is treated from period $T_0 + 1$ on; units $1, \dots, J$ are the
+donors. Potential outcomes are $Y_{jt}^N$ without treatment and
+$Y_{jt}^I = Y_{jt}^N + \alpha_{jt}$ with it. The observed outcome is
+$Y_{jt} = Y_{jt}^N + D_{jt}\,\alpha_{jt}$ with $D_{jt} = 1\{j = 0,\ t > T_0\}$.
+
+The estimand is the effect on the treated unit in each post-treatment
+period, $\alpha_{0t} = Y_{0t} - Y_{0t}^N$ for $t > T_0$, and its average
+over the post-treatment periods. It is not an average over units. Only
+$Y_{0t}^N$ is missing.
+
+Two assumptions come before any model.
+
+- **No anticipation.** $Y_{0t} = Y_{0t}^N$ for $t \le T_0$. The
+  pre-treatment path is a path without treatment.
+- **No interference.** $Y_{jt} = Y_{jt}^N$ for every donor and every $t$.
+  Donors are unaffected by the treated unit's policy.
+
+Both are restrictions on the donor pool and the treatment date, not on
+the estimator.
+
+> **Definition (synthetic control).** For weights $w$ in the simplex
+> $\Delta = \{w \in \mathbb{R}^J : w_j \ge 0,\ \sum_j w_j = 1\}$,
+> $$
+> \hat Y_{0t}^N(w) = \sum_{j = 1}^J w_j Y_{jt},
+> \qquad
+> \hat\alpha_{0t}(w) = Y_{0t} - \sum_{j = 1}^J w_j Y_{jt}.
+> $$
+> The synthetic control weights minimize the pre-treatment discrepancy,
+> $$
+> \hat w = \arg\min_{w \in \Delta} \sum_{t \le T_0} \Bigl(Y_{0t} - \sum_j w_j Y_{jt}\Bigr)^2
+> $$
+> when every pre-treatment outcome is a predictor, or
+> $\|Z_0 - Z w\|_V^2 = (Z_0 - Zw)' V (Z_0 - Zw)$ for a vector of predictors
+> $Z_0$ (outcome lags and covariates) and importance weights $V$.
+
+## The linear factor model {#sec-factor-model}
+
+The theory of the estimator is stated for
+$$
+Y_{jt}^N = c_j + \delta_t + \lambda_t' \mu_j + \varepsilon_{jt},
+$$
+with unit effects $c_j$, period effects $\delta_t$, $F$ common factors
+$\lambda_t$ with unit-specific loadings $\mu_j$, and idiosyncratic shocks
+$\varepsilon_{jt}$ with $\mathbb{E}[\varepsilon_{jt}] = 0$. Two-way fixed
+effects is the case $\mu_j \equiv \mu$: the factors then act like period
+effects. The factor model lets a common shock hit units with different
+intensity, which is the case parallel trends rules out.
+
+Treatment assignment is treated as fixed, together with $(c_j, \mu_j)$.
+The identifying condition (Ferman and Pinto 2021, Assumption 3) is that
+the idiosyncratic shocks have mean zero given the assignment. Treatment
+may depend on the treated unit's level $c_0$ and loadings $\mu_0$; it may
+not depend on shocks specific to the treated unit. This is what "selection
+on unobservables" means here: unobserved confounders are allowed as long
+as they also move the donors.
+
+| | DiD | Synthetic control |
+|---|---|---|
+| Counterfactual | donor average, shifted by the pre-treatment gap between the treated unit and the average | weighted donors, weights fitted before treatment |
+| Absorbs | $c_j$ and $\delta_t$ | $\delta_t$ (weights sum to one), plus $c_0$ and $\lambda_t'\mu_0$ if the weights reproduce them |
+| Needs | $\mu_0 = \bar\mu$, or $\mathbb{E}[\lambda_t] = 0$ after treatment | weights $w$ with $c'w = c_0$ and $\mu' w = \mu_0$, and a fit good enough to find them |
+
+## Why the weights work: skeleton of the argument {#sec-skeleton}
+
+Substitute the model into the estimator. For any $w \in \Delta$ and any
+$t$,
+$$
+\hat\alpha_{0t}(w) - \alpha_{0t}
+= \underbrace{(c_0 - c'w)}_{\text{level mismatch}}
++ \underbrace{\lambda_t'(\mu_0 - \mu' w)}_{\text{factor mismatch}}
++ \underbrace{(\varepsilon_{0t} - \varepsilon_t' w)}_{\text{noise}},
+$$
+where $c = (c_1, \dots, c_J)'$, $\mu = (\mu_1, \dots, \mu_J)'$, and
+$\varepsilon_t = (\varepsilon_{1t}, \dots, \varepsilon_{Jt})'$. The period
+effect $\delta_t$ cancels because the weights sum to one. The noise term
+has mean zero. Everything depends on whether the fitted weights make the
+first two terms small.
+
+**Step 1: perfect fit (Abadie, Diamond, and Hainmueller 2010).** Suppose
+weights $w^*$ exist with $c'w^* = c_0$ and $\mu'w^* = \mu_0$, and suppose
+the fitted weights reproduce the treated unit exactly over the
+pre-treatment period. Then the pre-treatment gap is the noise term
+evaluated at $\hat w$, and a mismatch in the loadings would have to be
+offset by the noise in every one of $T_0$ periods. The bias of
+$\hat\alpha_{0t}$ is bounded by a term that shrinks as $T_0$ grows, with a
+rate governed by the noise variance and the number of donors. Appendix
+\@ref(app-perfect-fit) states the bound. The lesson is practical: a long
+pre-treatment period with a close fit is the case the method was
+designed for.
+
+**Step 2: imperfect fit (Ferman and Pinto 2021).** Drop the perfect-fit
+condition. With every pre-treatment outcome as a predictor, the objective
+divided by $T_0$ converges, as $T_0 \to \infty$ with $J$ fixed, to
+$$
+Q_0(w) = (c_0 - c'w)^2 + (\mu_0 - \mu'w)'\,\Omega_0\,(\mu_0 - \mu'w) + \sigma^2\,(1 + w'w),
+$$
+where $\Omega_0$ is the long-run second moment of the factors and
+$\sigma^2$ the noise variance (Appendix \@ref(app-imperfect-fit)). The
+fitted weights converge to $\bar w = \arg\min_\Delta Q_0$. The last term
+is the variance of the weighted noise, and it rewards spreading the
+weights. Unless $\sigma^2 = 0$, the minimizer does not set the first two
+terms to zero, even when weights that would do so exist. So
+$$
+\hat\alpha_{0t} \;\to_p\; \alpha_{0t} + (c_0 - c'\bar w) + \lambda_t'(\mu_0 - \mu'\bar w) + (\varepsilon_{0t} - \varepsilon_t'\bar w).
+$$
+
+Four consequences, each visible in Table \@ref(tab:tab-experiment).
+
+- **Level bias.** If $\bar w$ misses $c_0$, the estimator is biased even
+  when the factors have mean zero after treatment. This is Design A, and
+  it is a bias DiD does not have.
+- **The demeaned fix.** Subtracting each unit's pre-treatment mean removes
+  the level term from $Q_0$. The demeaned synthetic control is then
+  unbiased under exactly the DiD condition, $\mathbb{E}[\lambda_t] = 0$
+  for $t > T_0$, and has weakly smaller asymptotic variance than DiD when
+  the factor and noise moments are stable (Ferman and Pinto, Propositions
+  2 and 3). The intercept costs nothing in identification and buys
+  efficiency.
+- **Time-varying confounders.** If $\mathbb{E}[\lambda_t] \ne 0$ after
+  treatment, both are biased: DiD by $\bar\lambda'(\mu_0 - \bar\mu)$ and the
+  demeaned synthetic control by $\bar\lambda'(\mu_0 - \mu'\bar w)$. The
+  second is usually smaller because $\bar w$ is pulled toward matching the
+  loadings, but it is not zero. This is Design B.
+- **Concentration as a warning.** The trade-off in $Q_0$ is between
+  matching and spreading. Weights that are concentrated on few donors
+  signal that matching was hard, and the simulations of Ferman and Pinto
+  show the bias rising with $\|w\|^2$.
+
+The following check makes Step 2 concrete. The treated unit's level and
+loadings are an exact convex combination of three donors' (weights 0.5,
+0.3, 0.2), so $w^*$ exists, and every unit has noise of standard deviation
+one. The table reports the distance between the fitted weights and
+$w^*$, the loading mismatch $\|\mu_0 - \mu'\hat w\|$, and the
+concentration $\|\hat w\|^2$ as $T_0$ grows.
+
+```{r weights-limit}
+w_true <- c(0.5, 0.3, 0.2, rep(0, 5))
+limit_check <- function(t_pre) {
+  dat <- simulate_convex_treated(n_donors = 8, t_pre = t_pre, t_post = 5, sd_e = 1, w_true = w_true, seed = 1)
+  fit <- synth_control(dat, id = "id", time = "time", y = "y", d = "d")
+  mu <- attr(dat, "donor_loadings")
+  c(t_pre = t_pre, distance_to_w_star = sqrt(sum((fit$weights$weight - w_true)^2)),
+    loading_mismatch = sqrt(sum((crossprod(mu, fit$weights$weight - w_true))^2)),
+    concentration = fit$concentration[["l2"]])
+}
+round(rbind(limit_check(50), limit_check(500), limit_check(5000)), 3)
+```
+
+The distance to $w^*$ does not vanish with $T_0$. The weights settle at a
+more diluted vector than $w^*$ (whose concentration is
+`r fmt(sum(w_true^2))`), and the loading mismatch that comes with it is
+permanent. That mismatch is harmless while the factors average zero, and
+becomes a bias when they do not.
+
+## Weights plus an outcome model {#sec-weights-model}
+
+Every estimator of Section \@ref(sec-problem) has the form
+$$
+\hat Y_{0t}^N = \hat m_t(Z_0) + \sum_j w_j \bigl(Y_{jt} - \hat m_t(Z_j)\bigr),
+$$
+an outcome model evaluated at the treated unit plus a weighted average of
+the donors' residuals from that model (Ben-Michael, Feller, and Rothstein
+2021; Doudchenko and Imbens 2016).
+
+| Estimator | Outcome model $\hat m_t$ | Weights |
+|---|---|---|
+| DiD | unit and period effects | uniform |
+| Synthetic control | none | simplex, on levels |
+| Demeaned synthetic control | unit effect | simplex, on deviations |
+| Augmented synthetic control | ridge regression of $Y_{jt}$ on the predictors | simplex, on deviations |
+| Synthetic DiD | unit and period effects | simplex units, simplex periods |
+| Unconstrained regression | none | least squares |
+
+The error of the general form is
+$$
+\hat Y_{0t}^N - Y_{0t}^N
+= \bigl(\hat m_t(Z_0) - m_t(Z_0)\bigr) - \sum_j w_j \bigl(\hat m_t(Z_j) - m_t(Z_j)\bigr)
++ \Bigl(\sum_j w_j\, m_t(Z_j) - m_t(Z_0)\Bigr) + \text{noise},
+$$
+with $m_t$ the true conditional mean. If the weights balance the
+predictors exactly and $m_t$ is linear in them, the third term is zero
+whatever the model. If the model is right, the first two terms are zero
+whatever the weights. Otherwise the leading error is the product of the
+model error and the imbalance. This is the structure of Section 04:
+weights play the role of the propensity score, the outcome model plays
+the role of the regression, and the remainder is a product. The augmented
+synthetic control is the doubly robust member of the family, which is
+why it removed most of the bias in Design B. The price is variance, and
+it is paid through extrapolation: the outcome model predicts outside the
+donors' range.
+
+# Building the synthetic control {#sec-build}
+
+Each subsection follows the same order: the choice, what it does to the
+weights, the code on Sweden, and when it breaks.
+
+## Predictors and importance weights {#sec-predictors}
+
+**The choice.** Two conventions define the predictors $Z$. The first uses
+every pre-treatment outcome, so the weights reproduce the whole path.
+The second uses a short list of covariates averaged over a window, plus a
+few outcome lags, each weighted by an importance weight in $V$. Andersson
+(2019) uses GDP per capita, vehicles per capita, gasoline consumption per
+capita, and urban population, averaged over 1980 to 1989, plus emissions
+in 1989, 1980, and 1970.
+
+**What it does.** With covariates, $V$ decides which predictors the weights
+must match. `Synth` chooses $V$ by a nested problem: for each $V$, solve
+the inner simplex problem for $w(V)$; then choose $V$ to minimize the
+pre-treatment mean squared prediction error of the outcome path. Kaul et
+al. (2022) show that when every outcome lag is a predictor, the outer
+problem gives the covariates zero weight: the lags alone determine $w$.
+Covariates matter only when the lags are few.
+
+```{r sweden-predictors, eval = has_data}
+xs <- c("GDP_per_capita", "vehicles_capita", "gas_cons_capita", "urban_pop")
+set.seed(1)
+sc_and <- synth_control(carbon, id = "country", time = "year", y = "CO2_transport_capita", d = "treated",
+                        x = xs, lags = c(1989, 1980, 1970), pre_window = 1980:1989, v = "mspe",
+                        v_control = list(maxit = 2000, starts = 3))
+sc_and_eq <- synth_control(carbon, id = "country", time = "year", y = "CO2_transport_capita", d = "treated",
+                           x = xs, lags = c(1989, 1980, 1970), pre_window = 1980:1989, v = "equal")
+weights_tab <- Reduce(function(a, b) merge(a, b, by = "country", all = TRUE), list(
+  setNames(sc_sweden$weights, c("country", "all_lags")),
+  setNames(sc_and_eq$weights, c("country", "andersson_equal_v")),
+  setNames(sc_and$weights, c("country", "andersson_mspe_v"))
+))
+weights_tab <- weights_tab[order(-weights_tab$andersson_mspe_v), ]
+knitr::kable(weights_tab[weights_tab$andersson_mspe_v > 0.001 | weights_tab$all_lags > 0.001, ], digits = 3,
+             row.names = FALSE, booktabs = TRUE,
+             caption = "Donor weights for Sweden under three predictor choices. Andersson (2019, Table 2) reports Denmark 0.384, Belgium 0.195, New Zealand 0.177, Greece 0.090, United States 0.088, Switzerland 0.061.")
+```
+
+```{r sweden-balance, eval = has_data}
+knitr::kable(sc_and$balance[, c("predictor", "treated", "synthetic", "donor_mean", "v")], digits = 3,
+             row.names = FALSE, booktabs = TRUE,
+             col.names = c("Predictor", "Sweden", "Synthetic Sweden", "Donor mean", "V"),
+             caption = "Predictor balance for Andersson's specification (his Table 1). The donor mean is unweighted.")
+```
+
+Three readings. The all-lags weights and Andersson's weights agree on the
+main donors (Denmark, Belgium, New Zealand, the United States) and differ
+in the tail. The $V$ weights of the nested problem concentrate on two
+predictors; the pre-treatment MSPE is flat in $V$ near its minimum, so
+different optimizers land on different $V$ with almost the same $w$, and
+`Synth`'s $V$ is not the one above. $V$ is a means to an end: report it,
+but judge the fit and the weights. The balance table is the object to
+read. Sweden and synthetic Sweden agree on every predictor except gasoline
+consumption, exactly as in the paper.
+
+**When it breaks.** Few lags and many covariates invite a fit driven by
+the covariates rather than the path. Many lags with a short pre-period
+invite overfitting (Section \@ref(sec-fit)). Predictors measured after
+treatment are never allowed.
+
+## Constraints and extrapolation {#sec-constraints}
+
+**The choice.** Weights on the simplex interpolate: the synthetic unit
+lies inside the convex hull of the donors, predictor by predictor. Adding
+an intercept (`demean = TRUE`) lets the level differ while the trends
+match. Dropping the sum-to-one constraint or the sign constraint
+(Doudchenko and Imbens 2016; Hsiao, Ching, and Wan 2012) allows
+extrapolation in every direction.
+
+```{r sweden-constraints, eval = has_data}
+fits <- list(
+  simplex = sc_sweden,
+  demeaned = synth_control(carbon, "country", "year", "CO2_transport_capita", "treated", demean = TRUE),
+  nonnegative = synth_control(carbon, "country", "year", "CO2_transport_capita", "treated", constraints = "nonnegative"),
+  unconstrained = synth_control(carbon, "country", "year", "CO2_transport_capita", "treated", constraints = "none")
+)
+t(sapply(fits, function(f) c(estimate = f$estimate, pre_rmspe = f$pre_rmspe, sum_w = sum(f$weights$weight),
+                              positive_weights = sum(f$weights$weight > 0.001), concentration = f$concentration[["l2"]])))
+```
+
+**What it does.** The simplex gives a sparse, interpretable set of donors.
+The intercept changes the estimate little here because Sweden's level is
+inside the donors' range; it would matter for a country at the top or
+bottom of the distribution (Design A). The unconstrained regression has
+30 pre-treatment periods and 14 donors, so it does not interpolate the
+data, but its weights are dense and of both signs, and its counterfactual
+is an extrapolation no one can defend donor by donor.
+
+The range check in the balance table is the first guard against
+extrapolation: every predictor of the treated unit should lie within the
+donors' range.
+
+```{r sweden-range, eval = has_data}
+sc_and$balance[, c("predictor", "treated", "in_range")]
+```
+
+**When it breaks.** A treated unit at the extreme of the predictor
+distribution cannot be reproduced on the simplex, and the fit will show
+it. The honest responses are the intercept (which extrapolates the level
+only) or a different design; unconstrained weights hide the problem
+rather than solve it.
+
+## Pre-treatment fit and overfitting {#sec-fit}
+
+**The choice.** Every synthetic control is judged first by its
+pre-treatment fit. The root mean squared prediction error over the
+pre-treatment periods (`pre_rmspe`) is the number; the path plot is the
+picture. Ferman and Pinto (2021) recommend a second picture: subtract the
+period mean of all units from every series and look at the fit again.
+Common trends that all units share are removed, and what remains is the
+part of the fit that the weights had to earn.
+
+```{r fig-sweden-demeaned, eval = has_data, fig.height = 3.4, fig.cap = "Sweden and its synthetic control after subtracting the period mean of all 15 countries. The fit before 1990 is what the weights achieved beyond the common trend."}
+plot_synth(sc_sweden, type = "demeaned_path")
+```
+
+**Overfitting.** A close fit is easy to obtain when the donors outnumber
+the pre-treatment periods, because the weights can absorb noise. The
+experiment below draws noisy panels with no treatment effect, 10
+pre-treatment periods, and 5 to 80 donors. The pre-treatment fit improves
+with the donor pool while the post-treatment error does not.
+
+```{r overfit-experiment, cache = TRUE, cache.extra = helper_md5}
+overfit <- run_overfit_experiment(n_sims = 100, n_donors = c(5, 10, 20, 40, 80), t_pre = 10, sd_e = 2, seed = 2)
+overfit_tab <- summarise_overfit(overfit)
+```
+
+```{r tab-overfit, echo = FALSE}
+knitr::kable(overfit_tab, digits = 3, booktabs = TRUE,
+             col.names = c("Donors", "Pre-RMSPE", "Post-RMSPE", "Bias", "SD", "RMSE", "Concentration"),
+             caption = "Demeaned synthetic control with no treatment effect, 10 pre-treatment periods, and noise standard deviation 2: fit and post-treatment error by donor-pool size, 100 simulations each.")
+```
+
+With 80 donors the pre-treatment fit is `r fmt(overfit_tab$pre_rmspe[overfit_tab$n_donors == 80] / overfit_tab$pre_rmspe[overfit_tab$n_donors == 5], 2)`
+times that with 5 donors, and the post-treatment error is
+`r fmt(overfit_tab$post_rmspe[overfit_tab$n_donors == 80] / overfit_tab$post_rmspe[overfit_tab$n_donors == 5], 2)`
+times. The improvement in the fit is fitted noise. Read the
+pre-treatment fit together with the ratio of donors to periods, and
+prefer the post/pre comparison of the placebo test (Section
+\@ref(sec-placebo-space)) to the pre-treatment fit alone.
+
+**When it breaks.** Ferman and Pinto's Remark 3: a good fit with $J$
+large relative to $T_0$ is not evidence that the loadings are matched.
+Sweden has 14 donors and 30 pre-treatment years, which is comfortable.
+
+## Regularization and augmentation {#sec-augment}
+
+**The choice.** Two additions borrow from Section 07 and Section 04. A
+ridge penalty on the weights (`zeta`, as in synthetic DiD) spreads them
+across donors at the cost of fit. The ridge-augmented estimator
+(`augment = "ridge"`) keeps the simplex weights and adds the correction
+$\hat m_t(Z_0) - \sum_j w_j \hat m_t(Z_j)$ of Section \@ref(sec-weights-model),
+with $\hat m_t$ a ridge regression of each period's outcome on the
+predictors, fitted on donors, and its penalty chosen by leave-one-donor-out
+cross-validation.
+
+```{r sweden-augment, eval = has_data}
+sc_dm <- fits$demeaned
+aug_row <- function(label, ...) {
+  base <- synth_control(carbon, "country", "year", "CO2_transport_capita", "treated", demean = TRUE, ...)
+  aug <- synth_control(carbon, "country", "year", "CO2_transport_capita", "treated", demean = TRUE, augment = "ridge", ...)
+  corr <- aug$augmentation$correction[aug$effects$post]
+  data.frame(predictors = label, demeaned_sc = base$estimate, augmented = aug$estimate, lambda = aug$lambda,
+             mean_correction = mean(corr), correction_share = mean(corr) / aug$estimate)
+}
+aug_tab <- rbind(
+  aug_row("all 30 lags"),
+  aug_row("Andersson's 7 predictors", x = xs, lags = c(1989, 1980, 1970), pre_window = 1980:1989),
+  aug_row("all 30 lags, lambda = 1", lambda = 1)
+)
+knitr::kable(aug_tab, digits = 3, row.names = FALSE, booktabs = TRUE,
+             col.names = c("Predictors", "Demeaned SC", "Augmented", "Lambda", "Mean correction", "Share of estimate"),
+             caption = "Ridge augmentation on Sweden under three predictor sets. The correction is averaged over the post-treatment periods.")
+```
+
+**What it does.** The correction is the augmented estimator's own
+diagnostic. With all 30 lags as predictors and 14 donors, the ridge
+model has more parameters than observations; cross-validation keeps the
+penalty near zero and the correction is
+`r if (has_data) fmt(100 * aug_tab$correction_share[1], 0) else "about 70"` percent of the estimate. With Andersson's
+seven predictors it is a fifth of the estimate, with the opposite sign.
+Neither is small. A correction comparable to the estimate says that the
+answer comes from the outcome model, not from the donors. In that case
+report the synthetic control estimate as the headline and the augmented
+one as a sensitivity check, or fix a larger penalty, which shrinks the
+augmented estimator back to the synthetic control (last row). The
+augmented estimator earns its keep when the pre-treatment fit is poor and
+the predictor set is small relative to the donor pool.
+
+**When it breaks.** The ridge model is linear in the predictors. When the
+post-treatment outcomes depend on the pre-treatment path in a different
+way for the treated unit than for the donors, the correction adds bias
+rather than removing it. The Monte Carlo of Section \@ref(sec-problem)
+showed the other cost: variance.
+
+# Inference {#sec-inference}
+
+## What is random {#sec-random}
+
+There is one treated unit. The estimate is one gap per post-treatment
+period, and nothing is averaged across treated units. Two things are
+uncertain: the weights, which were estimated from noisy pre-treatment
+data, and the idiosyncratic shocks after treatment, which the weighted
+donors do not reproduce. A standard error in the usual sense needs a
+population that the treated unit was sampled from, and there is none.
+
+The literature answers with Fisher's logic. Under a sharp null of no
+effect, the treated unit is exchangeable with the donors, or the
+post-treatment periods are exchangeable with the pre-treatment ones, and
+either exchangeability gives a reference distribution. Three tools follow.
+
+- **In-space placebos** permute the treatment across units (Abadie,
+  Diamond, and Hainmueller 2010).
+- **In-time placebos and conformal inference** permute across periods
+  (Abadie, Diamond, and Hainmueller 2015; Chernozhukov, Wuthrich, and Zhu
+  2021).
+- **The specification test** of Ferman and Pinto (2021) permutes across
+  periods to compare two estimators rather than to test an effect.
+
+## In-space placebos {#sec-placebo-space}
+
+**Procedure.** Reassign the treatment to each donor in turn, fit its
+synthetic control from the remaining donors with the same predictors, and
+record its gap path. The treated unit's gap is compared with the
+distribution of placebo gaps. The statistic that adjusts for fit is the
+ratio of post-treatment to pre-treatment mean squared prediction error:
+a large post-treatment gap counts for more when the pre-treatment fit was
+tight. The p-value is the rank of the treated unit's ratio among all
+units, divided by their number. Placebos that could not be fitted are
+usually dropped: Andersson keeps donors whose pre-treatment MSPE is at
+most 20 times Sweden's.
+
+```{r sweden-placebo, eval = has_data}
+pl_cut <- synth_placebo(sc_and, mspe_limit = 20)
+pl_cut
+head(pl_cut$mspe[order(pl_cut$mspe$rank), c("country", "pre_mspe", "post_mspe", "ratio", "rank")], 5)
+pl_lags <- synth_placebo(sc_sweden, mspe_limit = 20)
+c(rank_andersson_predictors = pl_cut$mspe$rank[1], rank_all_lags = pl_lags$mspe$rank[1],
+  p_andersson_predictors = pl_cut$p_value, p_all_lags = pl_lags$p_value)
+```
+
+```{r fig-sweden-placebo, eval = has_data, fig.height = 3.6, fig.cap = "Gaps for Sweden (black) and for each donor treated as a placebo (grey). Sweden's post-1990 gap is the largest and most persistent."}
+plot_synth(pl_cut)
+```
+
+```{r fig-sweden-ratio, eval = has_data, fig.height = 3.2, fig.cap = "Ratio of post-treatment to pre-treatment mean squared prediction error, Sweden against the placebos kept after the 20-times cut."}
+plot_synth(pl_cut, type = "ratio")
+```
+
+**Reading it.** With Andersson's predictors, Sweden's ratio ranks first
+among the `r if (has_data) sum(pl_cut$kept) else "ten"` units kept after
+the cut, so the p-value is `r if (has_data) fmt(pl_cut$p_value, 2) else "0.10"`,
+the paper's number. This is the smallest p-value the design can produce:
+with $J$ kept donors, no result can be rarer than one in $J + 1$. Per-period
+p-values (`p_value_by_period`) say in which years the gap stands out.
+
+The predictor choice matters here. With all 30 lags, France's placebo fit
+is so tight (pre-treatment MSPE
+`r if (has_data) formatC(pl_lags$mspe$pre_mspe[pl_lags$mspe$country == "France"], digits = 2, format = "e") else "tiny"`)
+that a modest post-1990 gap gives it a larger ratio than Sweden, which
+then ranks second. The ratio statistic rewards fit as much as effect. Report
+the cut on badly fitted placebos and the predictor set together with the
+p-value, because both change the denominator and the ranking.
+
+**When it breaks.** With few donors the test has little resolution. With
+donors whose own outcomes are hard to fit, the ratio statistic is noisy.
+And the test only ever speaks about the sharp null of no effect in any
+period; it does not give a confidence interval.
+
+## In-time placebos {#sec-placebo-time}
+
+**Procedure.** Move the treatment date to a year before the real one,
+use only the data before the real treatment, and fit the synthetic
+control as if the placebo date were real. A gap opening after the placebo
+date would mean the method finds effects where there are none.
+
+```{r sweden-placebo-time, eval = has_data}
+pt_1980 <- synth_placebo(sc_sweden, type = "time", placebo_time = 1980)
+pt_1970 <- synth_placebo(sc_sweden, type = "time", placebo_time = 1970)
+c(placebo_1980 = pt_1980$estimate, placebo_1970 = pt_1970$estimate, real_1990 = sc_sweden$estimate)
+```
+
+```{r fig-sweden-backdate, eval = has_data, fig.height = 3.4, fig.cap = "In-time placebo: treatment backdated to 1980, fitted on 1960 to 1979 and evaluated on 1980 to 1989."}
+plot_synth(pt_1980, type = "path")
+```
+
+The backdated gaps are small relative to the 1990 gap, which is what the
+design requires. Andersson uses fewer lags for these fits, because the
+placebo pre-period is shorter; the lecture keeps all lags for simplicity,
+and the replication follows the paper.
+
+## Conformal inference {#sec-conformal}
+
+**Procedure.** Chernozhukov, Wuthrich, and Zhu (2021) test a sharp null
+that fixes the effect in every post-treatment period, $H_0: \alpha_{0t} =
+\theta_t$. Subtract $\theta_t$ from the treated outcome after treatment,
+refit the synthetic control on all periods with every period's outcome
+as a predictor, and compute the residuals $\hat u_t$. Under the null the
+post-treatment residuals are like the others, so a statistic of the
+post-treatment residuals, here $(T_1^{-1}\sum_{t > T_0} |\hat u_t|^q)^{1/q}$,
+is compared with its value under all cyclic shifts of the residual vector
+(moving block permutations, which keep the dependence structure). The
+p-value is the share of shifts with a statistic at least as large.
+Inverting the test over a grid of constant effects gives a confidence set.
+Appendix \@ref(app-conformal) states the validity condition.
+
+```{r sweden-conformal, eval = has_data}
+ci_sweden <- synth_conformal(sc_sweden, per_period = TRUE)
+ci_sweden
+ci_sweden$per_period
+```
+
+```{r fig-sweden-conformal, eval = has_data, fig.height = 3.2, fig.cap = "Per-period gaps for Sweden with 95 percent conformal intervals."}
+ggplot(ci_sweden$per_period, aes(x = time, y = gap)) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), fill = "grey80") +
+  geom_line() + geom_point() +
+  labs(x = NULL, y = "Gap with 95% conformal interval") + sc_theme()
+```
+
+**Reading it.** The joint p-value for no effect in any post-treatment
+year is `r if (has_data) fmt(ci_sweden$p_value, 2) else "large"`, and the
+confidence set for a constant effect is
+[`r if (has_data) fmt(ci_sweden$conf.low, 2) else ""`, `r if (has_data) fmt(ci_sweden$conf.high, 2) else ""`].
+The joint test has little power for Sweden: the post-treatment block is
+16 of 46 periods, so every cyclic shift overlaps it and the permutation
+distribution is contaminated by the effect itself. The per-period tests
+use one post-treatment period at a time and reject in every year from
+1991 on, at the smallest p-value that 31 shifts allow. Conformal inference
+is the only tool here that produces an interval, and it needs only
+stationarity and weak dependence of the residuals, not a model for them.
+
+**When it breaks.** The method is designed for a short post-treatment
+block relative to the pre-treatment period. With a long one, test period
+by period, or test the average effect over a few periods at a time. A
+structural break in the residuals after treatment violates the
+exchangeability the test relies on; the placebo test in space does not
+depend on it.
+
+## Size and power of the three tests {#sec-inference-mc}
+
+The experiment draws panels from the factor model with 20 donors, 20
+pre-treatment periods, and 5 post-treatment periods, with no effect and
+with an effect of 1.5 (about one noise standard deviation), and applies
+the three tests at the ten percent level.
+
+```{r inference-experiment, cache = TRUE, cache.extra = helper_md5}
+inf_null <- run_inference_experiment(n_sims = n_sims, effect = 0, seed = 3)
+inf_alt <- run_inference_experiment(n_sims = n_sims, effect = 1.5, seed = 4)
+inf_tab <- summarise_inference(bind_rows(inf_null, inf_alt))
+```
+
+```{r tab-inference, echo = FALSE}
+knitr::kable(inf_tab, digits = 3, booktabs = TRUE,
+             col.names = c("True effect", "In-space placebo", "Conformal", "Specification test"),
+             caption = paste0("Rejection rates at the ten percent level, ", n_sims, " simulations per row. The specification test is a test of the design, not of the effect, and should not reject in either row."))
+```
+
+Both effect tests hold their size under the null (rejection rates
+`r fmt(inf_tab[[2]][1])` and `r fmt(inf_tab[[3]][1])`). Against an effect
+of 1.5 the placebo test rejects in `r fmt(100 * inf_tab[[2]][2], 0)` percent
+of the samples and the conformal test in `r fmt(100 * inf_tab[[3]][2], 0)`
+percent, with five post-treatment periods and one treated unit. The
+specification test does not respond to the effect, as it should not: the
+factors have mean zero after treatment in this design, so the demeaned
+synthetic control and DiD estimate the same thing.
+
+## The specification test {#sec-spec-test}
+
+**Procedure.** Under the factor model the demeaned synthetic control and
+DiD are both unbiased when the factors have mean zero after treatment,
+and both biased otherwise, with different biases. Ferman and Pinto (2021)
+contrast the two: fit the demeaned weights on all periods, form
+$$
+\hat u_t = \hat w'(y_t - \bar y) - J^{-1} \iota'(y_t - \bar y),
+$$
+the difference between the two counterfactuals (the treated outcome
+cancels), and compare the post-treatment mean of $\hat u_t$ with its
+moving block permutations. A low p-value says the two estimators disagree
+by more than the pre-treatment variation explains.
+
+```{r sweden-spec, eval = has_data}
+st_sweden <- synth_spec_test(sc_dm)
+st_sweden
+```
+
+```{r fig-sweden-spec, eval = has_data, fig.height = 3.4, fig.cap = "Sweden, its demeaned synthetic control, and the DiD counterfactual. The specification test asks whether the two counterfactuals diverge after 1990 by more than they wander before."}
+plot_synth(st_sweden)
+```
+
+**Reading it.** For Sweden the test does not reject
+(p = `r if (has_data) fmt(st_sweden$p_value, 2) else "high"`): the two
+counterfactuals move together, which supports the condition both need.
+Ferman and Pinto's own illustration is the Basque Country (Abadie and
+Gardeazabal 2003), where the test rejects with p = 0.023; the replication
+data reproduce it.
+
+```{r basque-spec}
+basque_path <- file.path(pkg_root, "data_raw", "09_Synthetic_Control", "ferman2021synthetic", "base_abadie.csv")
+if (file.exists(basque_path)) {
+  basque <- read.csv(basque_path)
+  basque <- basque[!basque$regionname %in% c("Spain (Espana)", "Syntetic Basque Country"), ]
+  basque$d <- as.integer(basque$regionname == "Basque Country (Pais Vasco)" & basque$year >= 1970)
+  sc_basque <- synth_control(basque, id = "regionname", time = "year", y = "gdpcap", d = "d", demean = TRUE)
+  synth_spec_test(sc_basque)
+}
+```
+
+**How to read a rejection.** A rejection means at least one of the two
+estimators is biased. If the pre-treatment fit is close and the donors are
+many relative to the periods, the synthetic control may still be valid
+while DiD is not (Section \@ref(sec-skeleton), Step 1). If the fit is
+imperfect, both are suspect, and the demeaned synthetic control is the
+lesser evil because its weights lean toward the loadings. The test cannot
+tell which case applies; the fit and the concentration can.
+
+## Several treated units {#sec-several}
+
+With a handful of treated units adopting at the same time, the average
+mode fits one synthetic control to their average, and the placebo tools
+apply unchanged. With staggered adoption, or with treated units that
+differ enough that one synthetic control cannot serve all, the separate
+mode fits one synthetic control per unit from the donors that are still
+untreated over that unit's window, and averages the gaps in event time.
+The jackknife over treated units gives a standard error for the average.
+
+```{r staggered-demo}
+stag <- sim_synth_panel(n_donors = 25, n_treated = 5, t_pre = 15, t_post = 8, effect = c(0.5, 1, 1.5, 2),
+                        adoption = c(14, 15, 17, 19, 21), seed = 7)
+sc_stag <- synth_control(stag, id = "id", time = "time", y = "y", d = "d",
+                         treated_units = "separate", horizon = 4, demean = TRUE)
+sc_stag
+sc_stag$unit_table
+```
+
+```{r fig-staggered, fig.height = 3.2, fig.cap = "Average gap by event time over five treated units with staggered adoption; the true effect rises from 0.5 to 2 over the first four periods."}
+plot_synth(sc_stag)
+```
+
+Each unit's donor pool shrinks as adoption spreads, and units treated
+late have fewer donors. Two refinements are in the literature and not in
+the package: pooled placebo p-values across treated units (Cavallo et al.
+2013) and partially pooled weights that trade unit-level fit for fit of
+the average (Ben-Michael, Feller, and Rothstein 2022). Synthetic DiD with
+cohort-by-cohort weights (Section 07) is the other option.
+
+# Robustness and design checks {#sec-robustness}
+
+## Leave-one-out {#sec-loo}
+
+Drop each donor with positive weight in turn and refit. The spread of the
+refitted estimates measures how much the answer rests on any single
+donor. Andersson (2019, Figure 9) runs this for the six donors with weight
+above 0.001.
+
+```{r sweden-loo, eval = has_data}
+loo_sweden <- synth_loo(sc_and)
+loo_sweden
+```
+
+```{r fig-sweden-loo, eval = has_data, fig.height = 3.4, fig.cap = "Synthetic Sweden with each positive-weight donor left out in turn (grey), against the full synthetic control and Sweden."}
+plot_synth(loo_sweden)
+```
+
+The estimate is robust to any single donor; leaving out Denmark, the
+largest donor, gives a somewhat larger reduction, as in the paper. A
+leave-one-out spread comparable to the estimate would say the result is
+one donor's story.
+
+## The donor pool {#sec-donor-pool}
+
+The donor pool is a modelling decision, and it is made before any weight
+is estimated. Four rules.
+
+- **Unaffected.** No donor should be exposed to the treatment through
+  spillovers (fuel tourism across a border, trade diversion).
+- **No policy of its own.** Donors with a similar policy in the window
+  are removed; Andersson drops Finland, Norway, and the Netherlands,
+  which introduced carbon taxes in the 1990s.
+- **Comparable.** Donors should share the structure that drives the
+  outcome, so that the factor loadings of the treated unit are inside
+  their span.
+- **Complete.** A balanced panel over the whole window.
+
+A useful check is to restrict the pool to the units one would defend as
+comparable and see whether the estimate moves.
+
+```{r sweden-pool, eval = has_data}
+europe <- c("Belgium", "Denmark", "France", "Greece", "Iceland", "Poland", "Portugal", "Spain", "Switzerland", "Sweden")
+sc_europe <- synth_control(carbon[carbon$country %in% europe, ], "country", "year", "CO2_transport_capita", "treated",
+                           x = xs, lags = c(1989, 1980, 1970), pre_window = 1980:1989, v = "mspe",
+                           v_control = list(maxit = 2000, starts = 3))
+c(all_donors = sc_and$estimate, european_donors = sc_europe$estimate,
+  pre_rmspe_all = sc_and$pre_rmspe, pre_rmspe_europe = sc_europe$pre_rmspe)
+```
+
+Restricting the pool to European donors removes New Zealand and the
+United States, which carry
+`r if (has_data) fmt(sum(sc_and$weights$weight[sc_and$weights$country %in% c("New Zealand", "United States")])) else "0.3"`
+of the weight, and the pre-treatment fit deteriorates by a factor of
+`r if (has_data) fmt(sc_europe$pre_rmspe / sc_and$pre_rmspe, 1) else "five"`.
+The estimate that comes with that fit changes sign. It is not an
+alternative estimate; it is a synthetic control that failed, and the
+right reading is that Sweden's emissions path has no counterpart among
+European donors alone. A donor-pool restriction is informative only when
+the fit survives it.
+
+## Confounders that move with the treatment {#sec-confounders}
+
+Sweden entered a deep recession in 1991 to 1993, right after the tax.
+If the recession drove the emissions gap, the gap should close when the
+economy recovers. Andersson's check applies the same donor weights to GDP
+per capita: if synthetic Sweden tracks real Sweden's GDP through the
+recession, the recession is not what separates the emission paths.
+`synth_control(weights = )` reuses the weights on another outcome.
+
+```{r sweden-gdp, eval = has_data}
+# GDP per capita is missing for Poland before 1970; the check uses 1970 to 2005.
+gdp_sweden <- synth_control(carbon[carbon$year >= 1970, ], "country", "year", "GDP_per_capita", "treated", weights = sc_and)
+gaps <- merge(data.frame(year = sc_and$effects$time, emissions = sc_and$effects$gap),
+              data.frame(year = gdp_sweden$effects$time, gdp = gdp_sweden$effects$gap), by = "year")
+change <- function(v, from, to) v[gaps$year == to] - v[gaps$year == from]
+recession_tab <- data.frame(
+  recession = c("1975 to 1978", "1989 to 1993"),
+  gdp_gap_change = c(change(gaps$gdp, 1975, 1978), change(gaps$gdp, 1989, 1993)),
+  emissions_gap_change = c(change(gaps$emissions, 1975, 1978), change(gaps$emissions, 1989, 1993))
+)
+recession_tab
+```
+
+```{r fig-sweden-gdp, eval = has_data, fig.height = 3.6, fig.cap = "Gaps between Sweden and synthetic Sweden in CO2 emissions (left axis) and in GDP per capita (right axis, thousands of 2005 dollars), with the two recessions shaded."}
+recessions <- data.frame(start = c(1976, 1991), end = c(1978, 1993))
+ggplot() +
+  geom_rect(data = recessions, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf), fill = "grey85") +
+  geom_hline(yintercept = 0, linetype = "dotted") + geom_vline(xintercept = 1989.5, linetype = "dotted") +
+  geom_line(data = gaps, aes(x = year, y = emissions, colour = "CO2 emissions gap")) +
+  geom_line(data = gaps, aes(x = year, y = gdp / 5000, colour = "GDP per capita gap")) +
+  scale_y_continuous(sec.axis = sec_axis(~ . * 5, name = "GDP gap, thousand dollars")) +
+  scale_colour_manual(values = c("CO2 emissions gap" = "black", "GDP per capita gap" = "#B22222")) +
+  labs(x = NULL, y = "Emissions gap, tons per capita", colour = NULL) + sc_theme()
+```
+
+The GDP gap falls by a similar amount in both recessions. The emissions
+gap rises slightly in the first and falls in the second, and it does not
+close when GDP recovers after 1993. The recession is not the explanation. The same logic applies
+to any confounder that can be observed: build its synthetic version with
+the same weights and ask whether it moved.
+
+## Justifying the design: the Ferman-Pinto checklist {#sec-checklist-fp}
+
+Ferman and Pinto (2021, Section 6) turn their results into six requests to
+the applied researcher. Each maps to an output of the package.
+
+| Request | Where to look | Sweden |
+|---|---|---|
+| 1. Argue that shocks specific to the treated unit are unrelated to treatment; confounders that also move the donors are allowed | the design, in words | the tax followed a political process, not an emissions shock |
+| 2. Show the pre-treatment fit after removing common trends, not only in levels | `plot_synth(type = "demeaned_path")` | Figure \@ref(fig:fig-sweden-demeaned): close |
+| 3. Keep the donors few relative to the pre-treatment periods, or a good fit may be overfitting | `glance()`: `n_donors`, `t_pre` | 14 donors, 30 years |
+| 4. Report the weight concentration $\|w\|^2$; diluted weights are the case where the estimator is asymptotically unbiased even with imperfect fit (Ferman 2021) | `concentration` | `r if (has_data) fmt(sc_and$concentration[["l2"]]) else ""`, about `r if (has_data) fmt(sc_and$concentration[["effective_donors"]], 1) else ""` effective donors |
+| 5. Compare the demeaned synthetic control with DiD; a large difference says both are biased | `synth_spec_test()` | p = `r if (has_data) fmt(st_sweden$p_value, 2) else ""`, no rejection |
+| 6. Use the original synthetic control only if it recovers the treated unit's level; otherwise demean or abandon | `balance`, `intercept` of the demeaned fit | intercept `r if (has_data) fmt(sc_dm$intercept, 3) else ""`: levels match |
+
+Sweden passes each request, which is why the paper's estimate survives a
+theory published two years after it. The checklist is also a map of the
+ways an application fails: a fit that is good only in levels, a donor
+pool larger than the pre-period, weights on one or two donors, or a
+demeaned estimate far from DiD.
+
+# Practice {#sec-practice}
+
+## Replications and anchors {#sec-replications}
+
+| Paper | What it anchors | Status |
+|---|---|---|
+| Andersson (2019), carbon taxes and CO2 emissions in Sweden | the full workflow: predictors and V, weights, balance, path and gap, in-time and in-space placebos, leave-one-out, the GDP check | `inst/replications/09_Synthetic_Control/andersson2019carbon.Rmd` |
+| Ferman and Pinto (2021), imperfect pretreatment fit | the theory of Section \@ref(sec-framework), the demeaned estimator, the specification test on the Basque Country, the Monte Carlo of Section 4 | setup described below; notebook to be written |
+| Abadie, Diamond, and Hainmueller (2010), California's Proposition 99 | the canonical application and the placebo test in space | data in the `synthdid` package; see lecture 07 |
+| Berman and Israeli (2022), descriptive analytics and online retailers | staggered adoption in a marketing panel, cohort-by-cohort synthetic DiD | lecture 07; `treated_units = "separate"` is the synthetic control analogue |
+
+**Ferman and Pinto (2021): setup and construction.** The replication
+folder holds the authors' code and data. Two parts.
+
+1. *Basque application.* Data: real GDP per capita for 17 Spanish regions,
+   1955 to 1997, from Abadie and Gardeazabal (2003); the Basque Country is
+   treated from 1970 (terrorism), so $T_0 = 15$ and $J = 16$ after dropping
+   Spain and the authors' pre-built synthetic unit. Construction: (i) the
+   original synthetic control with all 15 outcome lags, solved on raw
+   outcomes (`synth_control()` with defaults); (ii) the demeaned version
+   (`demean = TRUE`); (iii) the specification of Abadie and Gardeazabal
+   with covariates, for comparison; (iv) plots in levels and after
+   subtracting each period's regional mean (`plot_synth(type =
+   "demeaned_path")`); (v) the specification test (`synth_spec_test()`),
+   which gives p = 0.023, and the weights table (Appendix A.2 of the paper).
+2. *Monte Carlo (their Table 1).* Data: monthly CPS employment rates for
+   the 50 states and DC, 1982 to 2019. Construction: estimate a linear
+   factor model by interactive fixed effects (Bai 2009) with the number of
+   factors chosen by the Bai-Ng criterion (the authors find four), fit
+   ARMA processes to each factor and each state's residuals, and simulate
+   with $T_1 = 12$ and $T_0 \in \{120, 240, 480, 1200\}$. Panels A and B
+   treat the state with the second largest and second smallest fixed
+   effect; Panels C and D the state with the second largest and smallest
+   loading on the first factor, adding a break of two standard deviations
+   to that factor after treatment. Compare the original synthetic control,
+   the demeaned synthetic control, and DiD on bias and standard error.
+   `sim_synth_panel()` is the stylized version of this design; the
+   authors' version needs an interactive fixed effects estimator (the
+   `gsynth` package), which is not part of this package.
+
+## A synthetic control checklist {#sec-checklist}
+
+1. Name the treated unit, the treatment date, and the window. Argue no
+   anticipation (or date the treatment at the announcement) and no
+   interference with the donors.
+2. Describe the donor pool and every exclusion, with reasons.
+3. State the predictors, the window over which covariates are averaged,
+   and how $V$ was chosen. Report the balance table.
+4. Report the weights, the concentration $\|w\|^2$, and the effective
+   number of donors.
+5. Show the path plot and the demeaned path plot. Report the
+   pre-treatment RMSPE and the ratio of donors to pre-treatment periods.
+6. Report the average and the per-period gaps.
+7. Run in-space placebos; report the ratio ranking, the cut rule, and
+   the p-value. Run at least one in-time placebo.
+8. Report a conformal interval, per period when the post-treatment block
+   is long.
+9. Report the demeaned estimate next to the original and the
+   specification test against DiD.
+10. Report leave-one-out, at least one donor-pool restriction, and the
+    same-weights check on the confounders a referee will name.
+
+# Extensions {#sec-extensions}
+
+- **Synthetic DiD** (Arkhangelsky et al. 2021) adds period weights and
+  two-way effects; Section 07 and `sdid_weights()`. It is the demeaned
+  synthetic control with a data-driven choice of which pre-treatment
+  periods matter.
+- **Penalized synthetic control** (Abadie and L'Hour 2021) adds a penalty
+  on the distance between the treated unit and each donor it uses. The
+  weights become unique and sparse, and the method extends to many
+  treated units in disaggregated data.
+- **Staggered adoption with partial pooling** (Ben-Michael, Feller, and
+  Rothstein 2022) fits one synthetic control per unit and one for the
+  average, and trades off their fits. The separate mode of
+  `synth_control()` is the unpooled corner.
+- **Interactive fixed effects and generalized synthetic control** (Bai
+  2009; Xu 2017) estimate the factors and loadings directly and impute
+  the counterfactual from them. They need many donors and periods, and
+  they extrapolate; `gsynth` implements them.
+- **Matrix completion** (Athey et al. 2021) treats the untreated outcomes
+  as a matrix with missing entries and fills them under a nuclear-norm
+  penalty; synthetic control and regression on lags are the two
+  one-sided special cases.
+- **Prediction intervals** (Cattaneo, Feng, and Titiunik 2021) separate
+  the uncertainty from the weights and from the post-treatment shocks and
+  give intervals under explicit models for each; `scpi` implements them.
+- **Bayesian structural time series** (Brodersen et al. 2015) models the
+  treated unit's series with the donors as regressors and reports a
+  posterior for the counterfactual; `CausalImpact` is the common choice
+  in marketing.
+- **Geo experiments** (GeoLift) use the augmented synthetic control to
+  evaluate market-level marketing tests, where a few regions receive a
+  campaign and the rest are donors. The randomization of the treated
+  regions restores design-based inference.
+- **Doubly robust panel identification** (Arkhangelsky and Imbens 2022)
+  puts an assignment model and an outcome model on the same footing and
+  shows when synthetic control, DiD, and their combinations are valid.
+
+# Appendix {#sec-appendix}
+
+## The bias bound under perfect fit {#app-perfect-fit}
+
+Setting: the factor model of Section \@ref(sec-factor-model) with $F$
+factors, $\Lambda = (\lambda_1, \dots, \lambda_{T_0})'$ the $T_0 \times F$
+matrix of pre-treatment factors, and weights $w^*$ with
+$c'w^* = c_0$ and $\mu'w^* = \mu_0$. Suppose the fitted weights $\hat w$
+give an exact pre-treatment fit: $Y_{0s} = \sum_j \hat w_j Y_{js}$ for all
+$s \le T_0$.
+
+*Step 1.* By the decomposition of Section \@ref(sec-skeleton), an exact
+fit means that for every $s \le T_0$,
+$$
+(c_0 - c'\hat w) + \lambda_s'(\mu_0 - \mu'\hat w) = \varepsilon_s'\hat w - \varepsilon_{0s}.
+$$
+Stack the $T_0$ equations. With $\tilde\Lambda = (\iota, \Lambda)$ of full
+column rank, the level and loading mismatches are the least-squares
+projection of the noise contrast $e = (\varepsilon_s'\hat w - \varepsilon_{0s})_{s \le T_0}$
+on the factor span:
+$$
+\begin{pmatrix} c_0 - c'\hat w \\ \mu_0 - \mu'\hat w \end{pmatrix}
+= (\tilde\Lambda'\tilde\Lambda)^{-1}\tilde\Lambda' e .
+$$
+
+*Step 2.* The post-treatment bias is $\lambda_t'(\mu_0 - \mu'\hat w)$ plus
+the level term, a linear function of the projected noise. Its mean is
+bounded by a constant times the expected absolute size of
+$(\tilde\Lambda'\tilde\Lambda/T_0)^{-1}(\tilde\Lambda' e/T_0)$. When
+$\tilde\Lambda'\tilde\Lambda/T_0$ converges to a positive definite matrix and
+the noise has bounded moments, $\tilde\Lambda' e/T_0$ is an average of
+$T_0$ mean-zero terms with variance of order $\sigma^2 (1 + \|\hat w\|^2)/T_0$.
+The bound therefore shrinks in $T_0$ and grows with the noise variance
+and, through $\|\hat w\|^2 \le 1$ and the sum over donors, with $J$.
+Abadie, Diamond, and Hainmueller (2010, Theorem 1) give the explicit
+constant. The conclusion used in the text: under an exact fit the bias
+vanishes as $T_0$ grows, at a rate governed by the noise relative to the
+factors.
+
+The step that fails with an imperfect fit is the first one. When the fit
+is not exact, the stacked equations hold only up to the fitting error,
+and that error is chosen by the estimator to trade off against the noise
+term, which is Appendix \@ref(app-imperfect-fit).
+
+## The limit objective with imperfect fit {#app-imperfect-fit}
+
+Setting: all pre-treatment outcomes as predictors, $J$ fixed, $T_0 \to \infty$.
+Ferman and Pinto's Assumption 4: pre-treatment averages of $\lambda_s$,
+$\varepsilon_s$, and their cross products converge in probability, with
+$T_0^{-1}\sum_s \lambda_s \to 0$, $T_0^{-1}\sum_s \lambda_s\lambda_s' \to \Omega_0$,
+$T_0^{-1}\sum_s \varepsilon_s\varepsilon_s' \to \sigma^2 I_{J+1}$, and cross
+terms to zero. (Normalizing the factor mean to zero is without loss:
+a nonzero mean is absorbed in $c_j$.)
+
+*Derivation of $Q_0$.* The objective is
+$$
+Q_{T_0}(w) = \frac{1}{T_0}\sum_{s \le T_0}\bigl[(c_0 - c'w) + \lambda_s'(\mu_0 - \mu'w) + (\varepsilon_{0s} - \varepsilon_s'w)\bigr]^2 .
+$$
+Expand the square. The squared level term is constant in $s$. The
+squared factor term averages to $(\mu_0 - \mu'w)'\Omega_0(\mu_0 - \mu'w)$.
+The squared noise term averages to $\sigma^2(1 + w'w)$, because
+$\varepsilon_{0s}$ and $\varepsilon_s'w$ are uncorrelated with variance
+$\sigma^2$ and $\sigma^2 w'w$. Every cross term averages to zero. Hence
+$Q_{T_0}(w) \to_p Q_0(w)$ pointwise, and uniformly on the simplex because
+$Q_{T_0}$ is quadratic in $w$ with converging coefficients. Continuity
+and compactness give $\hat w \to_p \bar w = \arg\min_\Delta Q_0$ when the
+minimizer is unique (Proposition 1).
+
+*Why $\bar w$ misses the loadings.* Let $\mathcal{W}^* = \{w \in \Delta : c'w = c_0,\ \mu'w = \mu_0\}$.
+On $\mathcal{W}^*$ the first two terms vanish and $Q_0(w) = \sigma^2(1 + w'w)$.
+The minimizer of $Q_0$ over all of $\Delta$ equals a point of $\mathcal{W}^*$
+only if that point also minimizes $w'w$ over $\Delta$ up to the trade-off
+with the first two terms, which happens only when $\sigma^2 = 0$ or by
+coincidence. Otherwise $\bar w$ lies outside $\mathcal{W}^*$, and the
+mismatch $\mu_0 - \mu'\bar w$ is a fixed nonzero vector.
+
+*The demeaned estimator (Proposition 2).* Replace every series by its
+deviation from its own pre-treatment mean. The level term drops from
+the objective, so the limit is
+$\tilde Q_0(w) = (\mu_0 - \mu'w)'\Omega_0(\mu_0 - \mu'w) + \sigma^2(1 + w'w)$
+and the estimator converges to
+$\alpha_{0t} + \lambda_t'(\mu_0 - \mu'\tilde w) + (\varepsilon_{0t} - \varepsilon_t'\tilde w)$.
+It is asymptotically unbiased when $\mathbb{E}[\lambda_t] = 0$ for $t > T_0$,
+whatever $\tilde w$ is.
+
+*Efficiency against DiD (Proposition 3).* Assume the factor and noise
+moments after treatment equal the pre-treatment limits. Then for any
+fixed $w$ the asymptotic mean squared error of
+$\hat\alpha_{0t}(w)$ is $\tilde Q_0(w)$: the squared factor mismatch plus
+the noise variance. The demeaned weights minimize $\tilde Q_0$ over the
+simplex, and DiD uses $w = \iota/J$, which is in the simplex. Hence
+$\tilde Q_0(\tilde w) \le \tilde Q_0(\iota/J)$: the demeaned synthetic
+control weakly dominates DiD in asymptotic mean squared error. The
+inequality is strict unless uniform weights already minimize the
+trade-off.
+
+## One family: weights plus an outcome model {#app-family}
+
+Write every estimator as
+$\hat Y_{0t}^N = \hat m_t(Z_0) + \sum_j w_j (Y_{jt} - \hat m_t(Z_j))$.
+
+- *Synthetic control:* $\hat m_t \equiv 0$.
+- *Demeaned synthetic control:* $\hat m_t(Z_j) = \bar Y_j$, the unit's
+  pre-treatment mean. Then
+  $\hat Y_{0t}^N = \bar Y_0 + \sum_j w_j (Y_{jt} - \bar Y_j)$, which is the
+  intercept form $\hat a + \sum_j w_j Y_{jt}$ with
+  $\hat a = \bar Y_0 - \sum_j w_j \bar Y_j$. Minimizing the pre-treatment
+  fit over $(a, w)$ and over $w$ with the series demeaned give the same
+  $w$, because the optimal $a$ for given $w$ is exactly that expression.
+- *Augmented synthetic control:* $\hat m_t(Z) = \hat a_t + \hat\beta_t' Z$
+  from a ridge regression of $Y_{jt}$ on the donors' predictors.
+  Substituting gives
+  $\hat Y_{0t}^N = \sum_j w_j Y_{jt} + \hat\beta_t'(Z_0 - \sum_j w_j Z_j)$: the
+  synthetic control plus the outcome model applied to the imbalance.
+- *Synthetic DiD:* $\hat m_t(Z_j) = \hat a_j + \hat b_t$, two-way effects
+  estimated with period weights $\lambda_t$ on the pre-treatment
+  periods; the unit weights are then fitted to the residuals.
+- *DiD:* the same outcome model with uniform unit and period weights.
+
+The error decomposition of Section \@ref(sec-weights-model) follows by
+substituting $Y_{jt} = m_t(Z_j) + e_{jt}$.
+
+## Validity of the moving-block conformal test {#app-conformal}
+
+Under the sharp null the adjusted treated outcome has no effect in any
+period, and the refit on all $T$ periods treats every period alike. Let
+$u_t$ be the population residual of that fit and $\hat u_t$ its estimate.
+Chernozhukov, Wuthrich, and Zhu (2021) assume that $(u_t)$ is stationary
+and weakly dependent, and that the estimator is consistent so that
+$\hat u_t - u_t$ is small uniformly in $t$. For a statistic
+$S(\hat u_{\pi})$ of a block of $T_1$ consecutive residuals, the set of
+$T$ cyclic shifts $\pi$ treats every block of $T_1$ consecutive periods
+as the post-treatment block in turn. Under stationarity each block has
+the same distribution, so the rank of the observed block among the $T$
+blocks is approximately uniform, and
+$\mathbb{P}(\hat p \le a) \to a$ as $T \to \infty$ with $T_1$ fixed. With
+independent residuals the test is exact in finite samples. The
+approximation degrades when $T_1/T$ is not small, because the blocks
+overlap the true post-treatment period heavily and the effect, if the
+null is false, contaminates most of them; this is the low power seen for
+Sweden. The specification test of Ferman and Pinto applies the same
+argument to the contrast $\hat u_t$ of Section \@ref(sec-spec-test),
+with the treated outcome cancelled.
+
+## The nested problem for the importance weights {#app-nested}
+
+With predictors $Z_0$ (a vector of length $K$) and $Z$ ($K \times J$),
+standardized by their standard deviation across units, the inner problem
+for given $V = \mathrm{diag}(v_1, \dots, v_K)$ is the quadratic program
+$$
+w(V) = \arg\min_{w \in \Delta} (Z_0 - Zw)'V(Z_0 - Zw),
+$$
+solved exactly by an active-set method (`quadprog`) or by Frank-Wolfe
+steps on the simplex. The outer problem chooses $V$ in the simplex to
+minimize the pre-treatment mean squared prediction error of the outcome,
+$T_0^{-1}\sum_{s \le T_0}(Y_{0s} - Y_s'w(V))^2$. It is not convex and has
+flat regions: many $V$ give nearly the same $w$. `synth_control(v =
+"mspe")` runs Nelder-Mead from the equal-weight and regression-based
+starts, refines by BFGS, and keeps the best. When every pre-treatment
+outcome is a predictor, the outer objective is already the inner
+objective restricted to the lag rows, so putting all of $V$ on the lags
+attains the outer minimum and covariates receive zero weight (Kaul et
+al. 2022).
+
+## References
+
+- Abadie, Alberto, Alexis Diamond, and Jens Hainmueller. 2010. "Synthetic Control Methods for Comparative Case Studies: Estimating the Effect of California's Tobacco Control Program." *Journal of the American Statistical Association*.
+- Abadie, Alberto, Alexis Diamond, and Jens Hainmueller. 2015. "Comparative Politics and the Synthetic Control Method." *American Journal of Political Science*.
+- Abadie, Alberto, and Javier Gardeazabal. 2003. "The Economic Costs of Conflict: A Case Study of the Basque Country." *American Economic Review*.
+- Abadie, Alberto, and Jeremy L'Hour. 2021. "A Penalized Synthetic Control Estimator for Disaggregated Data." *Journal of the American Statistical Association*.
+- Andersson, Julius J. 2019. "Carbon Taxes and CO2 Emissions: Sweden as a Case Study." *American Economic Journal: Economic Policy*.
+- Arkhangelsky, Dmitry, Susan Athey, David A. Hirshberg, Guido W. Imbens, and Stefan Wager. 2021. "Synthetic Difference-in-Differences." *American Economic Review*.
+- Arkhangelsky, Dmitry, and Guido W. Imbens. 2022. "Doubly Robust Identification for Causal Panel Data Models." *The Econometrics Journal*.
+- Athey, Susan, Mohsen Bayati, Nikolay Doudchenko, Guido Imbens, and Khashayar Khosravi. 2021. "Matrix Completion Methods for Causal Panel Data Models." *Journal of the American Statistical Association*.
+- Bai, Jushan. 2009. "Panel Data Models with Interactive Fixed Effects." *Econometrica*.
+- Ben-Michael, Eli, Avi Feller, and Jesse Rothstein. 2021. "The Augmented Synthetic Control Method." *Journal of the American Statistical Association*.
+- Ben-Michael, Eli, Avi Feller, and Jesse Rothstein. 2022. "Synthetic Controls with Staggered Adoption." *Journal of the Royal Statistical Society: Series B*.
+- Berman, Ron, and Ayelet Israeli. 2022. "The Value of Descriptive Analytics: Evidence from Online Retailers." *Marketing Science*.
+- Brodersen, Kay H., Fabian Gallusser, Jim Koehler, Nicolas Remy, and Steven L. Scott. 2015. "Inferring Causal Impact Using Bayesian Structural Time-Series Models." *Annals of Applied Statistics*.
+- Cattaneo, Matias D., Yingjie Feng, and Rocio Titiunik. 2021. "Prediction Intervals for Synthetic Control Methods." *Journal of the American Statistical Association*.
+- Cavallo, Eduardo, Sebastian Galiani, Ilan Noy, and Juan Pantano. 2013. "Catastrophic Natural Disasters and Economic Growth." *Review of Economics and Statistics*.
+- Chernozhukov, Victor, Kaspar Wuthrich, and Yinchu Zhu. 2021. "An Exact and Robust Conformal Inference Method for Counterfactual and Synthetic Controls." *Journal of the American Statistical Association*.
+- Doudchenko, Nikolay, and Guido W. Imbens. 2016. "Balancing, Regression, Difference-in-Differences and Synthetic Control Methods: A Synthesis." NBER Working Paper 22791.
+- Ferman, Bruno. 2021. "On the Properties of the Synthetic Control Estimator with Many Periods and Many Controls." *Journal of the American Statistical Association*.
+- Ferman, Bruno, and Cristine Pinto. 2021. "Synthetic Controls with Imperfect Pretreatment Fit." *Quantitative Economics*.
+- Hsiao, Cheng, H. Steve Ching, and Shui Ki Wan. 2012. "A Panel Data Approach for Program Evaluation: Measuring the Benefits of Political and Economic Integration of Hong Kong with Mainland China." *Journal of Applied Econometrics*.
+- Kaul, Ashok, Stefan Klossner, Gregor Pfeifer, and Manuel Schieler. 2022. "Standard Synthetic Control Methods: The Case of Using All Preintervention Outcomes Together with Covariates." *Journal of Business and Economic Statistics*.
+- Xu, Yiqing. 2017. "Generalized Synthetic Control Method: Causal Inference with Interactive Fixed Effects Models." *Political Analysis*.

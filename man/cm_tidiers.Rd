@@ -14,12 +14,27 @@
 \alias{tidy.cm_dml}
 \alias{glance.cm_dml}
 \alias{tidy.cm_scores}
+\alias{tidy.cm_scores_multi}
 \alias{tidy.cm_blp}
+\alias{glance.cm_blp}
 \alias{tidy.cm_gate}
 \alias{tidy.cm_cate}
 \alias{tidy.cm_cate_score}
 \alias{tidy.cm_policy}
 \alias{glance.cm_scores}
+\alias{tidy.cm_dml_structured}
+\alias{tidy.cm_ar_set}
+\alias{tidy.cm_mte}
+\alias{tidy.cm_cf_boot}
+\alias{tidy.cm_compliers}
+\alias{tidy.cm_late_weights}
+\alias{tidy.cm_mediation}
+\alias{tidy.cm_med_dml}
+\alias{tidy.cm_med_cde}
+\alias{tidy.cm_med_iv}
+\alias{tidy.cm_front_door}
+\alias{tidy.cm_gelbach}
+\alias{tidy.cm_med_sensitivity}
 \title{Tidy and glance methods for causalmetrics estimators}
 \usage{
 \method{tidy}{cm_agg_att}(x, ...)
@@ -44,7 +59,11 @@
 
 \method{tidy}{cm_scores}(x, conf.int = TRUE, conf.level = 0.95, ...)
 
+\method{tidy}{cm_scores_multi}(x, ...)
+
 \method{tidy}{cm_blp}(x, conf.int = TRUE, conf.level = x$conf_level, ...)
+
+\method{glance}{cm_blp}(x, ...)
 
 \method{tidy}{cm_gate}(x, ...)
 
@@ -55,10 +74,37 @@
 \method{tidy}{cm_policy}(x, ...)
 
 \method{glance}{cm_scores}(x, ...)
+
+\method{tidy}{cm_dml_structured}(x, ...)
+
+\method{tidy}{cm_ar_set}(x, ...)
+
+\method{tidy}{cm_mte}(x, ...)
+
+\method{tidy}{cm_cf_boot}(x, ...)
+
+\method{tidy}{cm_compliers}(x, ...)
+
+\method{tidy}{cm_late_weights}(x, ...)
+
+\method{tidy}{cm_mediation}(x, ...)
+
+\method{tidy}{cm_med_dml}(x, ...)
+
+\method{tidy}{cm_med_cde}(x, ...)
+
+\method{tidy}{cm_med_iv}(x, ...)
+
+\method{tidy}{cm_front_door}(x, ...)
+
+\method{tidy}{cm_gelbach}(x, ...)
+
+\method{tidy}{cm_med_sensitivity}(x, ...)
 }
 \arguments{
 \item{x}{A \code{cm_aipw}, \code{cm_dml}, \code{cm_scores}, \code{cm_blp}, \code{cm_gate}, \code{cm_cate},
-\code{cm_cate_score}, or \code{cm_policy} object.}
+\code{cm_cate_score}, \code{cm_policy}, \code{cm_ar_set}, \code{cm_mte}, \code{cm_cf_boot},
+\code{cm_compliers}, or \code{cm_late_weights} object.}
 
 \item{...}{Unused.}
 

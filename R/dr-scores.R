@@ -25,14 +25,25 @@
 #' R-learner.
 #'
 #' @param data A data frame.
-#' @param y,d Outcome and binary treatment column names.
+#' @param y,d Outcome and treatment column names. A binary `d` (0/1,
+#'   logical) gives the pseudo-outcome below. A `d` with more than two
+#'   levels (or an explicit `arms`) gives the multi-arm score matrix
+#'   `Gamma[i, k] = mu_k(Z_i) + 1{W_i = k}(Y_i - mu_k(Z_i)) / e_k(Z_i)`,
+#'   one column per arm, of class `cm_scores_multi`; see Details.
 #' @param x Character vector of covariate names (the controls `Z`). Needed
 #'   when the nuisances are estimated internally, and used as the default
 #'   heterogeneity variables downstream.
 #' @param p_hat,mu0_hat,mu1_hat Optional out-of-fold predictions of
 #'   `P(D = 1 | Z)`, `E[Y | D = 0, Z]`, `E[Y | D = 1, Z]`: numeric vectors of
 #'   length `nrow(data)` or column names. When all three are supplied no
-#'   learner is fitted.
+#'   learner is fitted. In the multi-arm case `p_hat` is an `n x K` matrix
+#'   of arm probabilities (or `K` column names) and `mu_hat` the matching
+#'   matrix of outcome predictions.
+#' @param mu_hat Multi-arm case only: out-of-fold predictions
+#'   `E[Y | W = k, Z]`, an `n x K` matrix or `K` column names.
+#' @param arms Multi-arm case only: the arm labels in the order the columns
+#'   of the score matrix should take (default the sorted unique values, or
+#'   the factor levels, of `d`).
 #' @param learner_p `mlr3` classification learner for the propensity score
 #'   (default logistic regression).
 #' @param learner_mu `mlr3` regression learner for the two outcome regressions
@@ -47,9 +58,28 @@
 #'   the folds of supplied nuisances or imposing a partition.
 #' @param seed Optional seed for the fold partition.
 #' @param p_clip Propensity clipping bounds.
+#' @param trim Optional propensity trimming bounds, e.g. `c(0.01, 0.99)`
+#'   (multi-arm case: applied to the propensity of the arm the unit
+#'   received):
+#'   rows whose estimated propensity falls outside the bounds are dropped
+#'   after the nuisances are fitted, as in Crump et al. (2009). Trimming
+#'   changes the target population to the region of overlap; `diagnostics`
+#'   records the share dropped.
 #' @param outcome_type `"auto"`, `"continuous"`, or `"binary"`; matters only
 #'   when a classification learner predicts the outcome.
 #' @param na_action `"fail"` or `"omit"` for rows with missing values.
+#'
+#' @details
+#' **Multi-arm scores.** With `K` arms the propensities are estimated by one
+#' cross-fitted classifier per arm (one against the rest), normalized to sum
+#' to one, and the outcome model of each arm is fitted on that arm's rows.
+#' The returned object holds `gamma` (the `n x K` score matrix), `nuisance`
+#' (`e` and `mu` matrices), `w` (arm labels), `arms`, and `ate` (expected
+#' outcome under each arm and contrasts against the first arm). It feeds
+#' [policy_value()] (the expected outcome of any arm-valued policy, the
+#' inverse-propensity-score reward when `type = "ipw"`), [policy_learn()]
+#' (trees over the arms, or `policytree`), and [contrast_scores()], which
+#' extracts the binary object of any pair for the binary tools.
 #'
 #' @return A list of class `cm_scores`: `score` (the pseudo-outcome),
 #'   `nuisance` (data frame with `p`, `mu0`, `mu1`, `l`), `residuals`
@@ -73,12 +103,12 @@
 #' @seealso [cate_learner()], [cate_blp()], [cate_validate()], [policy_learn()]
 #' @export
 dr_scores <- function(data, y, d, x = NULL,
-                      p_hat = NULL, mu0_hat = NULL, mu1_hat = NULL,
+                      p_hat = NULL, mu0_hat = NULL, mu1_hat = NULL, mu_hat = NULL, arms = NULL,
                       learner_p = NULL, learner_mu = NULL,
                       learner_mu0 = NULL, learner_mu1 = NULL,
                       type = c("dr", "ipw", "reg"),
                       folds = 5L, fold_id = NULL, seed = NULL,
-                      p_clip = c(0.01, 0.99),
+                      p_clip = c(0.01, 0.99), trim = NULL,
                       outcome_type = c("auto", "continuous", "binary"),
                       na_action = c("fail", "omit")) {
   type <- match.arg(type)
@@ -92,6 +122,13 @@ dr_scores <- function(data, y, d, x = NULL,
   if (!is.null(x)) {
     if (!is.character(x)) stop("`x` must be a character vector of column names.", call. = FALSE)
     for (v in x) .cm_check_column(v, data)
+  }
+  d_vals <- unique(stats::na.omit(data[[d]]))
+  is_multi <- !is.null(arms) || !is.null(mu_hat) || length(d_vals) > 2L ||
+    (is.factor(data[[d]]) && !all(as.character(d_vals) %in% c("0", "1")))
+  if (is_multi) {
+    return(.cm_dr_scores_multi(data, y, d, x, arms, p_hat, mu_hat, learner_p, learner_mu, type,
+                               folds, fold_id, seed, p_clip, trim, outcome_type, na_action))
   }
   n_all <- nrow(data)
   p_in <- .cm_get_optional_numeric(p_hat, data, n_all, "p_hat")
@@ -147,6 +184,17 @@ dr_scores <- function(data, y, d, x = NULL,
   }
   if (type == "reg") p_in <- rep(mean(dv), n)
   if (type == "ipw") { mu0_in <- rep(0, n); mu1_in <- rep(0, n) }
+  trimmed_share <- 0
+  if (!is.null(trim)) {
+    if (length(trim) != 2L || trim[1] >= trim[2]) stop("`trim` must be two increasing bounds.", call. = FALSE)
+    keep_t <- p_in > trim[1] & p_in < trim[2]
+    trimmed_share <- mean(!keep_t)
+    if (sum(keep_t) < 4L) stop("Trimming removed almost every observation.", call. = FALSE)
+    data <- data[keep_t, , drop = FALSE]
+    yv <- yv[keep_t]; dv <- dv[keep_t]; fold_id <- fold_id[keep_t]
+    p_in <- p_in[keep_t]; mu0_in <- mu0_in[keep_t]; mu1_in <- mu1_in[keep_t]
+    n <- length(yv)
+  }
   p_raw <- p_in
   p <- .cm_clip(p_in, p_clip[1], p_clip[2])
   mu0 <- as.numeric(mu0_in)
@@ -164,6 +212,7 @@ dr_scores <- function(data, y, d, x = NULL,
   diagnostics <- list(
     propensity = .cm_summary(p_raw),
     clipped_share = mean(p_raw < p_clip[1] | p_raw > p_clip[2]),
+    trimmed_share = trimmed_share,
     common_support = if (type != "reg") .cm_common_support(p_raw, dv) else NULL,
     nuisance = rbind(
       p = if (type != "reg") .cm_fit_quality(dv, p_raw) else c(rmse = NA, r2 = NA),
@@ -180,7 +229,7 @@ dr_scores <- function(data, y, d, x = NULL,
     y = yv, d = dv, x = x, y_name = y, d_name = d,
     data = data, fold_id = fold_id, n = n, type = type,
     ate = ate, learners = labels, outcome_type = outcome_type,
-    p_clip = p_clip, diagnostics = diagnostics, call = match.call()
+    p_clip = p_clip, trim = trim, diagnostics = diagnostics, call = match.call()
   ), class = "cm_scores")
 }
 
@@ -188,7 +237,8 @@ dr_scores <- function(data, y, d, x = NULL,
 print.cm_scores <- function(x, ...) {
   cat("Doubly robust pseudo-outcomes (", x$type, ")\n", sep = "")
   cat("  n = ", x$n, ", treated share = ", round(mean(x$d), 3),
-      ", folds = ", length(unique(x$fold_id)), "\n", sep = "")
+      ", folds = ", length(unique(x$fold_id)),
+      if (!is.null(x$trim)) paste0(", trimmed share = ", round(x$diagnostics$trimmed_share, 3)), "\n", sep = "")
   cat("  nuisances: p = ", x$learners$p, ", mu0 = ", x$learners$mu0,
       ", mu1 = ", x$learners$mu1, "\n", sep = "")
   cat("  ATE (mean of the score) = ", format(round(x$ate$estimate, 4)),
@@ -196,4 +246,69 @@ print.cm_scores <- function(x, ...) {
   cat("  score quantiles (1%, 50%, 99%): ",
       paste(format(round(x$diagnostics$score[c("q01", "median", "q99")], 3)), collapse = ", "), "\n", sep = "")
   invisible(x)
+}
+
+#' Pool several score objects
+#'
+#' Stacks `cm_scores` objects built on different subsamples (for instance one
+#' per treatment-control pair in a multi-treatment design) into one object,
+#' so that [cate_blp()], [cate_validate()], or [policy_value()] can be
+#' applied to the pooled scores. A column named `set` in `$data` records the
+#' origin of each row (the names of the arguments, or `set1`, `set2`, ...).
+#'
+#' @param ... `cm_scores` objects, optionally named, or a single list of them.
+#' @param set Name of the column added to `$data` that records the origin.
+#'
+#' @return A `cm_scores` object whose `score`, `nuisance`, `residuals`, `y`,
+#'   `d`, `data`, and `fold_id` are the stacked components (fold identifiers
+#'   are offset so they stay unique across sets), with the ATE and the
+#'   diagnostics recomputed on the pooled rows.
+#' @examples
+#' dat <- sim_hte(600, dgp = "smooth", seed = 1)
+#' a <- dr_scores(dat[1:300, ], "y", "d", paste0("x", 1:5), seed = 1)
+#' b <- dr_scores(dat[301:600, ], "y", "d", paste0("x", 1:5), seed = 2)
+#' pooled <- bind_scores(first = a, second = b)
+#' table(pooled$data$set)
+#' @export
+bind_scores <- function(..., set = "set") {
+  objs <- list(...)
+  if (length(objs) == 1L && !inherits(objs[[1]], "cm_scores") && is.list(objs[[1]])) objs <- objs[[1]]
+  if (length(objs) == 0L) stop("Supply at least one `cm_scores` object.", call. = FALSE)
+  for (o in objs) .cm_check_scores(o)
+  nm <- names(objs)
+  if (is.null(nm)) nm <- rep("", length(objs))
+  nm[nm == ""] <- paste0("set", which(nm == ""))
+  types <- unique(vapply(objs, function(o) o$type, character(1)))
+  if (length(types) > 1L) stop("All score objects must have the same `type`.", call. = FALSE)
+  common <- Reduce(intersect, lapply(objs, function(o) names(o$data)))
+  data <- do.call(rbind, lapply(seq_along(objs), function(i) {
+    d <- objs[[i]]$data[, common, drop = FALSE]
+    d[[set]] <- nm[i]
+    d
+  }))
+  rownames(data) <- NULL
+  offset <- 0L
+  fold_id <- integer(0)
+  for (o in objs) {
+    fold_id <- c(fold_id, o$fold_id + offset)
+    offset <- offset + max(o$fold_id)
+  }
+  score <- unlist(lapply(objs, `[[`, "score"), use.names = FALSE)
+  yv <- unlist(lapply(objs, `[[`, "y"), use.names = FALSE)
+  dv <- unlist(lapply(objs, `[[`, "d"), use.names = FALSE)
+  nuisance <- do.call(rbind, lapply(objs, `[[`, "nuisance"))
+  residuals <- do.call(rbind, lapply(objs, `[[`, "residuals"))
+  rownames(nuisance) <- rownames(residuals) <- NULL
+  n <- length(score)
+  first <- objs[[1]]
+  structure(list(
+    score = score, nuisance = nuisance, residuals = residuals, y = yv, d = dv,
+    x = Reduce(union, lapply(objs, function(o) o$x)), y_name = first$y_name, d_name = first$d_name,
+    data = data, fold_id = fold_id, n = n, type = first$type,
+    ate = list(estimate = mean(score), std.error = stats::sd(score) / sqrt(n)),
+    learners = first$learners, outcome_type = first$outcome_type, p_clip = first$p_clip,
+    diagnostics = list(propensity = .cm_summary(nuisance$p), score = .cm_summary(score),
+                       sets = stats::setNames(vapply(objs, function(o) o$n, integer(1)), nm)),
+    sets = nm, call = match.call()
+  ), class = "cm_scores")
 }

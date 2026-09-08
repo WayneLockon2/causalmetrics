@@ -1,0 +1,1000 @@
+---
+title: "Replication: Deep Learning-Based Causal Inference for Large-Scale Combinatorial Experiments"
+subtitle: "Ye, Zhang, Zhang, Zhang, and Zhang (Management Science, 2025), with causalmetrics and PyTorch"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/04_Doubly_Robust_and_Double_ML/ye2025deep/"
+  ridge: 0.01
+  n_reps_appendix: 20
+  rerun_python: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_path <- file.path(pkg_root, "inst", "vignette_helpers", "04_Doubly_Robust_and_Double_ML", "dedl_helpers.R")
+  py_script <- file.path(pkg_root, "inst", "python", "dedl_nuisance.py")
+} else {
+  library(causalmetrics)
+  helper_path <- system.file("vignette_helpers", "04_Doubly_Robust_and_Double_ML", "dedl_helpers.R", package = "causalmetrics")
+  py_script <- system.file("python", "dedl_nuisance.py", package = "causalmetrics")
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+source(helper_path)
+data_path <- params$data_path
+derived <- file.path(data_path, "derived")
+dir.create(derived, showWarnings = FALSE)
+python <- find_python_torch()
+run_python <- nzchar(python) && nzchar(py_script)
+ridge_main <- params$ridge
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+fmt0 <- function(x) formatC(x, digits = 0, format = "f", big.mark = ",")
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+tvar <- c("is_DP", "is_LP", "is_FYP")
+dat <- read.csv(file.path(data_path, "empirics", "synthetic_data.csv"))
+xvar <- setdiff(names(dat), c(tvar, "y", "kfold"))
+key <- combo_key(dat[, tvar])
+dat$.row <- seq_len(nrow(dat))
+n_folds <- length(unique(dat$kfold))
+# the assignment distribution of the observed combinations in the paper's design
+t_dist_paper <- data.frame(combo_matrix(observed_cells), prob = 1 / length(observed_cells))
+names(t_dist_paper)[1:3] <- tvar
+# python runs are cached in `derived/`; delete the files (or set params$rerun_python) to retrain
+py_run <- function(output, args, history = NULL, epoch_theta = NULL, input = file.path(data_path, "empirics", "synthetic_data.csv")) {
+  if (!run_python && !file.exists(output)) stop("No Python with torch was found and no cached output exists: ", output)
+  run_dedl_python(python, py_script, input, output, args, history = history, epoch_theta = epoch_theta,
+                  rerun = params$rerun_python)
+}
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is how to estimate the effect of a combination of treatments
+that was never tested.** Large platforms run hundreds of A/B tests at once
+under orthogonal assignment, so every user sits in some combination of
+treatments, but only a few combinations have enough traffic to be measured on
+their own. The common practice adds up the single-treatment effects. Ye,
+Zhang, Zhang, Zhang, and Zhang (2025) show on a video platform that this
+linear addition can be badly wrong (their Figure 1), and propose a method,
+debiased deep learning (DeDL), that observes only $m + 2$ combinations of
+$m$ treatments and recovers the average treatment effect (ATE) of all $2^m$.
+
+The method has three parts.
+
+1. **A structured outcome model.** $E[Y \mid X = x, T = t] = G(\theta(x), t)$
+   with a known link $G$ and an unknown parameter function $\theta(x)$. Their
+   choice is the generalized sigmoid,
+   $G(\theta, t) = \theta_{m+1} / (1 + \exp(-(\theta_0 + \theta_1 t_1 + \dots + \theta_m t_m)))$,
+   which captures diminishing or increasing returns to combining treatments
+   user by user (their Theorem 1 shows it can approximate any ATE function as
+   the number of distinct covariate profiles grows). Two ReLU networks output
+   $\theta_0(x)$ and $(\theta_1, \dots, \theta_m)(x)$; the scale $\theta_{m+1}$
+   is one trained constant.
+2. **An influence function.** The plug-in estimator
+   $\frac{1}{n}\sum_i [G(\hat\theta(x_i), t) - G(\hat\theta(x_i), t_0)]$ inherits
+   the bias of the network. Following Farrell, Liang, and Misra (2020) they add
+   the Neyman-orthogonal correction (their Proposition 2),
+   $$
+   \psi_i(t) = H_i - H_{\theta,i}'\,\Lambda(x_i)^{-1}\,\ell_{\theta,i}, \qquad
+   H_i = G(\hat\theta_i, t) - G(\hat\theta_i, t_0),
+   $$
+   where $H_\theta$ is the gradient of $H$ in $\theta$,
+   $\Lambda(x) = 2\,E_\nu[G_\theta G_\theta' \mid x]$ averages the outer product of
+   the gradient over the *known* assignment distribution $\nu$ of the observed
+   combinations, and $\ell_\theta = 2 G_\theta(\hat\theta, \check t)(G(\hat\theta, \check t) - y)$
+   is the gradient of the squared loss at the realized treatment $\check t$.
+   The mean of $\psi_i(t)$ over a fold whose $\hat\theta$ was trained on the
+   other folds is root-$n$ normal (their Theorem 2).
+3. **Four-fold cross-fitting**, the best combination as the largest estimated
+   ATE, and the gap $\tau(t) = \mu(t^*) - \mu(t)$ with its own influence
+   function for best-treatment identification.
+
+Benchmarks: linear addition (LA), linear regression of $y$ on $(x, t)$ (LR), a
+pure network on $(x, t)$ (PDL), and the plug-in structured network without the
+correction (SDL). On the platform's data the "unobserved" combinations are in
+fact observed, so every estimator is scored against the ground truth with four
+metrics: the correct-direction ratio (sign and significance), MAPE, MSE, and
+MAE. DeDL wins on every metric (their Table 3), identifies the best
+combination (Table 4), and does so within demographic groups (Tables 5-6).
+Their Section 5 lists the implementation checkpoints: stratified sampling to
+balance covariates, an architecture and learning-rate search, a ridge on
+$\Lambda(x)$ before inversion, and the training error as the compass (Figure 7).
+
+**What this note does.** The platform data are proprietary. The authors ship a
+synthetic data set with the same structure, a 999-subgroup file for Figure 1,
+and a Keras notebook whose printed outputs are the numbers we match. We
+reproduce every table and figure of the empirical section in the published
+layout, using `est_dml_structured()` from `causalmetrics` for the influence
+function and inference and a PyTorch script for the network, then port the
+validation experiment of the paper's Appendix D. Two things are learned on the
+way: the correction term is unstable without a ridge (Section
+\@ref(sec-ridge)), and the authors' notebook departs from the paper's algorithm
+in ways that change the ranking of DeDL and SDL (Section \@ref(sec-variants)).
+
+# Data and ground truth {#sec-data}
+
+## The synthetic data
+
+The file has `r fmt0(nrow(dat))` users, the three treatment indicators, an
+outcome `y` scaled to $[0, 1]$, `r length(xvar)` covariates (10 standardized
+continuous usage variables and 77 dummies for operating system, activity,
+gender, age, location, follower and friend counts, and phone price tier), and a
+fold index. Unlike the paper's stratified sample, all eight combinations are
+present in every fold.
+
+```{r tab-cells, echo = FALSE}
+tibble(combo = key, fold = dat$kfold) %>%
+  count(combo, fold) %>%
+  pivot_wider(names_from = fold, values_from = n, names_prefix = "Fold ") %>%
+  mutate(combo = factor(combo, levels = paper_order),
+         observed = ifelse(combo %in% observed_cells, "Observable", "Unobservable")) %>%
+  arrange(combo) %>%
+  mutate(combo = combo_label(as.character(combo))) %>%
+  select(combo, observed, starts_with("Fold")) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Treatment combination", "Status in the exercise", paste("Fold", 1:4)),
+      caption = "Users per treatment combination and fold in the synthetic data. The exercise treats the last three combinations as unobserved.") %>%
+  tab_style()
+```
+
+## Figure 1: heterogeneous response to two experiments
+
+The paper's opening figure uses 1,254 subgroups of users defined by
+demographics and activity, each observed under all four combinations of two
+experiments (D and S). The released file has 999 subgroups with the mean
+outcome under (D,S), (\_,S), (D,\_), and (\_,\_). The left panel plots the true
+combined effect against the linear-additive prediction; the right panel the
+distribution of the percentage error of linear addition.
+
+```{r fig1, echo = FALSE, fig.height = 3.6, fig.cap = "Heterogeneous response to two experiments (paper's Figure 1). Left: true combined effect against the linear-additive effect by subgroup, with the 45-degree line (solid) and the no-intercept linear fit (dot-dash). Right: density of the percentage error of linear addition, trimmed to its 10 to 90 percent quantiles."}
+fig1_dat <- read.csv(file.path(data_path, "empirics", "Heterogeneous_Response_to_Two_Experiments.csv"))
+plot_figure1(fig1_dat)
+```
+
+```{r fig1-numbers, echo = FALSE}
+true_eff <- fig1_dat$app_DS - fig1_dat$app___
+la_eff <- fig1_dat$app__S + fig1_dat$app_D_ - 2 * fig1_dat$app___
+fig1_slope <- sum(true_eff * la_eff) / sum(true_eff^2)
+fig1_share_wrong_sign <- mean(sign(true_eff) != sign(la_eff))
+```
+
+The fitted slope is `r fmt(fig1_slope, 2)` rather than one, and linear addition
+gets the sign of the combined effect wrong in
+`r round(100 * fig1_share_wrong_sign)` percent of the subgroups. This is the
+motivation for a model of interactions.
+
+## Table 2: ground-truth ATEs
+
+With all eight cells observed, the ground truth is the difference in cell
+means against the baseline $(0, 0, 0)$. The authors test each difference with a
+pooled $t$-test when Levene's test does not reject equal variances and Welch's
+test otherwise; we do the same.
+
+```{r truth}
+truth <- ground_truth_table(dat$y, key)
+```
+
+```{r tab2, echo = FALSE}
+truth %>%
+  mutate(combo = combo_label(combo),
+         rel = ifelse(combo == "(0, 0, 0)", "0.000", paste0(fmt(100 * relative, 3), stars(p.value))),
+         obs = ifelse(combo %in% combo_label(observed_cells), "Observable", "Unobservable")) %>%
+  select(combo, rel, obs, n) %>%
+  mutate(n = fmt0(n)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, align = c("l", "r", "l", "r"),
+      col.names = c("Treatment combination $t'$", "Relative effect size, \\% (1)", "Observed or not (2)", "Number of users (3)"),
+      caption = "Ground-truth ATE and best treatment identification of eight treatment combinations (paper's Table 2, synthetic data). Relative effect size is the cell-mean difference against the baseline divided by the baseline mean. * $p<0.05$; ** $p<0.01$; *** $p<0.001$; **** $p<0.0001$.") %>%
+  tab_style() %>%
+  footnote(general = paste0("The optimal treatment combination is ", combo_label(truth$combo[which.max(truth$diff)]), "."),
+           general_title = "Note.", footnote_as_chunk = TRUE)
+```
+
+```{r truth-numbers, echo = FALSE}
+best_true <- truth$combo[which.max(truth$diff)]
+```
+
+The relative effects match the notebook's printed values (0.519, $-0.353$,
+$-0.358$, 0.149, $-0.585$, 0.332 for the first six non-baseline
+combinations). Every effect is significant at any conventional level, so the
+correct-direction ratio will only reward sign agreement, and the best
+combination is `r combo_label(best_true)`. The synthetic outcome is far less
+noisy than the platform's screen time: the paper's ground truth has two
+insignificant combinations and relative effects of one to two percent.
+
+# The structured model and its influence function {#sec-model}
+
+## Link function and gradients
+
+Write $u = \theta_0 + \theta' t$ and $s(u) = 1 / (1 + e^{-u})$. The generalized
+sigmoid is $G(\theta, t) = c\, s(u)$ with $c = \theta_{m+1}$, so
+$$
+G_\theta(\theta, t) = \big(c\,s(u)(1 - s(u)),\; c\,s(u)(1 - s(u))\,t',\; s(u)\big)',
+$$
+a vector of length $m + 2$. The plug-in contrast is
+$H = G(\theta, t) - G(\theta, t_0)$ and $H_\theta = G_\theta(\theta, t) - G_\theta(\theta, t_0)$.
+With the assignment distribution $\nu$ uniform over the five observed
+combinations, $\Lambda(x) = \frac{2}{5}\sum_{t \in \mathcal{T}^o} G_\theta(\theta(x), t) G_\theta(\theta(x), t)'$
+is a $5 \times 5$ matrix per user, a sum of five rank-one terms. It is
+invertible in principle but nearly singular for users whose sigmoid is
+saturated ($s(u)$ near 0 or 1), because then all but the last entry of
+$G_\theta$ are close to zero for every $t$. This is where the ridge of Section
+\@ref(sec-ridge) enters.
+
+## Why the correction removes first-order bias
+
+The plug-in $\frac{1}{n}\sum_i H_i$ has bias $E[H_\theta'(\hat\theta - \theta_0)]$
+to first order. The score $\ell_\theta$ has zero conditional mean at
+$\theta_0$ and derivative $E[\ell_{\theta\theta} \mid x] = \Lambda(x)$, so
+$E[\Lambda(x)^{-1}\ell_\theta(\hat\theta) \mid x] \approx \hat\theta(x) - \theta_0(x)$:
+the correction term estimates the nuisance error from the residuals and
+subtracts its first-order effect. This is the same Neyman orthogonality as in
+lecture 04, written for a parameter *function* rather than a scalar nuisance.
+Cross-fitting supplies the independence between $\hat\theta$ and the scored
+observations that the argument needs.
+
+## The package function
+
+`est_dml_structured()` takes the out-of-fold $\hat\theta$ matrix from any
+engine, the realized treatments, the target combinations, the link, the
+assignment distribution, and the fold index, and returns the influence
+functions, the fold-by-fold and pooled estimates, the plug-in estimates (SDL)
+from the same call, and the contrasts to the best combination. With the true
+$\theta$ the correction has mean zero and the estimator equals the plug-in
+contrast, which is the package's unit test. The first stage is
+`inst/python/dedl_nuisance.py`, a PyTorch script mirroring the authors' Keras
+architecture (two 3-layer, 20-node ReLU branches, a fixed sigmoid, a final
+linear layer without bias, Adam with learning rate $10^{-3}$, batch 128, 50
+epochs).
+
+# First stage: the structured network {#sec-first-stage}
+
+The paper trains on the five observed combinations of three folds and scores
+the fourth. The script does this for every fold in one call and writes
+$\hat\theta$ for every user out of fold; runs are cached in `derived/`.
+
+```{r first-stage, cache = TRUE, cache.extra = params$rerun_python}
+theta_paper <- py_run(
+  output = file.path(derived, "theta_paper.csv"),
+  history = file.path(derived, "history_paper.csv"),
+  args = c("--model structured --y y --t is_DP,is_LP,is_FYP --x-all-others --fold kfold",
+           "--train-cells 000,001,010,100,111 --arch two_branch --hidden 20 --depth 3",
+           "--epochs 50 --batch 128 --lr 0.001 --val-split 0.1 --seed 1")
+)
+stopifnot(all(theta_paper$.row == dat$.row))
+history_paper <- read.csv(file.path(derived, "history_paper.csv"))
+theta_cols <- c("theta_0", "theta_1", "theta_2", "theta_3", "theta_c")
+```
+
+```{r tab-first-stage, echo = FALSE}
+history_paper %>%
+  group_by(fold) %>%
+  summarise(epochs = max(epoch), train_mse = train_mse[epoch == max(epoch)], val_mse = val_mse[epoch == max(epoch)],
+            best_val = min(val_mse), .groups = "drop") %>%
+  left_join(theta_paper %>% group_by(fold) %>% summarise(n_scored = n(), c_hat = first(theta_c), .groups = "drop"), by = "fold") %>%
+  arrange(fold) %>%
+  mutate(across(c(train_mse, val_mse, best_val), ~ fmt(.x, 5)), c_hat = fmt(c_hat, 3), n_scored = fmt0(n_scored)) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Held-out fold", "Epochs", "Training MSE", "Validation MSE", "Best validation MSE", "Users scored", "$\\hat c$"),
+      escape = FALSE, caption = "First stage per fold: squared loss after 50 epochs on the training rows (five observed combinations of the other three folds) and on the 10 percent validation split, and the trained scale $\\hat c$.") %>%
+  tab_style()
+```
+
+```{r fig-history, echo = FALSE, fig.height = 3.2, fig.cap = "Validation mean squared error by epoch for the four cross-fitting networks."}
+ggplot(history_paper, aes(epoch, val_mse, colour = factor(fold))) +
+  geom_line(linewidth = 0.8) +
+  scale_y_log10() +
+  labs(x = "Epoch", y = "Validation MSE (log scale)", colour = "Held-out fold") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+The validation loss is still falling slowly at epoch 50 in every fold. The
+authors' Figure 7 and Section 5.3 make the point that the quality of this fit
+is the quality of everything that follows; Section \@ref(sec-epochs) reproduces
+that figure.
+
+# Second stage: DeDL and SDL {#sec-second-stage}
+
+## The ridge on $\Lambda(x)$ is not optional {#sec-ridge}
+
+We first run the influence function exactly as written, with no ridge, and
+then with the ridge the paper mentions in Section 5.2 (they report grid
+searching values such as 0.001, 0.01, and 1; the notebook uses 0.5).
+
+```{r ridge-grid, cache = TRUE, dependson = "first-stage"}
+theta_mat <- as.matrix(theta_paper[, theta_cols])
+ridge_grid <- c(0, 1e-3, 1e-2, 0.05, 0.1, 0.5, 1)
+ridge_res <- lapply(ridge_grid, function(r) {
+  fit <- est_dml_structured(theta_mat, dat$y, dat[, tvar], targets = paper_order[-1], t_dist = t_dist_paper,
+                            fold_id = dat$kfold, ridge = r, contrast_best = FALSE)
+  p <- fit$estimates[fit$estimates$fold == "pooled", ]
+  ape <- 100 * abs(p$estimate - truth$diff[-1]) / abs(truth$diff[-1])
+  ape_sdl <- 100 * abs(p$plugin - truth$diff[-1]) / abs(truth$diff[-1])
+  corr <- fit$psi - fit$plugin
+  data.frame(ridge = r, mape_all = mean(ape), mape_unobs = mean(ape[5:7]), sdl_all = mean(ape_sdl), sdl_unobs = mean(ape_sdl[5:7]),
+             max_corr = max(abs(corr)), share_large = mean(abs(corr) > 1), ill = fit$diagnostics$share_ill_conditioned)
+})
+ridge_tab <- bind_rows(ridge_res)
+```
+
+```{r tab-ridge, echo = FALSE}
+ridge_tab %>%
+  mutate(across(c(mape_all, mape_unobs, sdl_all, sdl_unobs), ~ fmt(.x, 2)),
+         max_corr = formatC(max_corr, digits = 2, format = "e"), share_large = fmt(100 * share_large, 2)) %>%
+  select(ridge, mape_all, mape_unobs, max_corr, share_large, sdl_all, sdl_unobs) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Ridge", "MAPE all, \\%", "MAPE unobserved, \\%", "Largest $|$correction$|$", "Share $|$correction$| > 1$, \\%", "SDL MAPE all, \\%", "SDL MAPE unobserved, \\%"),
+      escape = FALSE, caption = "Sensitivity of the DeDL estimates to the ridge added to $\\Lambda(x)$ before inversion. The SDL columns do not depend on the ridge.") %>%
+  tab_style() %>%
+  add_header_above(c(" " = 1, "DeDL" = 4, "SDL" = 2))
+```
+
+Without a ridge the estimator is useless: a handful of users with a saturated
+sigmoid have a nearly singular $\Lambda(x)$, their corrections run into the
+thousands, and the unobserved combinations' MAPE is in the tens of thousands
+of percent, while the plug-in is within two percent. A ridge of
+`r ridge_main` removes those users' leverage and leaves the correction
+elsewhere intact; larger ridges shrink the correction toward zero, and DeDL
+converges to SDL. The rest of the note uses `ridge = `r ridge_main``. This is
+the practical content of the paper's remark that "$\lambda(x)$ may be
+noninvertible for certain values of $x$".
+
+## Table 7: fold-by-fold estimates
+
+```{r dedl-main, cache = TRUE, dependson = "first-stage"}
+fit_dedl <- est_dml_structured(theta_mat, dat$y, dat[, tvar], targets = paper_order[-1], t_dist = t_dist_paper,
+                               fold_id = dat$kfold, ridge = ridge_main)
+fit_dedl
+# the plug-in (SDL) fold table from the same object
+plugin_table <- function(fit) {
+  crit <- qnorm(0.975)
+  folds <- sort(unique(fit$fold_id))
+  bind_rows(lapply(seq_along(fit$labels), function(k) {
+    fe <- sapply(folds, function(f) mean(fit$plugin[fit$fold_id == f, k]))
+    fs <- sapply(folds, function(f) sd(fit$plugin[fit$fold_id == f, k]) / sqrt(sum(fit$fold_id == f)))
+    bind_rows(data.frame(target = fit$labels[k], fold = as.character(folds), estimate = fe, std.error = fs,
+                         conf.low = fe - crit * fs, conf.high = fe + crit * fs),
+              data.frame(target = fit$labels[k], fold = "pooled", estimate = mean(fe), std.error = sqrt(sum(fs^2)) / length(folds),
+                         conf.low = mean(fe) - crit * sqrt(sum(fs^2)) / length(folds), conf.high = mean(fe) + crit * sqrt(sum(fs^2)) / length(folds)))
+  }))
+}
+sdl_tab <- plugin_table(fit_dedl)
+```
+
+```{r tab7, echo = FALSE}
+truth_lab <- truth %>% mutate(target = combo_label(combo))
+t7 <- fit_dedl$estimates %>%
+  left_join(truth_lab %>% select(target, truth_diff = diff, p.value), by = "target") %>%
+  mutate(low = ifelse(fold == "pooled", ci_low_avg, conf.low), high = ifelse(fold == "pooled", ci_high_avg, conf.high),
+         sig = p.value < 0.05,
+         ape = ifelse(sig, 100 * abs(estimate - truth_diff) / abs(truth_diff), NA),
+         se = ifelse(sig, (estimate - truth_diff)^2, NA), ae = ifelse(sig, abs(estimate - truth_diff), NA),
+         fold = ifelse(fold == "pooled", "Mean", fold),
+         truth_txt = paste0(fmt(truth_diff, 3), stars(p.value)),
+         ci = paste0("[", fmt(low, 3), ", ", fmt(high, 3), "]")) %>%
+  mutate(target = factor(target, levels = combo_label(paper_order[-1]))) %>%
+  arrange(target, fold) %>%
+  transmute(target = as.character(target), truth_txt, fold, estimate = fmt(estimate, 4), ci,
+            ape = ifelse(is.na(ape), "NA", fmt(ape, 2)), se = ifelse(is.na(se), "NA", formatC(se * 1e4, digits = 3, format = "f")),
+            ae = ifelse(is.na(ae), "NA", formatC(ae * 1e2, digits = 3, format = "f")))
+kbl(t7, booktabs = TRUE, linesep = "", escape = FALSE,
+    col.names = c("Treatment combination", "Ground-truth ATE (1)", "Fold (2)", "Estimated ATE (3)", "95\\% CI for ATE estimate (4)", "APE, \\% (5)", "SE $\\times 10^4$ (6)", "AE $\\times 10^2$ (7)"),
+    caption = "Detailed results of fourfold DeDL estimators (paper's Table 7 layout). Effects are in units of the scaled synthetic outcome; the Mean row averages the fold estimates and the fold confidence bounds, as in the paper. SE and AE are scaled by constants, as in the paper.") %>%
+  tab_style("scale_down") %>%
+  collapse_rows(columns = 1:2, valign = "top", latex_hline = "major")
+```
+
+```{r tab7-numbers, echo = FALSE}
+pooled_dedl <- fit_dedl$estimates %>% filter(fold == "pooled")
+pooled_sdl <- sdl_tab %>% filter(fold == "pooled")
+ape_pool <- 100 * abs(pooled_dedl$estimate - truth$diff[-1]) / abs(truth$diff[-1])
+fold_spread <- fit_dedl$estimates %>% filter(fold != "pooled") %>% group_by(target) %>%
+  summarise(sd = sd(estimate), mean_se = mean(std.error), .groups = "drop")
+```
+
+Fold estimates differ from each other by about as much as their standard
+errors: the standard deviation across the four fold estimates reaches
+`r fmt(max(fold_spread$sd), 3)` against fold standard errors of about
+`r fmt(mean(fold_spread$mean_se), 3)`, because each fold's network is a
+different random fit. Averaging over folds is what makes the final estimate
+usable, and the paper's convention of averaging the fold confidence bounds,
+rather than combining them as independent estimates, is a conservative
+acknowledgement of that.
+
+## Figure 5: DeDL against SDL
+
+```{r fig5, echo = FALSE, fig.height = 3.8, fig.cap = "Detailed comparison between the SDL and DeDL estimators (paper's Figure 5 layout): ground-truth effect with its confidence interval, DeDL, and SDL, for the seven non-baseline combinations. Bars are 95 percent intervals."}
+plot_figure5(truth, pooled_dedl %>% transmute(combo = paper_order[-1], estimate, conf.low, conf.high),
+             pooled_sdl %>% transmute(combo = paper_order[-1], estimate, conf.low, conf.high))
+```
+
+On the synthetic data the two estimators are close and both track the truth;
+the DeDL intervals are wider than the SDL intervals because the correction
+term adds variance, which is the price of removing the network's bias. (The
+ground-truth bars use the standard error of the cell-mean difference; the
+notebook scales the cell standard deviation by a normal quantile of the
+$p$-value, which is not an interval.) The paper's platform data show the SDL
+intervals to be too narrow; here, with a nearly noiseless synthetic outcome,
+the plug-in is already accurate.
+
+# Benchmarks and metrics {#sec-benchmarks}
+
+## LA, LR, and PDL
+
+Linear addition uses the cell means of the full data. Linear regression is
+fitted on the training rows of each fold (observed combinations only) and
+evaluated on the held-out fold; the pure network is trained the same way by
+the script with a 3-layer, 32-node ReLU architecture on $(x, t)$. Both report
+the mean contrast of predicted outcomes, with the authors' inference: the
+standard deviation of the row-wise contrast over $\sqrt{n}$ and a Welch test
+between the two prediction vectors.
+
+```{r benchmarks, cache = TRUE, dependson = "first-stage"}
+la_tab <- la_estimator(dat$y, key)
+lr_folds <- lapply(sort(unique(dat$kfold)), function(f) {
+  train <- dat[dat$kfold != f & key %in% observed_cells, ]
+  lr_estimator(train, dat[dat$kfold == f, ], "y", tvar, xvar)
+})
+average_folds <- function(tabs) {
+  bind_rows(tabs, .id = "fold") %>%
+    group_by(combo) %>%
+    summarise(estimate = mean(estimate), conf.low = mean(conf.low), conf.high = mean(conf.high),
+              std.error = mean(std.error), p.value = max(p.value), .groups = "drop") %>%
+    mutate(combo = factor(combo, levels = paper_order)) %>% arrange(combo) %>% mutate(combo = as.character(combo))
+}
+lr_tab <- average_folds(lapply(lr_folds, `[[`, "table"))
+pdl_paper <- py_run(
+  output = file.path(derived, "pdl_paper.csv"),
+  args = c("--model pure --y y --t is_DP,is_LP,is_FYP --x-all-others --fold kfold",
+           "--train-cells 000,001,010,100,111 --hidden 32 --depth 3 --epochs 50 --batch 128 --lr 0.001 --seed 1")
+)
+pdl_folds <- lapply(sort(unique(pdl_paper$fold)), function(f) pdl_estimator(pdl_paper[pdl_paper$fold == f, ]))
+pdl_tab <- average_folds(lapply(pdl_folds, `[[`, "table"))
+dedl_tab <- pooled_dedl %>% transmute(combo = paper_order[-1], estimate, std.error, conf.low = ci_low_avg, conf.high = ci_high_avg) %>%
+  bind_rows(data.frame(combo = "000", estimate = 0, std.error = 0, conf.low = 0, conf.high = 0), .)
+sdl_tab2 <- pooled_sdl %>% transmute(combo = paper_order[-1], estimate, std.error, conf.low, conf.high) %>%
+  bind_rows(data.frame(combo = "000", estimate = 0, std.error = 0, conf.low = 0, conf.high = 0), .)
+estimators <- list(LA = la_tab, LR = lr_tab, PDL = pdl_tab, SDL = sdl_tab2, DeDL = dedl_tab)
+tab3 <- metrics_table(estimators, truth)
+```
+
+## Table 3: comparison of the estimators of the ATE
+
+```{r tab3, echo = FALSE}
+notebook_tab3 <- data.frame(
+  estimator = c("LA", "LR", "PDL", "SDL", "DeDL"),
+  nb_mape_u = c(166.67, 21.99, 3.87, 1.95, 6.16), nb_mape = c(62.84, 24.89, 5.98, 2.79, 9.04))
+tab3 %>%
+  left_join(notebook_tab3, by = "estimator") %>%
+  mutate(across(c(mape_u, mape), ~ fmt(.x, 2)), across(c(mse_u, mse), ~ formatC(.x * 1e4, digits = 3, format = "f")),
+         across(c(mae_u, mae), ~ formatC(.x * 1e2, digits = 3, format = "f")), across(c(nb_mape_u, nb_mape), ~ fmt(.x, 2))) %>%
+  select(estimator, cdr_u, mape_u, mse_u, mae_u, nb_mape_u, cdr, mape, mse, mae, nb_mape) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Estimator", "CDRu (1)", "MAPEu, \\% (2)", "MSEu $\\times 10^4$ (3)", "MAEu $\\times 10^2$ (4)", "Notebook MAPEu, \\%",
+                    "CDR (5)", "MAPE, \\% (6)", "MSE $\\times 10^4$ (7)", "MAE $\\times 10^2$ (8)", "Notebook MAPE, \\%"),
+      caption = "Comparison of different estimators of the ATE (paper's Table 3 layout) on the synthetic data, with the MAPE printed by the authors' notebook next to ours. MSE and MAE are scaled by constants, as in the paper.") %>%
+  tab_style("scale_down") %>%
+  add_header_above(c(" " = 1, "Unobserved treatment combinations" = 5, "All treatment combinations" = 5))
+```
+
+```{r tab3-numbers, echo = FALSE}
+rank_u <- tab3$estimator[order(tab3$mape_u)]
+g3 <- function(e, col) fmt(tab3[[col]][tab3$estimator == e], 1)
+```
+
+On the unobserved combinations the ranking is
+`r paste(rank_u, collapse = ", ")`. Linear addition misses by
+`r g3("LA", "mape_u")` percent because the synthetic interactions are strong;
+linear regression by `r g3("LR", "mape_u")` percent because it cannot bend;
+the pure network by `r g3("PDL", "mape_u")` percent because it never saw
+those combinations and must extrapolate without structure, which is the
+paper's argument for a link function. The two structured estimators are
+within two percent, DeDL at `r g3("DeDL", "mape_u")` and SDL at
+`r g3("SDL", "mape_u")`; they are close because the plug-in is already nearly
+unbiased on this nearly noiseless outcome. Three of the notebook's columns
+are not comparable: its linear addition mis-indexes the single effects (it
+adds the effects of $(0,0,1)$ and $(0,1,0)$ for the combination $(1,1,0)$,
+and so on), its pure network is trained on all eight cells, and its DeDL
+departs from Algorithm 1 (Section \@ref(sec-variants)).
+
+## Table 4: best-treatment identification
+
+Each estimator names its best combination as the largest estimated ATE and
+reports the gap $\tau(t)$ to every other combination. DeDL and SDL use the
+difference of their influence functions (the package's `contrasts`), LA adds
+variances, LR and PDL difference their predicted outcomes with a Welch test.
+The ground truth is the gap in cell means, tested cell against cell.
+
+```{r tab4, cache = TRUE, dependson = "benchmarks"}
+truth_tau <- {
+  yb <- dat$y[key == best_true]
+  do.call(rbind, lapply(paper_order, function(cc) {
+    yt <- dat$y[key == cc]
+    data.frame(combo = cc, diff = mean(yb) - mean(yt), p.value = if (cc == best_true) 1 else t.test(yb, yt)$p.value)
+  }))
+}
+contrast_from_predictions <- function(pred_list, tab) {
+  best <- tab$combo[which.max(tab$estimate)]
+  bind_rows(lapply(pred_list, function(P) {
+    do.call(rbind, lapply(paper_order, function(cc) {
+      d <- P[, best] - P[, cc]
+      data.frame(combo = cc, estimate = mean(d), std.error = sd(d) / sqrt(length(d)),
+                 p.value = if (cc == best) 1 else t.test(P[, best], P[, cc])$p.value)
+    }))
+  }), .id = "fold") %>% group_by(combo) %>%
+    summarise(estimate = mean(estimate), std.error = mean(std.error), p.value = max(p.value), .groups = "drop") %>%
+    mutate(conf.low = estimate - 1.96 * std.error, conf.high = estimate + 1.96 * std.error)
+}
+tau_lr <- contrast_from_predictions(lapply(lr_folds, `[[`, "predictions"), lr_tab)
+tau_pdl <- contrast_from_predictions(lapply(pdl_folds, `[[`, "predictions"), pdl_tab)
+tau_la <- {
+  b <- which.max(la_tab$estimate)
+  la_tab %>% transmute(combo, estimate = la_tab$estimate[b] - estimate,
+                       std.error = sqrt(la_tab$std.error[b]^2 + std.error^2),
+                       conf.low = estimate - 1.96 * std.error, conf.high = estimate + 1.96 * std.error)
+}
+tau_dedl <- fit_dedl$contrasts %>% filter(fold == "pooled") %>%
+  transmute(combo = paper_order[-1], estimate, std.error, conf.low, conf.high) %>%
+  bind_rows(data.frame(combo = "000", estimate = pooled_dedl$estimate[which.max(pooled_dedl$estimate)],
+                       std.error = pooled_dedl$std.error[which.max(pooled_dedl$estimate)]) %>%
+              mutate(conf.low = estimate - 1.96 * std.error, conf.high = estimate + 1.96 * std.error), .)
+fit_sdl_contrast <- {
+  kb <- which.max(pooled_sdl$estimate)
+  d <- fit_dedl$plugin[, kb] - fit_dedl$plugin
+  folds <- sort(unique(fit_dedl$fold_id))
+  bind_rows(lapply(seq_along(fit_dedl$labels), function(k) {
+    fe <- sapply(folds, function(f) mean(d[fit_dedl$fold_id == f, k]))
+    fs <- sapply(folds, function(f) sd(d[fit_dedl$fold_id == f, k]) / sqrt(sum(fit_dedl$fold_id == f)))
+    data.frame(combo = paper_order[-1][k], estimate = mean(fe), std.error = sqrt(sum(fs^2)) / length(folds))
+  })) %>% mutate(conf.low = estimate - 1.96 * std.error, conf.high = estimate + 1.96 * std.error)
+}
+tau_sdl <- bind_rows(data.frame(combo = "000", estimate = pooled_sdl$estimate[which.max(pooled_sdl$estimate)],
+                                std.error = pooled_sdl$std.error[which.max(pooled_sdl$estimate)]) %>%
+                       mutate(conf.low = estimate - 1.96 * std.error, conf.high = estimate + 1.96 * std.error), fit_sdl_contrast)
+order_tau <- function(t) t[match(paper_order, t$combo), ]
+tab4 <- bind_rows(lapply(list(LA = tau_la, LR = tau_lr, PDL = tau_pdl, SDL = tau_sdl, DeDL = tau_dedl), function(t) {
+  combo_metrics(order_tau(t), truth_tau)
+}), .id = "estimator")
+best_named <- c(LA = la_tab$combo[which.max(la_tab$estimate)], LR = lr_tab$combo[which.max(lr_tab$estimate)],
+                PDL = pdl_tab$combo[which.max(pdl_tab$estimate)], SDL = paper_order[-1][which.max(pooled_sdl$estimate)],
+                DeDL = paper_order[-1][which.max(pooled_dedl$estimate)])
+```
+
+```{r tab4-print, echo = FALSE}
+notebook_tab4 <- c(LA = 127.79, LR = 19.75, PDL = 3.16, SDL = 1.87, DeDL = 1.69)
+tab4 %>%
+  mutate(best = combo_label(best_named[estimator]), nb = fmt(notebook_tab4[estimator], 2),
+         mape = fmt(mape, 2), mse = formatC(mse * 1e4, digits = 3, format = "f"), mae = formatC(mae * 1e2, digits = 3, format = "f")) %>%
+  select(estimator, best, cdr, mape, mse, mae, nb) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Estimator", "Identified best", "CDR (1)", "MAPE, \\% (2)", "MSE $\\times 10^4$ (3)", "MAE $\\times 10^2$ (4)", "Notebook MAPE, \\%"),
+      caption = paste0("Comparison of different estimators of best treatment identification (paper's Table 4 layout). The true best combination is ",
+                       combo_label(best_true), ". Metrics compare the estimated gap to the best combination with the ground-truth gap over all eight combinations.")) %>%
+  tab_style()
+```
+
+# Conditional effects by demographic group {#sec-cate}
+
+The paper splits users by residence (rural or not) and phone price tier. The
+synthetic data do not carry that cross, so the notebook, and we, use the four
+groups defined by `gender_M` and `feed_model_1`. The group CATE of DeDL and
+SDL is the group mean of the influence functions, the LR and PDL CATEs are
+group means of the predicted contrasts, and the LA CATE adds the group's
+single-treatment cell effects. The ground truth is the group's cell means. As
+in the notebook's Table 5 code, MAPE here averages over all non-baseline
+combinations without dropping insignificant ones.
+
+```{r cate, cache = TRUE, dependson = "tab4"}
+grp <- paste0("G", 1 + 2 * dat$gender_M + dat$feed_model_1)
+grp_names <- c(G1 = "female, feed model 2", G2 = "female, feed model 1", G3 = "male, feed model 2", G4 = "male, feed model 1")
+lr_pred_all <- do.call(rbind, lapply(seq_along(lr_folds), function(i) {
+  data.frame(.row = dat$.row[dat$kfold == sort(unique(dat$kfold))[i]], lr_folds[[i]]$predictions)
+})) %>% arrange(.row)
+pdl_pred_all <- do.call(rbind, lapply(seq_along(pdl_folds), function(i) {
+  data.frame(.row = pdl_paper$.row[pdl_paper$fold == sort(unique(pdl_paper$fold))[i]], pdl_folds[[i]]$predictions)
+})) %>% arrange(.row)
+cate_group <- function(g) {
+  rows <- grp == g
+  tr <- ground_truth_table(dat$y[rows], key[rows])
+  la <- la_estimator(dat$y[rows], key[rows])$estimate
+  dedl <- c(0, colMeans(fit_dedl$psi[rows, ]))
+  sdl <- c(0, colMeans(fit_dedl$plugin[rows, ]))
+  lr <- colMeans(as.matrix(lr_pred_all[rows, paste0("X", paper_order)]) - lr_pred_all[rows, "X000"])
+  pdl <- colMeans(as.matrix(pdl_pred_all[rows, paste0("X", paper_order)]) - pdl_pred_all[rows, "X000"])
+  list(n = sum(rows), truth = tr$diff, est = list(LA = la, LR = lr, PDL = pdl, SDL = sdl, DeDL = dedl))
+}
+cate_res <- lapply(sort(unique(grp)), cate_group)
+names(cate_res) <- sort(unique(grp))
+cate_metrics <- bind_rows(lapply(names(cate_res), function(g) {
+  r <- cate_res[[g]]
+  bind_rows(lapply(names(r$est), function(e) {
+    err <- r$est[[e]] - r$truth
+    idx_all <- 2:8; idx_u <- 6:8
+    data.frame(group = g, n = r$n, estimator = e,
+               mape_u = 100 * mean(abs(err[idx_u] / r$truth[idx_u])), mse_u = mean(err[idx_u]^2), mae_u = mean(abs(err[idx_u])),
+               mape = 100 * mean(abs(err[idx_all] / r$truth[idx_all])), mse = mean(err[idx_all]^2), mae = mean(abs(err[idx_all])))
+  }))
+}))
+tab5 <- cate_metrics %>% group_by(estimator) %>%
+  summarise(across(c(mape_u, mse_u, mae_u, mape, mse, mae), ~ weighted.mean(.x, n)), .groups = "drop") %>%
+  mutate(estimator = factor(estimator, levels = c("LA", "LR", "PDL", "SDL", "DeDL"))) %>% arrange(estimator)
+```
+
+```{r tab5, echo = FALSE}
+tab5 %>%
+  mutate(across(c(mape_u, mape), ~ fmt(.x, 2)), across(c(mse_u, mse), ~ formatC(.x * 1e4, digits = 3, format = "f")),
+         across(c(mae_u, mae), ~ formatC(.x * 1e2, digits = 3, format = "f"))) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Estimator", "MAPEu, \\% (1)", "MSEu $\\times 10^4$ (2)", "MAEu $\\times 10^2$ (3)", "MAPE, \\% (4)", "MSE $\\times 10^4$ (5)", "MAE $\\times 10^2$ (6)"),
+      caption = "Comparison of different estimators of the CATE (paper's Table 5 layout): group-size-weighted averages over the four demographic groups.") %>%
+  tab_style() %>%
+  add_header_above(c(" " = 1, "Unobserved treatment combinations" = 3, "All treatment combinations" = 3))
+```
+
+```{r tab6, echo = FALSE}
+sizes <- sapply(cate_res, `[[`, "n")
+t6 <- cate_metrics %>%
+  mutate(estimator = factor(estimator, levels = c("LA", "LR", "PDL", "SDL", "DeDL"))) %>%
+  select(group, estimator, mape_u, mape) %>%
+  pivot_longer(c(mape_u, mape), names_to = "set", values_to = "mape") %>%
+  mutate(set = ifelse(set == "mape_u", "Unobserved treatment combinations", "All treatment combinations"),
+         set = factor(set, levels = c("Unobserved treatment combinations", "All treatment combinations"))) %>%
+  pivot_wider(names_from = group, values_from = mape) %>%
+  arrange(set, estimator) %>%
+  mutate(across(starts_with("G"), ~ fmt(.x, 2)))
+kbl(t6 %>% mutate(set = as.character(set)), booktabs = TRUE, linesep = "", escape = FALSE,
+    col.names = c("", "Estimator", paste0(names(sizes), ", \\% (", fmt0(sizes), ")")),
+    caption = paste0("MAPE comparison of different estimators of the CATE for four groups (paper's Table 6 layout). Groups: ",
+                     paste0(names(grp_names), " = ", grp_names, collapse = "; "), ". Group sizes in parentheses.")) %>%
+  tab_style() %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+```
+
+```{r cate-numbers, echo = FALSE}
+best_cate <- tab5$estimator[which.min(tab5$mape)]
+```
+
+Within groups the structured estimators keep their advantage over LA and LR;
+`r as.character(best_cate)` ranks first on the size-weighted MAPE. Group G2
+has near-zero true effects for some combinations, so every estimator's
+percentage error there is large; the notebook's Table 6 shows the same
+group with errors above 100 percent. The notebook's Table 5 code reports
+only the last group's metrics (its loop overwrites the earlier groups), so
+its printed SDL and DeDL values, 0.88 and 0.76 percent for the unobserved
+combinations, correspond to our G4 column.
+
+# Implementation lessons {#sec-lessons}
+
+## Figure 7: the training error as the compass {#sec-epochs}
+
+The paper's Figure 7 retrains the fold-1 network at learning rate $10^{-4}$
+and evaluates DeDL and SDL after every epoch. The script writes $\hat\theta$
+for the held-out fold after each epoch; `est_dml_structured()` is then called
+fifty times.
+
+```{r epochs, cache = TRUE, dependson = "benchmarks"}
+split_file <- file.path(derived, "synthetic_fold1_split.csv")
+if (!file.exists(split_file)) {
+  write.csv(dat %>% select(-.row) %>% mutate(split = ifelse(kfold == 1, "pred", "train")), split_file, row.names = FALSE)
+}
+theta_final <- py_run(
+  input = split_file, output = file.path(derived, "theta_epochs_final.csv"),
+  history = file.path(derived, "history_epochs.csv"), epoch_theta = file.path(derived, "theta_epochs.csv.gz"),
+  args = c("--model structured --y y --t is_DP,is_LP,is_FYP --x-all-others --train-col split --train-value train",
+           "--train-cells 000,001,010,100,111 --arch two_branch --hidden 20 --depth 3",
+           "--epochs 50 --batch 128 --lr 0.0001 --val-split 0.1 --seed 10234")
+)
+theta_epochs <- read.csv(gzfile(file.path(derived, "theta_epochs.csv.gz")))
+# one-split runs score every row; keep the held-out fold only
+theta_epochs <- theta_epochs[theta_epochs$.row %in% which(dat$kfold == 1), ]
+history_epochs <- read.csv(file.path(derived, "history_epochs.csv"))
+rows1 <- which(dat$kfold == 1)
+lr_mape_fold1 <- combo_metrics(lr_folds[[1]]$table[-1, ], truth[-1, ])$mape
+epoch_curve <- bind_rows(lapply(sort(unique(theta_epochs$epoch)), function(e) {
+  te <- theta_epochs[theta_epochs$epoch == e, ]
+  stopifnot(all(te$.row == rows1))
+  f <- est_dml_structured(as.matrix(te[, theta_cols]), dat$y[rows1], dat[rows1, tvar], targets = paper_order[-1],
+                          t_dist = t_dist_paper, ridge = ridge_main, contrast_best = FALSE)
+  p <- f$estimates[f$estimates$fold == "pooled", ]
+  data.frame(epoch = e,
+             mape_dedl = mean(100 * abs(p$estimate - truth$diff[-1]) / abs(truth$diff[-1])),
+             mape_sdl = mean(100 * abs(p$plugin - truth$diff[-1]) / abs(truth$diff[-1])))
+})) %>% left_join(history_epochs %>% select(epoch, val_mse), by = "epoch") %>% mutate(mape_lr = lr_mape_fold1)
+```
+
+```{r fig7, echo = FALSE, fig.height = 3.8, fig.cap = "MAPE comparison with the training epoch (paper's Figure 7 layout): validation MSE of the fold-1 network (left axis) and the MAPE over all combinations of DeDL, SDL, and linear regression (right axis) after each epoch."}
+plot_figure7(epoch_curve)
+```
+
+```{r epochs-numbers, echo = FALSE}
+first_better <- epoch_curve$epoch[which(epoch_curve$mape_dedl < epoch_curve$mape_lr)[1]]
+end_curve <- epoch_curve[nrow(epoch_curve), ]
+```
+
+At the slow learning rate the network is poorly trained for the first epochs
+and both structured estimators are worse than linear regression; DeDL falls
+below the LR line at epoch `r first_better` and ends at
+`r fmt(end_curve$mape_dedl, 2)` percent against `r fmt(end_curve$mape_sdl, 2)`
+for SDL. The paper's message is that the validation loss is the only observable
+guide to whether the first stage is good enough for debiasing to help, and
+that when the fit is poor, debiasing does not rescue it.
+
+## The authors' notebook against the paper's algorithm {#sec-variants}
+
+The released notebook differs from Algorithm 1 in four places.
+
+1. It trains on all rows of the three training folds, so the "unobserved"
+   combinations are in the training data.
+2. The shares in $\Lambda(x)$ are taken from the first five rows of a
+   groupby over all eight cells, in sorted order, which are not the five
+   observed combinations and sum to about 5/8.
+3. The factor 2 in $\Lambda(x)$ is dropped and a ridge of 0.5 is added.
+4. The DeDL row of Table 3 concatenates fold 4 four times.
+
+The next table isolates these choices with the same `est_dml_structured()`
+call. The notebook's $\Lambda$ is reproduced by passing its shares halved as
+weights (the function's factor 2 cancels the missing one) and its ridge.
+
+```{r variants, cache = TRUE, dependson = "dedl-main"}
+theta_all <- py_run(
+  output = file.path(derived, "theta_allcells.csv"), history = file.path(derived, "history_allcells.csv"),
+  args = c("--model structured --y y --t is_DP,is_LP,is_FYP --x-all-others --fold kfold",
+           "--arch two_branch --hidden 20 --depth 3 --epochs 50 --batch 128 --lr 0.001 --val-split 0.1 --seed 1")
+)
+theta_all_mat <- as.matrix(theta_all[, theta_cols])
+shares_sorted <- prop.table(table(key))[c("000", "001", "010", "011", "100")]
+t_dist_notebook <- data.frame(combo_matrix(c("000", "001", "100", "010", "111")), prob = as.numeric(shares_sorted) / 2)
+names(t_dist_notebook)[1:3] <- tvar
+variant_mape <- function(theta, t_dist, ridge) {
+  f <- suppressWarnings(est_dml_structured(theta, dat$y, dat[, tvar], targets = paper_order[-1], t_dist = t_dist,
+                                           fold_id = dat$kfold, ridge = ridge, contrast_best = FALSE))
+  p <- f$estimates[f$estimates$fold == "pooled", ]
+  ape <- 100 * abs(p$estimate - truth$diff[-1]) / abs(truth$diff[-1]); aps <- 100 * abs(p$plugin - truth$diff[-1]) / abs(truth$diff[-1])
+  c(dedl_all = mean(ape), dedl_u = mean(ape[5:7]), sdl_all = mean(aps), sdl_u = mean(aps[5:7]))
+}
+variants <- bind_rows(
+  data.frame(variant = "Paper: observed cells, uniform shares, factor 2, ridge 0.01", t(variant_mape(theta_mat, t_dist_paper, ridge_main))),
+  data.frame(variant = "Paper design with the notebook's ridge 0.5", t(variant_mape(theta_mat, t_dist_paper, 0.5))),
+  data.frame(variant = "Notebook: all cells in training, uniform shares, factor 2, ridge 0.01", t(variant_mape(theta_all_mat, t_dist_paper, ridge_main))),
+  data.frame(variant = "Notebook: all cells, misaligned shares, no factor 2, ridge 0.5", t(variant_mape(theta_all_mat, t_dist_notebook, 0.5)))
+)
+pdl_all <- py_run(
+  output = file.path(derived, "pdl_allcells.csv"),
+  args = c("--model pure --y y --t is_DP,is_LP,is_FYP --x-all-others --fold kfold",
+           "--hidden 32 --depth 3 --epochs 50 --batch 128 --lr 0.001 --seed 1")
+)
+pdl_all_tab <- average_folds(lapply(sort(unique(pdl_all$fold)), function(f) pdl_estimator(pdl_all[pdl_all$fold == f, ])$table))
+pdl_all_metrics <- metrics_table(list(PDL = pdl_all_tab), truth)
+```
+
+```{r tab-variants, echo = FALSE}
+variants %>%
+  mutate(across(-variant, ~ fmt(.x, 2))) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Variant", "DeDL, all", "DeDL, unobserved", "SDL, all", "SDL, unobserved"),
+      caption = "MAPE (percent) of DeDL and SDL under the paper's algorithm and under the notebook's departures from it.") %>%
+  tab_style() %>%
+  column_spec(1, width = "7.5cm") %>%
+  add_header_above(c(" " = 1, "MAPE, %" = 4))
+```
+
+```{r variants-numbers, echo = FALSE}
+v <- variants
+```
+
+Training on all cells improves the plug-in on the unobserved combinations
+(they are no longer unobserved), which is why the notebook's SDL looks so
+good, and the heavy ridge with the misaligned shares shrinks the correction,
+which is why its DeDL cannot improve on SDL. The same holds for the pure
+network: trained on all cells it reaches a MAPE of
+`r fmt(pdl_all_metrics$mape, 2)` percent over all combinations and
+`r fmt(pdl_all_metrics$mape_u, 2)` on the "unobserved" ones (the notebook
+prints 5.98 and 3.87), against `r g3("PDL", "mape")` and
+`r g3("PDL", "mape_u")` when it must extrapolate. Under the paper's own
+algorithm, with a small ridge, DeDL has MAPE `r fmt(v$dedl_u[1], 2)` percent
+on the unobserved combinations against `r fmt(v$sdl_u[1], 2)` for SDL.
+
+# Appendix D: synthetic experiments {#sec-appendix-d}
+
+The paper's Appendix D validates DeDL on simulated combinatorial experiments.
+We port the base design: $m = 4$ experiments, $d_c = 10$ uniform covariates,
+outcome $c / (1 + \exp(-(\beta(x)'\tilde t))) + \varepsilon$ with
+$\beta(x) = (x'C)^3$, $\tilde t = (1, t')'$, $C$ uniform on $[-0.5, 0.5]$, $c$
+uniform on $[10, 20]$, uniform noise of $\pm 0.05$, six observed combinations
+(baseline, four singles, and $(1, 1, 0, 0)$) each with probability $1/6$,
+2,000 training and 2,000 estimation users per replication. The network is
+the appendix's single-branch one (one hidden layer of 10 ReLU units, outputs
+$\theta_0, \dots, \theta_4$, sigmoid, trained scale initialized at the
+maximum outcome), full-batch Adam at learning rate 0.05 for 2,000 epochs,
+restarted up to five times when the validation MSE exceeds 0.3. The
+estimators are LA, LR, SDL, and DeDL, scored on the estimation users against
+the true ATE function.
+
+```{r appendix-d, cache = TRUE, cache.extra = params$n_reps_appendix}
+n_reps <- params$n_reps_appendix
+designs <- lapply(seq_len(n_reps), function(r) appendix_d_design(seed = 100 + r))
+appd_long <- bind_rows(lapply(seq_len(n_reps), function(r) {
+  bind_rows(designs[[r]]$train %>% mutate(split = "train"), designs[[r]]$est %>% mutate(split = "est")) %>% mutate(rep = r)
+}))
+appd_in <- file.path(derived, "appd_in.csv")
+if (!file.exists(appd_in) || params$rerun_python) write.csv(appd_long, appd_in, row.names = FALSE)
+appd_theta <- py_run(
+  input = appd_in, output = file.path(derived, "appd_theta.csv"), history = file.path(derived, "appd_history.csv"),
+  args = c("--model structured --y y --t t1,t2,t3,t4 --x x1,x2,x3,x4,x5,x6,x7,x8,x9,x10 --group rep --train-col split --train-value train",
+           "--arch single --hidden 10 --depth 1 --epochs 2000 --batch 0 --lr 0.05 --val-split 0.3 --restarts 5 --val-threshold 0.3 --c-init max_y --seed 1")
+)
+appd_results <- bind_rows(lapply(seq_len(n_reps), function(r) {
+  des <- designs[[r]]
+  est_rows <- which(appd_long$rep == r & appd_long$split == "est")
+  th <- appd_theta[match(est_rows, appd_theta$.row), ]
+  theta <- as.matrix(th[, c("theta_0", paste0("theta_", 1:4), "theta_c")])
+  tv <- paste0("t", 1:4)
+  keys <- des$truth_keys
+  obs_keys <- combo_key(des$obs_t)
+  truth_r <- data.frame(combo = keys, diff = des$truth, p.value = ifelse(keys == "0000", 1, 0))
+  tdist <- data.frame(des$obs_t, prob = 1 / nrow(des$obs_t))
+  fit <- est_dml_structured(theta, des$est$y, des$est[, tv], targets = des$all_t[-1, ], t_dist = tdist, ridge = ridge_main, contrast_best = FALSE)
+  p <- fit$estimates[fit$estimates$fold == "pooled", ]
+  crit <- qnorm(0.975)
+  dedl <- data.frame(combo = keys, estimate = c(0, p$estimate), conf.low = c(0, p$conf.low), conf.high = c(0, p$conf.high))
+  sdl_se <- apply(fit$plugin, 2, sd) / sqrt(nrow(fit$plugin))
+  sdl <- data.frame(combo = keys, estimate = c(0, p$plugin), conf.low = c(0, p$plugin - crit * sdl_se), conf.high = c(0, p$plugin + crit * sdl_se))
+  # linear addition from the estimation sample's observed cells
+  ekey <- combo_key(des$est[, tv])
+  cell <- function(k) { v <- des$est$y[ekey == k]; c(mean = mean(v), var = var(v) / length(v)) }
+  b <- cell("0000")
+  la <- do.call(rbind, lapply(keys, function(k) {
+    bits <- as.numeric(strsplit(k, "")[[1]])
+    if (k %in% obs_keys && k != "0000") { s <- cell(k); est <- s["mean"] - b["mean"]; vr <- s["var"] + b["var"] }
+    else if (k == "0000") { est <- 0; vr <- 0 }
+    else { singles <- c("1000", "0100", "0010", "0001")[bits == 1]; est <- sum(sapply(singles, function(s) cell(s)["mean"] - b["mean"])); vr <- sum(sapply(singles, function(s) cell(s)["var"] + b["var"])) }
+    data.frame(combo = k, estimate = unname(est), conf.low = unname(est) - crit * sqrt(unname(vr)), conf.high = unname(est) + crit * sqrt(unname(vr)))
+  }))
+  lr <- lr_estimator(des$train, des$est, "y", tv, paste0("x", 1:10), combos = keys)$table
+  ests <- list(LA = la, LR = lr, SDL = sdl, DeDL = dedl)
+  unobs <- setdiff(keys, obs_keys)
+  bind_rows(lapply(names(ests), function(e) {
+    tab <- ests[[e]][match(keys, ests[[e]]$combo), ]
+    mu <- combo_metrics(tab[keys %in% unobs, ], truth_r[keys %in% unobs, ])
+    ma <- combo_metrics(tab[keys != "0000", ], truth_r[keys != "0000", ])
+    data.frame(rep = r, estimator = e, cdr_u = mu$cdr_share, mape_u = mu$mape, mse_u = mu$mse, mae_u = mu$mae,
+               cdr = ma$cdr_share, mape = ma$mape, mse = ma$mse, mae = ma$mae)
+  }))
+}))
+appd_tab <- appd_results %>% group_by(estimator) %>%
+  summarise(across(c(cdr_u, mape_u, mse_u, mae_u, cdr, mape, mse, mae), mean), .groups = "drop") %>%
+  mutate(estimator = factor(estimator, levels = c("LA", "LR", "SDL", "DeDL"))) %>% arrange(estimator)
+appd_hist <- read.csv(file.path(derived, "appd_history.csv"))
+```
+
+```{r tab-appd, echo = FALSE}
+appd_tab %>%
+  mutate(across(c(cdr_u, cdr), ~ fmt(100 * .x, 1)), across(c(mape_u, mape), ~ fmt(.x, 2)),
+         across(c(mse_u, mse, mae_u, mae), ~ fmt(.x, 3))) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Estimator", "CDRu, \\%", "MAPEu, \\%", "MSEu", "MAEu", "CDR, \\%", "MAPE, \\%", "MSE", "MAE"),
+      caption = paste0("Synthetic experiments of the paper's Appendix D (base design, m = 4, ", n_reps,
+                       " replications): mean metrics over replications for the 10 unobserved and all 15 non-baseline combinations. Effects are in outcome units (scale c between 10 and 20).")) %>%
+  tab_style() %>%
+  add_header_above(c(" " = 1, "Unobserved treatment combinations" = 4, "All treatment combinations" = 4))
+```
+
+```{r appd-numbers, echo = FALSE}
+appd_final <- appd_hist %>% group_by(group) %>% summarise(val = val_mse[epoch == max(epoch)], restarts = max(restarts), .groups = "drop")
+wins <- appd_results %>% select(rep, estimator, mape_u) %>% pivot_wider(names_from = estimator, values_from = mape_u) %>%
+  summarise(dedl_beats_sdl = mean(DeDL < SDL), dedl_beats_lr = mean(DeDL < LR))
+```
+
+With interactions built into the data through the sigmoid, linear addition
+and linear regression miss the unobserved combinations by a wide margin,
+while the structured estimators do far better, and DeDL improves on SDL by
+about a third in MAPE at the cost of a slightly lower correct-direction
+ratio (its intervals are wider). DeDL has a lower MAPE than SDL on the
+unobserved combinations in
+`r round(100 * wins$dedl_beats_sdl)` percent of the replications; the
+validation MSE of the networks ends between `r fmt(min(appd_final$val), 3)`
+and `r fmt(max(appd_final$val), 3)`, and `r sum(appd_final$restarts > 1)`
+replications needed a restart. The paper reports, with 200 replications and a
+longer tuning loop, MAPE below one percent for DeDL; our smaller run
+reproduces the ordering and the size of the gap to the linear benchmarks.
+
+# What matched, what did not, and what we learned {#sec-summary}
+
+```{r tab-match, echo = FALSE}
+match_tab <- tibble::tribble(
+  ~item, ~notebook, ~ours, ~status,
+  "Table 2: relative effects (001, 010, 100, 111, 110, 101)", "0.519, -0.353, -0.358, 0.149, -0.585, 0.332",
+  paste(fmt(truth$relative[2:7], 3), collapse = ", "), "exact",
+  "Table 3: LA MAPE all / unobserved", "62.84 / 166.67", paste(fmt(tab3$mape[tab3$estimator == "LA"], 2), "/", fmt(tab3$mape_u[tab3$estimator == "LA"], 2)), "notebook mis-indexes the single effects",
+  "Table 3: LR MAPE all / unobserved", "24.89 / 21.99", paste(fmt(tab3$mape[tab3$estimator == "LR"], 2), "/", fmt(tab3$mape_u[tab3$estimator == "LR"], 2)), "close (fold averaging)",
+  "Table 3: PDL MAPE all / unobserved", "5.98 / 3.87", paste(fmt(pdl_all_metrics$mape, 2), "/", fmt(pdl_all_metrics$mape_u, 2)), "same magnitude once trained on all cells, as the notebook does",
+  "Table 3: SDL MAPE all / unobserved", "2.79 / 1.95", paste(fmt(tab3$mape[tab3$estimator == "SDL"], 2), "/", fmt(tab3$mape_u[tab3$estimator == "SDL"], 2)), "same magnitude",
+  "Table 3: DeDL MAPE all / unobserved", "9.04 / 6.16", paste(fmt(tab3$mape[tab3$estimator == "DeDL"], 2), "/", fmt(tab3$mape_u[tab3$estimator == "DeDL"], 2)), "ours lower; notebook departs from Algorithm 1",
+  "Table 4: DeDL MAPE", "1.69", fmt(tab4$mape[tab4$estimator == "DeDL"], 2), "same magnitude",
+  "Table 5, unobserved: SDL / DeDL MAPE", "0.88 / 0.76 (last group only)",
+  paste(fmt(cate_metrics$mape_u[cate_metrics$group == "G4" & cate_metrics$estimator == "SDL"], 2), "/",
+        fmt(cate_metrics$mape_u[cate_metrics$group == "G4" & cate_metrics$estimator == "DeDL"], 2), "(G4)"), "same magnitude"
+)
+kbl(match_tab, booktabs = TRUE, linesep = "", col.names = c("Quantity", "Authors' notebook", "This note", "Status"),
+    caption = "Match between the authors' printed outputs on the synthetic data and this note.") %>%
+  tab_style() %>%
+  column_spec(1, width = "4.6cm") %>% column_spec(2, width = "3.6cm") %>% column_spec(3, width = "3.6cm") %>% column_spec(4, width = "3.8cm")
+```
+
+Three lessons for the workflow of double machine learning with a structured
+first stage.
+
+- **The influence function is only as good as $\Lambda(x)^{-1}$.** The
+  orthogonal correction divides by the curvature of the loss in the nuisance
+  direction. Where that curvature vanishes (saturated users), the correction
+  is noise with infinite variance. A ridge is a bias-variance choice that the
+  theory does not make for you; report the sensitivity.
+- **The first-stage fit is observable, the nuisance error is not.** Figure 7
+  is the practical test: watch the validation loss and do not debias a model
+  that has not converged.
+- **Read the code, not only the paper.** The released notebook's departures
+  (training set, assignment shares, ridge, a copy-paste in the results table,
+  a mis-indexed linear-addition benchmark) change the ranking of the
+  estimators. The package function
+  makes each choice an explicit argument, which is what a replication should
+  produce.
+
+# Appendix: formulas used {#sec-appendix}
+
+## Gradients of the generalized sigmoid
+
+For $u = \theta_0 + \sum_k \theta_k t_k$, $s = 1 / (1 + e^{-u})$, $G = c\,s$:
+$\partial G / \partial \theta_0 = c\,s(1 - s)$,
+$\partial G / \partial \theta_k = c\,s(1 - s)\,t_k$,
+$\partial G / \partial c = s$. The loss gradient is
+$\ell_\theta = 2\,G_\theta(\theta, \check t)\,(G(\theta, \check t) - y)$, and
+$\Lambda(x) = 2 \sum_{t \in \mathcal{T}^o} \nu(t)\, G_\theta(\theta(x), t)\, G_\theta(\theta(x), t)'$.
+The package's `link = "linear"` and `"logit"` replace $G$ by $u$ and by $s(u)$
+with the corresponding gradients; `link = "custom"` takes both functions from
+the user.
+
+## The authors' inference conventions
+
+- Ground truth and best treatment: cell-mean differences; pooled $t$-test if
+  Levene's test does not reject at 5 percent, Welch otherwise.
+- LA: the variance of a single-treatment effect is the sum of the two cell
+  variances of the mean; combinations add the single effects and their
+  variances.
+- LR and PDL: the contrast of predicted outcomes has standard error
+  $\mathrm{sd}(\hat y_t - \hat y_0) / \sqrt{n}$ and its $p$-value is a Welch
+  test between the two prediction vectors.
+- DeDL and SDL: fold means and standard errors of $\psi$ (or of $H$); the
+  reported interval averages the fold bounds.
+- Metrics: a combination with an insignificant ground truth contributes zero
+  to MAPE, MSE, and MAE and counts as correctly identified when the estimate's
+  interval covers zero; otherwise the estimate must be significant with the
+  right sign.
+
+## References
+
+- Chernozhukov, Victor, Denis Chetverikov, Mert Demirer, Esther Duflo, Christian Hansen, Whitney Newey, and James Robins. 2018. "Double/Debiased Machine Learning for Treatment and Structural Parameters." *The Econometrics Journal*.
+- Farrell, Max H., Tengyuan Liang, and Sanjog Misra. 2020. "Deep Learning for Individual Heterogeneity: An Automatic Inference Framework." arXiv:2010.14694.
+- Farrell, Max H., Tengyuan Liang, and Sanjog Misra. 2021. "Deep Neural Networks for Estimation and Inference." *Econometrica*.
+- Ye, Zikun, Zhiqi Zhang, Dennis J. Zhang, Heng Zhang, and Renyu Zhang. 2025. "Deep Learning-Based Causal Inference for Large-Scale Combinatorial Experiments: Theory and Empirical Evidence." *Management Science*.

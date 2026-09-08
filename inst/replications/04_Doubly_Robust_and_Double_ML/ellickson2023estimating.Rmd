@@ -1,0 +1,1252 @@
+---
+title: "Replication: Estimating Marketing Component Effects"
+subtitle: "Double Machine Learning from Targeted Digital Promotions (Ellickson, Kar, and Reeder, Marketing Science 2023)"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/04_Doubly_Robust_and_Double_ML/ellickson2023estimating/"
+  n_trees: 1000
+  n_threads: 8
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(mlr3)
+library(mlr3learners)
+library(ranger)
+data_path <- params$data_path
+n_trees <- params$n_trees
+n_threads <- params$n_threads
+data_md5 <- tools::md5sum(file.path(data_path, c("DigitalPromo_Replication.csv", "Step2_Analysis_Mat.csv",
+                                                 "EmailComponents.csv")))
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+fmt0 <- function(x) formatC(x, digits = 0, format = "f", big.mark = ",")
+stars <- function(p) ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", ifelse(p < 0.10, ".", ""))))
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+covs <- c("Demographic", "Monetary", "Frequency", "Recency")
+baseline_email <- 6L
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is which parts of a promotional email cause customers to
+open it, not whether the email as a whole works.** Ellickson, Kar, and
+Reeder (2023) observe 34 email promotions sent by an apparel retailer to 1.3
+million customers over two months. Each email is a bundle of components:
+a merchandise category, a price or nonprice promotion, semantic cues in the
+subject line, and its character length. Outcomes are observed at three
+stages of the funnel: open, purchase, and purchase amount.
+
+**Targeting is the identification problem, and the firm's own targeting
+variables are the solution.** The firm chose whom to send each email using
+fifteen recency, frequency, monetary, and demographic variables that the
+authors observe. Assignment is therefore unconfounded given those
+variables (their Assumption 1), and the residual randomization in the
+firm's rule gives overlap (Assumption 2). The paper spends Section 5 on
+checking overlap and balance because everything that follows rests on
+those two assumptions.
+
+**The method has two stages, and both consume one object: the doubly
+robust score.** In the first stage, for each email $j$ against a baseline
+email, they build the score
+$$
+\psi_i = \hat\mu_1(x_i) - \hat\mu_0(x_i)
+       + \frac{W_i}{\hat e_t(x_i)}\,(y_i - \hat\mu_1(x_i))
+       - \frac{1 - W_i}{\hat e_c(x_i)}\,(y_i - \hat\mu_0(x_i)),
+$$
+with random forests for the outcome models $\mu$ and the propensities
+$e$, trained on one half of the sample and evaluated on the other half.
+The mean of $\psi_i$ is the pairwise ATE (Figures 1 to 3 of the paper). In
+the second stage they regress the pooled scores on the component
+differences between each email and the baseline, following Semenova and
+Chernozhukov (2021); each coefficient is the marginal effect of one
+component (Table 10), and the same regression by customer segment gives
+heterogeneous component effects (Tables 12 and 13).
+
+**Why two stages rather than one regression of opens on components.** A
+regression of outcomes on components confounds the component effects with
+targeting, because the firm sends different bundles to different customers.
+The score removes targeting once, using all fifteen covariates and flexible
+learners, and leaves a variable whose conditional mean is the treatment
+effect. The projection then answers the decomposition question with plain
+least squares and robust standard errors, which is why the second stage can
+be simple.
+
+**The public replication package cannot reproduce the paper's numbers, and
+says so.** The real data are under a nondisclosure agreement. The package
+holds a synthetic dataset with the same variable types, the authors' two R
+scripts, and the authors' own first-stage output on the synthetic data.
+Table \@ref(tab:files) lists them. This note replicates the workflow on
+those files, matches our package's estimates against the authors' scripts
+step by step, and keeps the paper's table and figure layouts so that each
+object can be read next to its published counterpart.
+
+```{r files, echo = FALSE}
+tibble(
+  File = c("DigitalPromo\\_Replication.csv", "Step2\\_Analysis\\_Mat.csv", "EmailComponents.csv",
+           "FirstStage\\_ScoreCreation\\_Replication.r", "SecondStage\\_Projection\\_Replication.r"),
+  Content = c("221,188 customers, one row each; 6 emails (email 6 is the baseline); outcome Opened; 4 covariates",
+              "the authors' first-stage output: 251,804 scores for emails 1--5 against the baseline",
+              "component differences (email minus baseline) for emails 1--5: Characters, Component1--3",
+              "score construction: ranger forests, 1,000 trees, seed 227",
+              "trimming, stratified subsample of 25,000 rows per pair, lm with HC1"),
+  `Used for` = c("descriptives, balance, first stage, segments", "benchmark for our first stage",
+                 "second stage", "benchmark rerun", "benchmark rerun")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, caption = "Files in the replication package and their role in this note.") %>%
+  tab_style() %>% column_spec(2, width = "6.5cm") %>% column_spec(3, width = "3.6cm")
+```
+
+**What is lost relative to the paper.** Only the open stage exists, so
+every three-outcome table has one outcome column. There are five treatment
+emails instead of 33, four covariates instead of fifteen, four generic
+components instead of eighteen named ones, and no customer receives more
+than one email. The segment variable shipped with the data is constant, so
+segments are rebuilt from the covariates as the paper does.
+
+# Data {#sec-data}
+
+## Emails and outcomes
+
+**The paper's Table 2 reports raw open rates by component to show that
+components differ in performance before any adjustment.** The table exists
+to motivate the decomposition, and its last column (purchase amount
+conditional on purchase) previews that top-of-funnel and bottom-of-funnel
+rankings disagree. The authors are careful to call these associations: the
+customers exposed to each component were chosen by the firm.
+
+```{r load-data}
+promo <- read.csv(file.path(data_path, "DigitalPromo_Replication.csv"))
+components <- read.csv(file.path(data_path, "EmailComponents.csv"))
+step2_authors <- read.csv(file.path(data_path, "Step2_Analysis_Mat.csv"))
+promo$treated_email <- promo$PromoID != baseline_email
+c(customers = nrow(promo), emails = length(unique(promo$PromoID)),
+  customers_with_more_than_one_email = sum(table(promo$ID) > 1))
+```
+
+```{r tab-emails, echo = FALSE}
+email_tab <- promo %>%
+  group_by(PromoID) %>%
+  summarise(n = n(), open_rate = mean(Opened), .groups = "drop") %>%
+  left_join(components, by = c("PromoID" = "Email_Type")) %>%
+  mutate(role = ifelse(PromoID == baseline_email, "baseline", "treatment"))
+email_tab %>%
+  transmute(Email = PromoID, Role = role, `Number of customers` = fmt0(n), `Open rate` = fmt(open_rate),
+            Characters = ifelse(is.na(Characters), "--", Characters),
+            `Component 1` = ifelse(is.na(Component1), "--", Component1),
+            `Component 2` = ifelse(is.na(Component2), "--", Component2),
+            `Component 3` = ifelse(is.na(Component3), "--", Component3)) %>%
+  kbl(booktabs = TRUE, linesep = "", align = c("l", "l", "r", "r", "r", "r", "r", "r"),
+      caption = "Emails in the replication data: recipients, raw open rate, and component differences from the baseline email (the analogue of the paper's Tables 1 and 2). Component values are differences from email 6, so the baseline row is empty.") %>%
+  tab_style()
+```
+
+**In the synthetic data the raw open rates already spread from
+`r fmt(min(email_tab$open_rate))` to `r fmt(max(email_tab$open_rate))`.**
+Whether that spread reflects the emails or the customers they were sent to
+is exactly what the first stage has to settle.
+
+## Pretreatment covariates
+
+**The paper's Table 3 lists the fifteen targeting variables with their
+means and standard deviations to make one point: these are the firm's own
+targeting inputs, so conditioning on them is conditioning on the
+assignment rule.** The standard deviations of the RFM variables are large
+relative to their means, which the authors read as evidence of active
+segmentation, and the demographic variables barely vary across emails,
+which suggests they play little role in targeting.
+
+```{r tab-covariates, echo = FALSE}
+cov_desc <- tibble(
+  Group = c("Demographic", "Monetary", "Frequency", "Recency"),
+  Variable = covs,
+  Description = c("Demographic bracket of the recipient (categorical, 1--3)",
+                  "Monetary value of past purchases (dollars)",
+                  "Number of past purchases",
+                  "Days since the recipient's last action")
+)
+cov_stats <- promo %>%
+  summarise(across(all_of(covs), list(mean = mean, sd = sd))) %>%
+  pivot_longer(everything(), names_to = c("Variable", "stat"), names_sep = "_") %>%
+  pivot_wider(names_from = stat, values_from = value)
+cov_desc %>%
+  left_join(cov_stats, by = "Variable") %>%
+  mutate(across(c(mean, sd), ~ fmt(.x, 2))) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Recipient characteristic", "Variable", "Description", "Mean", "Standard deviation"),
+      caption = "Pretreatment covariates in the replication data (the analogue of the paper's Table 3). The synthetic data keep one variable per family of the firm's fifteen targeting variables.") %>%
+  tab_style() %>% column_spec(3, width = "6cm")
+```
+
+**Why the layout groups variables into recency, frequency, monetary, and
+demographic families.** The families map onto the firm's targeting logic,
+and the same grouping reappears in every later table (balance, the two
+emails compared in Table 8, the segments in Table 11), so a reader can
+follow one variable through the paper.
+
+# Overlap and balance {#sec-balance}
+
+## Why the paper checks balance before estimating anything
+
+**Unconfoundedness holds by construction here, but overlap does not, so
+the authors test overlap and balance rather than assume them.** A firm
+that targets algorithmically could target deterministically: if a rule
+sends an email only to customers with a birthday this month, no other
+customer has a positive propensity and the effect for them is not
+identified. Section 5 of the paper therefore does three things: it
+estimates a propensity for every email against the pooled population,
+checks that the propensities are not degenerate, and reports population
+standardized biases (PSB) for every covariate and email.
+
+**The PSB of McCaffrey et al. (2013) is the balance diagnostic for many
+treatments.** For covariate $k$ and email $t$,
+$$
+\mathrm{PSB}_{tk} = \frac{|\bar X_{kt} - \bar X_{kp}|}{\sigma_{kp}}, \qquad
+\bar X_{kt} = \frac{\sum_i T_i[t]\, X_{ki} / \hat e_t(X_i)}{\sum_i T_i[t] / \hat e_t(X_i)},
+$$
+where $\hat e_t$ is the propensity of email $t$ in the pooled population,
+and $\bar X_{kp}$, $\sigma_{kp}$ are the pooled mean and standard
+deviation. It compares the propensity-weighted recipients of each email
+with the whole population, which is the population the pairwise ATEs refer
+to. The authors adopt the thresholds 0.20 (small), 0.40 (moderate), and
+0.60 (large) and flag anything above 0.25 for a closer look.
+
+## Propensities for each email against the pooled population
+
+**We estimate the six pooled propensities as the authors do, with
+probability forests, and cross-fit them so the weights are honest.** The
+authors' script trains each forest on half of the rows and predicts on the
+other half. Two-fold cross-fitting is the same idea applied to both halves,
+so every customer gets an out-of-sample propensity.
+
+```{r pooled-propensities, cache = TRUE, cache.extra = list(data_md5, n_trees)}
+crossfit_prob <- function(data, target, features, n_trees, seed) {
+  set.seed(seed)
+  fold <- sample(rep(1:2, length.out = nrow(data)))
+  out <- numeric(nrow(data))
+  for (k in 1:2) {
+    fit <- ranger(x = data[fold != k, features], y = factor(data[[target]][fold != k]),
+                  num.trees = n_trees, probability = TRUE, num.threads = n_threads, seed = seed)
+    out[fold == k] <- predict(fit, data = data[fold == k, features], num.threads = n_threads)$predictions[, "1"]
+  }
+  out
+}
+pooled_ps <- sapply(sort(unique(promo$PromoID)), function(j) {
+  promo$W <- as.integer(promo$PromoID == j)
+  crossfit_prob(promo, "W", covs, n_trees, seed = 100 + j)
+})
+colnames(pooled_ps) <- paste0("email", sort(unique(promo$PromoID)))
+```
+
+```{r fig-overlap, echo = FALSE, fig.height = 3.6, fig.cap = "Cross-fitted propensity of each email in the pooled population, recipients of the email against everyone else. The dashed lines are the 0.01 and 0.99 trimming points used in the first stage. Distributions that overlap without mass at the boundaries are the paper's evidence of residual randomization."}
+ps_long <- as.data.frame(pooled_ps) %>%
+  mutate(PromoID = promo$PromoID) %>%
+  pivot_longer(-PromoID, names_to = "email", values_to = "p") %>%
+  mutate(email_id = as.integer(sub("email", "", email)),
+         group = ifelse(PromoID == email_id, "recipients", "others"))
+ggplot(ps_long, aes(p, fill = group)) +
+  geom_histogram(bins = 60, position = "identity", alpha = 0.55) +
+  geom_vline(xintercept = c(0.01, 0.99), linetype = "dashed", colour = "grey40") +
+  facet_wrap(~ email, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c(recipients = "#B22222", others = "grey60"), name = NULL) +
+  labs(x = "Estimated propensity of the email", y = "Customers") +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+```
+
+## Weighted means and standardized biases
+
+**Table \@ref(tab:tab-balance) reproduces the layout of the paper's Table
+4: one row per email, one column per covariate, weighted means in the
+cells, the pooled mean and standard deviation at the bottom, and a marker
+on cells whose PSB exceeds 0.20 or 0.40.** The layout lets the reader
+scan a column to see which covariate is targeted and a row to see which
+email is targeted; the bottom rows give the scale against which the
+differences are judged.
+
+```{r balance}
+psb_table <- function(data, ps, covs, clip = c(0.01, 0.99)) {
+  ps <- pmin(pmax(ps, clip[1]), clip[2])
+  pooled_mean <- colMeans(data[, covs])
+  pooled_sd <- apply(data[, covs], 2, sd)
+  emails <- sort(unique(data$PromoID))
+  rows <- lapply(emails, function(j) {
+    w <- as.numeric(data$PromoID == j) / ps[, paste0("email", j)]
+    wm <- apply(data[, covs], 2, function(x) sum(w * x) / sum(w))
+    tibble(PromoID = j, Variable = covs, weighted_mean = wm,
+           psb = abs(wm - pooled_mean[covs]) / pooled_sd[covs])
+  })
+  list(table = bind_rows(rows), pooled_mean = pooled_mean, pooled_sd = pooled_sd)
+}
+bal <- psb_table(promo, pooled_ps, covs)
+```
+
+```{r tab-balance, echo = FALSE}
+bal_wide <- bal$table %>%
+  mutate(cell = paste0(fmt(weighted_mean, 2), ifelse(psb > 0.40, "$^{b}$", ifelse(psb > 0.20, "$^{a}$", "")))) %>%
+  select(PromoID, Variable, cell) %>%
+  pivot_wider(names_from = Variable, values_from = cell) %>%
+  mutate(PromoID = as.character(PromoID))
+bind_rows(
+  bal_wide,
+  tibble(PromoID = "Pop. mean", !!!as.list(fmt(bal$pooled_mean, 2))),
+  tibble(PromoID = "Pop. standard deviation", !!!as.list(fmt(bal$pooled_sd, 2)))
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, col.names = c("Email", covs), align = c("l", rep("r", 4)),
+      caption = "Propensity-weighted means of the pretreatment covariates by email, with the unweighted pooled mean and standard deviation (the layout of the paper's Table 4). $^{a}$: PSB above 0.20; $^{b}$: PSB above 0.40.") %>%
+  tab_style() %>%
+  row_spec(nrow(bal_wide), hline_after = TRUE)
+```
+
+```{r tab-psb-email, echo = FALSE}
+max_by_email <- bal$table %>% group_by(PromoID) %>% summarise(`Maximum PSB` = max(psb), .groups = "drop") %>%
+  mutate(`Maximum PSB` = fmt(`Maximum PSB`, 2)) %>% rename(Email = PromoID)
+kbl(max_by_email, booktabs = TRUE, linesep = "", caption = "Maximum PSB across covariates for each email (the layout of the paper's Table 5).") %>%
+  tab_style()
+```
+
+```{r tab-psb-cov, echo = FALSE}
+max_by_cov <- bal$table %>% group_by(Variable) %>% summarise(`Maximum PSB` = max(psb), .groups = "drop") %>%
+  mutate(`Maximum PSB` = fmt(`Maximum PSB`, 2)) %>%
+  left_join(cov_desc[, c("Group", "Variable")], by = "Variable") %>%
+  select(`Recipient characteristic` = Group, `Pretreatment covariate` = Variable, `Maximum PSB`)
+kbl(max_by_cov, booktabs = TRUE, linesep = "", caption = "Maximum PSB across emails for each covariate (the layout of the paper's Table 6).") %>%
+  tab_style()
+```
+
+```{r balance-numbers, echo = FALSE}
+recip <- sapply(sort(unique(promo$PromoID)), function(j) {
+  p <- pooled_ps[promo$PromoID == j, paste0("email", j)]
+  c(share_outside = mean(p < 0.01 | p > 0.99), min = min(p))
+})
+raw_means <- promo %>% group_by(PromoID) %>% summarise(across(all_of(covs), mean), .groups = "drop")
+raw_psb <- raw_means %>% pivot_longer(-PromoID, names_to = "Variable", values_to = "raw_mean") %>%
+  mutate(psb_raw = abs(raw_mean - bal$pooled_mean[Variable]) / bal$pooled_sd[Variable])
+n_psb <- nrow(bal$table)
+n_above20 <- sum(bal$table$psb > 0.20)
+n_above40 <- sum(bal$table$psb > 0.40)
+worst <- bal$table[which.max(bal$table$psb), ]
+```
+
+**Reading the tables the way the authors read theirs.** Before
+weighting, the raw means differ sharply across emails: the largest
+unweighted standardized difference is `r fmt(max(raw_psb$psb_raw), 2)`
+(email `r raw_psb$PromoID[which.max(raw_psb$psb_raw)]`,
+`r raw_psb$Variable[which.max(raw_psb$psb_raw)]`), so the synthetic firm
+targets on recency and frequency as the real one did. After weighting, of
+the `r n_psb` email-by-covariate comparisons, `r n_above20` exceed 0.20
+and `r n_above40` exceed 0.40; the largest is `r fmt(worst$psb, 2)` (email
+`r worst$PromoID`, `r worst$Variable`). The paper found 25 of 510 above
+0.20 and one at 0.59, an email personalized to the recipient's birth
+month, and argued that even that case does not threaten identification
+because only about 80 percent of eligible customers received it, so the
+rule was not deterministic. Propensities are clipped at 0.01 and 0.99
+before weighting, the paper's trimming points; among recipients of each
+email the share outside those bounds is at most
+`r fmt(100 * max(recip["share_outside", ]), 1)` percent, so the weights
+never explode and the balance the weights deliver is the balance the first
+stage will rely on.
+
+**Why the paper reports maxima in Tables 5 and 6 rather than only the
+full matrix.** With 34 emails and 15 covariates the full matrix has 510
+cells; two one-column tables tell the reader at once which emails and which
+covariates carry the imbalance, and the full matrix is moved to the online
+appendix. With six emails and four covariates the matrix itself fits, so
+both views are shown here.
+
+## What the balance check found in the synthetic data
+
+```{r overlap-structure, echo = FALSE}
+rec_range <- promo %>% group_by(PromoID) %>%
+  summarise(max_recency = max(Recency), max_frequency = max(Frequency),
+            share_recency_above_500 = mean(Recency > 500), .groups = "drop")
+```
+
+**Three emails stay imbalanced after weighting, and the reason is a
+structural failure of overlap, not a bad propensity model.** Recipients
+of email 1 have recency of at most `r fmt0(rec_range$max_recency[1])`
+days while `r fmt(100 * mean(promo$Recency > 500), 0)` percent of the
+population is above 500; recipients of email 5 have at most
+`r rec_range$max_frequency[5]` past purchases. No reweighting of the
+recipients can represent customers who were never sent the email, so the
+weighted means in Table \@ref(tab:tab-balance) stay far from the pooled
+means. This is the failure the paper's footnote 14 calls structural, and
+the paper's data passed the check; the synthetic data do not for emails 1,
+2, and 5. The consequence for the first stage is that the pairwise ATEs
+for those emails are identified only on the overlapping part of the
+population. The paper's trimming at propensities of 0.01 and 0.99 makes
+that restriction explicit, and we keep it.
+
+# First stage: the doubly robust score {#sec-first-stage}
+
+## What the authors' code computes
+
+**The score has three ingredients, and each is estimated on a sample
+that excludes the observation it scores.** For treatment email $j$ and
+the baseline $b$, the authors' script (a) splits the baseline recipients
+in half and the recipients of $j$ one quarter to three quarters, training
+on the first parts and scoring the second; (b) fits a probability forest
+for "received $j$" against every other row of the data, and another for
+"received $b$" against every other row, which are the pooled propensities
+of Section \@ref(sec-balance) rather than the propensity of $j$ within the
+pair; (c) fits one probability forest of the outcome on each arm. The
+propensities are scaled by the ratio of customers to rows, the stabilized
+weight of Hernán and Robins (2006), which is one here because no customer
+appears twice.
+
+**The score written in the code differs from the formula in the paper in
+one place.** The paper divides the control residual by the control
+propensity $e_c(x)$; the script divides both residuals by the treatment
+propensity $e_t(x)$. The check below recomputes the shipped scores from
+the shipped propensities and outcome predictions with the code's formula
+and reproduces them exactly, so the shipped file was made with the code's
+formula.
+
+The shipped file does not carry the outcome, so the check needs it from
+the raw data:
+
+```{r score-formula-check-2}
+rat <- length(unique(promo$ID)) / nrow(promo)
+s2 <- step2_authors %>% left_join(promo[, c("ID", "Opened")], by = "ID")
+code_formula <- (s2$g_1 - s2$g_2) + s2$Wtest * rat * (s2$Opened - s2$g_1) / s2$Propensity -
+  (1 - s2$Wtest) * rat * (s2$Opened - s2$g_2) / s2$Propensity
+c(max_abs_difference = max(abs(code_formula - s2$Score_rat), na.rm = TRUE),
+  rows_with_zero_propensity = sum(s2$Propensity == 0))
+```
+
+**Why this matters and why it does not matter much here.** With the
+pairwise propensity $p = P(W = 1 \mid x)$ the doubly robust score divides
+the control residual by $1 - p$; the code divides it by $p$ instead,
+which weights control residuals by the treatment propensity. The
+conditional mean of the code's score is no longer the treatment effect
+unless the outcome model is exactly right, so the code's score is not
+doubly robust for the control term. A second consequence is variance: the pooled propensity of an email is
+far smaller than its propensity within the pair, so both residual terms
+are divided by a small number. Section \@ref(sec-ates) shows what this
+costs in precision. We keep the paper's formula and the pairwise
+propensity in our own estimates.
+
+## The authors' benchmark, rerun
+
+**Rerunning the authors' first stage with their seed gives the numbers our
+package must match.** The function below is their script with the file
+paths removed and the loop body kept line for line, returning the same
+columns as the shipped file.
+
+```{r authors-first-stage, cache = TRUE, cache.extra = list(data_md5, n_trees)}
+authors_first_stage <- function(EmailOut_Analysis, n_trees = 1000, threads = 8, seed = 227) {
+  set.seed(seed)
+  rat <- length(unique(EmailOut_Analysis$ID)) / nrow(EmailOut_Analysis)
+  Control_Email <- subset(EmailOut_Analysis, PromoID == 6)
+  sample <- sample.int(n = nrow(Control_Email), size = floor(0.5 * nrow(Control_Email)), replace = FALSE)
+  Control_train <- Control_Email[sample, ]
+  Control_test <- Control_Email[-sample, ]
+  rest_Data <- subset(EmailOut_Analysis, PromoID != 6)
+  sample_rc <- sample.int(n = nrow(rest_Data), size = floor(0.5 * nrow(rest_Data)), replace = FALSE)
+  rc_Treat_train <- rest_Data[sample_rc, ]
+  X_P_Matrix <- rbind(rc_Treat_train[, 3:6], Control_train[, 3:6])
+  W_train <- as.factor(c(rep(0, nrow(rc_Treat_train)), rep(1, nrow(Control_train))))
+  p_Function_rc <- ranger(W_train ~ ., data = data.frame(X_P_Matrix, W_train), num.trees = n_trees,
+                          probability = TRUE, num.threads = threads)
+  out <- list()
+  for (jjj in 1:5) {
+    Treat_Email <- subset(EmailOut_Analysis, PromoID == jjj)
+    sample_t <- sample.int(n = nrow(Treat_Email), size = floor(0.25 * nrow(Treat_Email)), replace = FALSE)
+    Treat_train <- Treat_Email[sample_t, ]
+    Treat_test <- Treat_Email[-sample_t, ]
+    rest_rt_Data <- subset(EmailOut_Analysis, PromoID != jjj)
+    sample_rt <- sample.int(n = nrow(rest_rt_Data), size = floor(0.5 * nrow(rest_rt_Data)), replace = FALSE)
+    rt_Treat_train <- rest_rt_Data[sample_rt, ]
+    X_P_Matrix <- rbind(Treat_train[, 3:6], rt_Treat_train[, 3:6])
+    W_train <- as.factor(c(rep(1, nrow(Treat_train)), rep(0, nrow(rt_Treat_train))))
+    p_Function <- ranger(W_train ~ ., data = data.frame(X_P_Matrix, W_train), num.trees = n_trees,
+                         probability = TRUE, num.threads = threads)
+    p_treat <- predict(p_Function, data = Treat_test[, 3:6], num.threads = threads)$predictions[, 2]
+    p_control <- predict(p_Function_rc, data = Control_test[, 3:6], num.threads = threads)$predictions[, 2]
+    u_treat_Function <- ranger(y ~ ., data = data.frame(Treat_train[, 3:6], y = factor(Treat_train$Opened)),
+                               num.trees = n_trees, probability = TRUE, num.threads = threads)
+    u_control_Function <- ranger(y ~ ., data = data.frame(Control_train[, 3:6], y = factor(Control_train$Opened)),
+                                 num.trees = n_trees, probability = TRUE, num.threads = threads)
+    test <- rbind(Treat_test, Control_test)
+    W_test <- c(rep(1, nrow(Treat_test)), rep(0, nrow(Control_test)))
+    pr <- c(p_treat, p_control)
+    u_1 <- predict(u_treat_Function, data = test[, 3:6], num.threads = threads)$predictions[, 2]
+    u_0 <- predict(u_control_Function, data = test[, 3:6], num.threads = threads)$predictions[, 2]
+    s_out <- (u_1 - u_0) + W_test * rat * ((test$Opened - u_1) / pr) - (1 - W_test) * rat * ((test$Opened - u_0) / pr)
+    out[[jjj]] <- data.frame(Treat_E = jjj, Control_E = 6, Score_rat = s_out, Propensity = pr, g_1 = u_1, g_2 = u_0,
+                             ID = test$ID, Cluster = test$Cluster, Wtest = W_test, Opened = test$Opened)
+  }
+  do.call(rbind, out)
+}
+step2_rerun <- authors_first_stage(promo, n_trees = n_trees, threads = n_threads)
+```
+
+```{r rerun-vs-shipped, echo = FALSE}
+cmp <- step2_rerun %>%
+  inner_join(step2_authors %>% select(Treat_E, ID, Score_shipped = Score_rat, Propensity_shipped = Propensity),
+             by = c("Treat_E", "ID"))
+rerun_match <- cmp %>% group_by(Treat_E) %>%
+  summarise(rows = n(), shipped_rows = NA_integer_, cor_score = cor(Score_rat, Score_shipped, use = "complete.obs"),
+            cor_propensity = cor(Propensity, Propensity_shipped), .groups = "drop")
+rerun_match$shipped_rows <- as.integer(table(step2_authors$Treat_E))
+```
+
+**The rerun reproduces the shipped file's rows and its propensities to
+the precision random forests allow.** Table \@ref(tab:tab-rerun) matches
+the two by customer and email: the same customers are scored (the split
+is fixed by the seed), and the scores correlate at
+`r fmt(min(rerun_match$cor_score), 3)` to three decimals. Forests with 1,000
+trees are not deterministic across thread schedules, so the residual
+differences are Monte Carlo noise of the forests, not a difference in
+procedure.
+
+```{r tab-rerun, echo = FALSE}
+rerun_match %>%
+  mutate(across(c(cor_score, cor_propensity), ~ fmt(.x, 4))) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Email", "Rows rerun", "Rows shipped", "Correlation of scores", "Correlation of propensities"),
+      caption = "The authors' first stage rerun with their seed, matched to the shipped scores by customer and email.") %>%
+  tab_style()
+```
+
+## Our version: pairwise scores with cross-fitting {#sec-our-scores}
+
+**We build the same object with `dr_scores()`, pair by pair, with three
+deliberate differences.** First, the propensity is the pairwise one,
+$P(\text{email } j \mid \text{email } j \text{ or baseline}, x)$, so the
+score uses $1 - p$ for controls as in the paper's formula. Second, both
+halves are used: two-fold cross-fitting scores every customer in the
+pair, where the authors' split scores half of the baseline and three
+quarters of the treated. Third, trimming at 0.01 and 0.99 drops rows,
+as in the paper, rather than clipping. The learners are the same
+probability forests with 1,000 trees; a lasso variant follows.
+
+```{r our-scores, cache = TRUE, cache.extra = list(data_md5, n_trees)}
+forest_learner <- function() lrn("classif.ranger", num.trees = n_trees, predict_type = "prob", num.threads = n_threads)
+pair_data <- function(j) {
+  d <- promo[promo$PromoID %in% c(j, baseline_email), ]
+  d$W <- as.integer(d$PromoID == j)
+  d
+}
+scores_forest <- lapply(1:5, function(j) {
+  dr_scores(pair_data(j), y = "Opened", d = "W", x = covs,
+            learner_p = forest_learner(), learner_mu = forest_learner(),
+            folds = 2, seed = 300 + j, trim = c(0.01, 0.99))
+})
+names(scores_forest) <- paste0("email", 1:5)
+scores_forest[[1]]
+```
+
+**The lasso variant replaces both forests by cross-validated lasso
+logits on a polynomial dictionary.** The paper's footnote 15 reports that
+lasso nuisances gave similar results; with four covariates the dictionary
+of squares and pairwise products is the natural flexible linear model.
+
+```{r our-scores-lasso, cache = TRUE, cache.extra = list(data_md5)}
+add_dictionary <- function(d) {
+  for (v in covs) d[[paste0(v, "_sq")]] <- d[[v]]^2
+  pairs <- combn(covs, 2)
+  for (k in seq_len(ncol(pairs))) d[[paste0(pairs[1, k], "_x_", pairs[2, k])]] <- d[[pairs[1, k]]] * d[[pairs[2, k]]]
+  d
+}
+dict <- c(covs, paste0(covs, "_sq"), apply(combn(covs, 2), 2, paste, collapse = "_x_"))
+lasso_learner <- function() lrn("classif.cv_glmnet", predict_type = "prob")
+scores_lasso <- lapply(1:5, function(j) {
+  dr_scores(add_dictionary(pair_data(j)), y = "Opened", d = "W", x = dict,
+            learner_p = lasso_learner(), learner_mu = lasso_learner(),
+            folds = 2, seed = 300 + j, trim = c(0.01, 0.99))
+})
+names(scores_lasso) <- paste0("email", 1:5)
+```
+
+```{r trim-shares, echo = FALSE}
+trim_tab <- tibble(
+  Email = 1:5,
+  `Rows in pair` = sapply(1:5, function(j) nrow(pair_data(j))),
+  `Trimmed, forest` = sapply(scores_forest, function(s) s$diagnostics$trimmed_share),
+  `Trimmed, lasso` = sapply(scores_lasso, function(s) s$diagnostics$trimmed_share),
+  `Propensity RMSE, forest` = sapply(scores_forest, function(s) s$diagnostics$nuisance["p", "rmse"]),
+  `Propensity RMSE, lasso` = sapply(scores_lasso, function(s) s$diagnostics$nuisance["p", "rmse"])
+)
+```
+
+**Trimming removes what overlap cannot support.** Table
+\@ref(tab:tab-trim) shows the share of each pair dropped at the 0.01 and
+0.99 bounds. For emails 1, 2, and 5 the dropped rows are the baseline
+customers the email was never sent to; for emails 3 and 4 almost nothing
+is dropped. The forests and the lasso predict the pairwise propensity
+about equally well.
+
+```{r tab-trim, echo = FALSE}
+trim_tab %>%
+  mutate(across(c(`Trimmed, forest`, `Trimmed, lasso`), ~ paste0(fmt(100 * .x, 1), "\\%")),
+         across(c(`Propensity RMSE, forest`, `Propensity RMSE, lasso`), ~ fmt(.x, 3)),
+         `Rows in pair` = fmt0(`Rows in pair`)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      caption = "Rows dropped by trimming the pairwise propensity at 0.01 and 0.99, and the cross-fitted propensity fit, by email and learner.") %>%
+  tab_style()
+```
+
+## Pairwise ATEs {#sec-ates}
+
+**The paper's Section 6.1 starts with one pair to show that the
+correction is material, then shows all 33 in Figure 1.** Its Table 8
+puts the naive open rates next to the covariate means of the two groups
+so the reader sees, before any model, that the email with the higher
+open rate went to the more engaged customers; the doubly robust ATE then
+reverses the naive ranking. We follow the same order.
+
+```{r pair-example}
+pair_ex <- c(3L, 5L)
+ex <- promo[promo$PromoID %in% pair_ex, ]
+ex$W <- as.integer(ex$PromoID == pair_ex[1])
+sc_ex <- dr_scores(ex, "Opened", "W", covs, learner_p = forest_learner(), learner_mu = forest_learner(),
+                   folds = 2, seed = 7, trim = c(0.01, 0.99))
+naive_ex <- diff(rev(tapply(ex$Opened, ex$W, mean)))
+c(naive_difference = unname(naive_ex), dr_ate = sc_ex$ate$estimate, t_stat = sc_ex$ate$estimate / sc_ex$ate$std.error,
+  trimmed_share = sc_ex$diagnostics$trimmed_share)
+```
+
+**Why emails 3 and 5.** They share every component difference except
+the subject-line length (Table \@ref(tab:tab-emails)), which is the
+paper's own criterion for a pair that is "akin to an A/B test": one
+difference in content, and a targeting difference to be removed.
+
+```{r tab-pair, echo = FALSE}
+pair_stats <- ex %>% group_by(PromoID) %>%
+  summarise(across(c(Opened, all_of(covs)), list(mean = mean, sd = sd)), n = n(), .groups = "drop")
+rows <- c("Opened", covs)
+pair_tab <- tibble(
+  Group = c("Response", rep("Pretreatment covariate", 4)),
+  Variable = c("Open rate", covs),
+  m1 = sapply(rows, function(v) pair_stats[[paste0(v, "_mean")]][pair_stats$PromoID == pair_ex[1]]),
+  s1 = sapply(rows, function(v) pair_stats[[paste0(v, "_sd")]][pair_stats$PromoID == pair_ex[1]]),
+  m2 = sapply(rows, function(v) pair_stats[[paste0(v, "_mean")]][pair_stats$PromoID == pair_ex[2]]),
+  s2 = sapply(rows, function(v) pair_stats[[paste0(v, "_sd")]][pair_stats$PromoID == pair_ex[2]])
+) %>% mutate(across(c(m1, s1, m2, s2), ~ fmt(.x, 3)))
+pair_tab <- bind_rows(pair_tab, tibble(Group = "Number of customers", Variable = "",
+                                       m1 = fmt0(pair_stats$n[pair_stats$PromoID == pair_ex[1]]), s1 = "",
+                                       m2 = fmt0(pair_stats$n[pair_stats$PromoID == pair_ex[2]]), s2 = ""))
+kbl(pair_tab, booktabs = TRUE, linesep = "", escape = FALSE,
+    col.names = c("", "", "Mean", "Standard deviation", "Mean", "Standard deviation"),
+    caption = paste0("Consumer response and pretreatment covariates of emails ", pair_ex[1], " and ", pair_ex[2],
+                     " before correcting for targeting (the layout of the paper's Table 8).")) %>%
+  add_header_above(c(" " = 2, "Customers getting email 3" = 2, "Customers getting email 5" = 2)) %>%
+  tab_style() %>% collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+```
+
+**The naive gap is `r fmt(naive_ex)` and the doubly robust ATE is
+`r fmt(sc_ex$ate$estimate)` (t = `r fmt(sc_ex$ate$estimate / sc_ex$ate$std.error, 1)`).**
+Email 5 went to customers with far longer recency and fewer purchases
+(Table \@ref(tab:tab-pair)), so part of its lower open rate is its
+audience. The correction attributes the remaining gap to the email.
+
+```{r ate-table, echo = FALSE}
+ate_from_scores <- function(s, id) tibble(Email = id, estimate = mean(s), std.error = sd(s) / sqrt(length(s)), n = length(s))
+ate_shipped <- step2_authors %>% filter(Propensity > 0.01, Propensity < 0.99) %>%
+  group_by(Email = Treat_E) %>% summarise(estimate = mean(Score_rat), std.error = sd(Score_rat) / sqrt(n()), n = n(), .groups = "drop") %>%
+  mutate(source = "Authors' shipped scores")
+ate_rerun <- step2_rerun %>% filter(Propensity > 0.01, Propensity < 0.99) %>%
+  group_by(Email = Treat_E) %>% summarise(estimate = mean(Score_rat), std.error = sd(Score_rat) / sqrt(n()), n = n(), .groups = "drop") %>%
+  mutate(source = "Authors' script, rerun")
+ate_forest <- bind_rows(lapply(1:5, function(j) ate_from_scores(scores_forest[[j]]$score, j))) %>% mutate(source = "dr_scores(), forests")
+ate_lasso <- bind_rows(lapply(1:5, function(j) ate_from_scores(scores_lasso[[j]]$score, j))) %>% mutate(source = "dr_scores(), lasso")
+naive <- promo %>% group_by(PromoID) %>% summarise(open = mean(Opened), .groups = "drop")
+naive_diff <- naive$open[match(1:5, naive$PromoID)] - naive$open[naive$PromoID == baseline_email]
+ate_all <- bind_rows(ate_shipped, ate_rerun, ate_forest, ate_lasso) %>%
+  mutate(t = estimate / std.error)
+```
+
+```{r tab-ates, echo = FALSE}
+ate_all %>%
+  mutate(cell = paste0(fmt(estimate, 4), " (", fmt(t, 1), ")")) %>%
+  select(Email, source, cell) %>%
+  pivot_wider(names_from = source, values_from = cell) %>%
+  mutate(`Naive difference` = fmt(naive_diff, 4)) %>%
+  select(Email, `Naive difference`, everything()) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = TRUE,
+      caption = "Pairwise ATE of each email against the baseline at the open stage: naive difference in open rates, and doubly robust estimates from the authors' shipped scores, their script rerun, and our two versions (t-statistics in parentheses). All doubly robust estimates trim at propensities of 0.01 and 0.99.") %>%
+  tab_style(c("scale_down"))
+```
+
+```{r ate-numbers, echo = FALSE}
+t_range <- function(src) range(abs(ate_all$t[ate_all$source == src]))
+ate_wide <- ate_all %>% select(Email, source, estimate) %>% pivot_wider(names_from = source, values_from = estimate)
+gap_fl <- max(abs(ate_wide$`dr_scores(), forests` - ate_wide$`dr_scores(), lasso`))
+```
+
+**Where the columns agree and where they do not.** The shipped scores
+and the rerun agree to forest noise, which confirms the benchmark. The
+authors' columns carry t-statistics between
+`r fmt(t_range("Authors' shipped scores")[1], 1)` and
+`r fmt(t_range("Authors' shipped scores")[2], 1)`; ours carry between
+`r fmt(t_range("dr_scores(), forests")[1], 1)` and
+`r fmt(t_range("dr_scores(), forests")[2], 1)` on the same pairs. The
+difference is the propensity in the denominator: the pooled propensity
+of an email is a small number for most customers, and the code divides
+both residual terms by it, so the authors' scores are the outcome-model
+contrast plus a very noisy correction. With the pairwise propensity and
+the paper's formula, the same forests give estimates whose standard
+errors are an order of magnitude smaller. Our forest and lasso versions
+agree within `r fmt(gap_fl, 3)` on every email, including email 3, whose
+effect is close to zero and changes sign between the two learners. For
+emails 1, 2, and 5 the doubly robust estimates are read on the trimmed
+population only (Table \@ref(tab:tab-trim)), so they are effects on the
+customers the email could have reached, not on everyone.
+
+```{r fig-ates, echo = FALSE, fig.height = 3.4, fig.cap = "Average treatment effects of the five emails with respect to the baseline email at the open stage, with 95 percent error bars (the layout of the paper's Figure 1). Emails are ordered by the estimate from our forest version in every panel so the panels can be compared."}
+ord <- ate_forest$Email[order(ate_forest$estimate)]
+plot_df <- ate_all %>% filter(source != "Authors' script, rerun") %>%
+  mutate(rank = match(Email, ord),
+         source = factor(source, levels = c("Authors' shipped scores", "dr_scores(), forests", "dr_scores(), lasso")))
+ggplot(plot_df, aes(rank, estimate)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_line(colour = "#E41A1C", linewidth = 0.4) +
+  geom_errorbar(aes(ymin = estimate - 1.96 * std.error, ymax = estimate + 1.96 * std.error), width = 0.15, colour = "#E41A1C") +
+  geom_point(colour = "#E41A1C", size = 1.6) +
+  facet_wrap(~ source) +
+  scale_x_continuous(breaks = 1:5, labels = ord) +
+  labs(x = "Email treatments", y = "Lift w.r.t. base email") +
+  theme_bw(base_size = 10)
+```
+
+**Why the figure is drawn this way.** The paper sorts the 33 emails by
+their open-stage ATE and keeps that order in the purchase and amount
+figures, so a reader can see at a glance which emails move down the funnel
+in a different order. The connected points draw the eye to the shape of
+the distribution of effects, and the tight error bars make the point that
+the effects are precisely estimated at this sample size. Here the same
+order is kept across estimators instead of across outcomes.
+
+# Second stage: projecting the scores on the components {#sec-second-stage}
+
+## What the projection estimates
+
+**The second stage is a regression of the pooled scores on the component
+differences, and its coefficients are marginal component effects.** With
+$\psi_{ij}$ the score of customer $i$ in the pair of email $j$ with the
+baseline and $c_j$ the vector of component differences of email $j$,
+$$
+\beta = \arg\min_b E\big[(\psi_{ij} - c_j' b)^2\big]
+$$
+is the best linear predictor of the conditional mean of the score, which
+is the pairwise treatment effect, in the components (Semenova and
+Chernozhukov 2021). Because the score is Neyman orthogonal, ordinary
+least squares with heteroskedasticity-robust standard errors is valid as
+if the nuisances were known. This is exactly what `cate_blp()` computes;
+the paper's Table 10 is its coefficient table.
+
+**Why the components are differenced from the baseline.** A treatment
+email's score measures its effect relative to the baseline, so the
+regressor must measure the email's content relative to the baseline too.
+The intercept is then the effect of an email that shares every component
+with the baseline. In the paper, 33 emails identify 19 coefficients, so
+the projection is overidentified and the intercept is informative: a
+value far from zero would signal a component missing from the list.
+
+**In the replication data the projection is exactly identified, which
+changes how its table must be read.** Five treatment emails identify
+five coefficients (an intercept and four components), so the regression
+fits the five email-level means of the scores exactly and the
+coefficients are a linear transformation of the five pairwise ATEs of
+Table \@ref(tab:tab-ates): $\hat\beta = C^{-1}\widehat{\mathrm{ATE}}$
+with $C$ the five-by-five matrix of a constant and the component
+differences. The check in Section \@ref(sec-our-projection) confirms it.
+Nothing is tested by the fit, the intercept is a free parameter, and the
+standard errors are the ATE standard errors propagated through $C^{-1}$,
+which is why a component whose values barely differ across emails
+receives a large coefficient with a large standard error.
+
+## The authors' second stage, rerun
+
+**The authors trim, draw a stratified subsample of 25,000 scores per
+pair, and run one least-squares regression with HC1 standard errors.**
+The subsample keeps the treated share of each pair; the script notes that
+the proprietary data were "many times larger", so the subsample is a
+device for the public release rather than part of the method.
+
+```{r authors-second-stage}
+authors_second_stage <- function(Analysis_Mat, EmailChara, seed = 226, per_pair = 25000) {
+  Analysis_Mat_temp <- subset(Analysis_Mat, Propensity > .01 & Propensity < .99)
+  set.seed(seed)
+  temp <- NULL
+  for (i in sort(unique(Analysis_Mat_temp$Treat_E))) {
+    hold <- subset(Analysis_Mat_temp, Treat_E == i)
+    hold_treat <- subset(hold, Wtest == 1)
+    ratio <- nrow(hold_treat) / nrow(hold)
+    sample_treat <- sample.int(n = nrow(hold_treat), size = floor(ratio * per_pair), replace = FALSE)
+    hold_control <- subset(hold, Wtest == 0)
+    sample_control <- sample.int(n = nrow(hold_control), size = per_pair - length(sample_treat), replace = FALSE)
+    temp <- rbind(temp, hold_treat[sample_treat, ], hold_control[sample_control, ])
+  }
+  Email_Analysis <- left_join(temp, EmailChara, by = c("Treat_E" = "Email_Type"))
+  m <- lm(Score_rat ~ Characters + Component1 + Component2 + Component3, data = Email_Analysis)
+  list(model = m, data = Email_Analysis,
+       coef = lmtest::coeftest(m, vcov = sandwich::vcovHC(m, type = "HC1")))
+}
+authors_ss <- authors_second_stage(step2_authors, components)
+authors_ss$coef
+```
+
+## Our version: `bind_scores()` and `cate_blp()` {#sec-our-projection}
+
+**Pooling the five score objects and projecting them is two calls.** The
+component differences are attached to each row through the `set` column
+that `bind_scores()` records, so the dictionary in `cate_blp()` is the
+same four columns as in the authors' regression.
+
+```{r our-second-stage}
+component_rows <- function(pooled) {
+  idx <- match(as.integer(sub("email", "", pooled$data$set)), components$Email_Type)
+  components[idx, c("Characters", "Component1", "Component2", "Component3")]
+}
+pooled_forest <- bind_scores(scores_forest)
+pooled_lasso <- bind_scores(scores_lasso)
+blp_forest <- cate_blp(pooled_forest, ~ Characters + Component1 + Component2 + Component3,
+                       data = component_rows(pooled_forest), uniform = FALSE)
+blp_lasso <- cate_blp(pooled_lasso, ~ Characters + Component1 + Component2 + Component3,
+                      data = component_rows(pooled_lasso), uniform = FALSE)
+blp_forest
+```
+
+**For the authors' scores we also run the full-sample projection.** The
+shipped file has no outcome, so `cate_blp()` cannot rebuild a score
+object from it; the same regression with HC1 standard errors on all
+trimmed rows is run with `estimatr::lm_robust()`, which is the identical
+computation.
+
+```{r exact-identification}
+C <- cbind(1, as.matrix(components[order(components$Email_Type), c("Characters", "Component1", "Component2", "Component3")]))
+ate_forest_vec <- sapply(scores_forest, function(s) s$ate$estimate)
+c(max_abs_difference = max(abs(solve(C, ate_forest_vec) - blp_forest$beta)))
+```
+
+```{r authors-full-projection}
+shipped_full <- step2_authors %>% filter(Propensity > 0.01, Propensity < 0.99) %>%
+  left_join(components, by = c("Treat_E" = "Email_Type"))
+blp_shipped_full <- estimatr::lm_robust(Score_rat ~ Characters + Component1 + Component2 + Component3,
+                                        data = shipped_full, se_type = "HC1")
+```
+
+```{r tab-components, echo = FALSE}
+coef_rows <- function(est, se, p, nobs, r2, label) {
+  tibble(term = names(est), estimate = est, std.error = se, p.value = p, model = label,
+         nobs = nobs, r2 = r2)
+}
+a_ct <- authors_ss$coef
+cols <- list(
+  coef_rows(a_ct[, 1], a_ct[, 2], a_ct[, 4], nobs(authors_ss$model), summary(authors_ss$model)$adj.r.squared, "(1) Authors' script (subsample)"),
+  coef_rows(coef(blp_shipped_full), blp_shipped_full$std.error, blp_shipped_full$p.value, nobs(blp_shipped_full), blp_shipped_full$adj.r.squared, "(2) Authors' scores, all rows"),
+  coef_rows(setNames(blp_forest$beta, blp_forest$coefficients$term), blp_forest$coefficients$std.error, blp_forest$coefficients$p.value, blp_forest$n, blp_forest$adj.r.squared, "(3) dr\\_scores(), forests"),
+  coef_rows(setNames(blp_lasso$beta, blp_lasso$coefficients$term), blp_lasso$coefficients$std.error, blp_lasso$coefficients$p.value, blp_lasso$n, blp_lasso$adj.r.squared, "(4) dr\\_scores(), lasso")
+)
+comp_tab <- bind_rows(cols) %>%
+  mutate(cell_est = paste0(fmt(estimate, 4), stars(p.value)), cell_se = paste0("(", fmt(std.error, 4), ")"))
+term_order <- c("(Intercept)", "Characters", "Component1", "Component2", "Component3")
+type_of <- c("(Intercept)" = "", "Characters" = "Footprint", "Component1" = "Components", "Component2" = "Components", "Component3" = "Components")
+wide <- lapply(unique(comp_tab$model), function(m) {
+  d <- comp_tab %>% filter(model == m)
+  d <- d[match(term_order, d$term), ]
+  tibble(!!m := d$cell_est, !!paste0(m, " se") := d$cell_se)
+})
+body <- bind_cols(tibble(Type = type_of[term_order], Variables = term_order), wide)
+foot <- bind_rows(
+  tibble(Type = "", Variables = "Observations", !!!setNames(as.list(unlist(lapply(cols, function(d) c(fmt0(d$nobs[1]), "")))), names(body)[-(1:2)])),
+  tibble(Type = "", Variables = "(Adjusted) R2", !!!setNames(as.list(unlist(lapply(cols, function(d) c(fmt(d$r2[1], 4), "")))), names(body)[-(1:2)]))
+)
+tab <- bind_rows(body, foot)
+kbl(tab, booktabs = TRUE, linesep = "", escape = FALSE, align = c("l", "l", rep(c("r", "l"), 4)),
+    col.names = c("Type", "Variables", rep(c("", ""), 4)),
+    caption = "Effect of the treatment components on the open stage (the layout of the paper's Table 10). Each pair of columns shows the coefficient with significance stars and the HC1 standard error in parentheses. (1) the authors' script on their scores with the 25,000-row subsample per pair; (2) the same regression on all trimmed rows of their scores; (3) and (4) cate\\_blp() on our forest and lasso scores. . p < 0.10; * p < 0.05; ** p < 0.01; *** p < 0.001.") %>%
+  add_header_above(c(" " = 2, "(1) Authors' script" = 2, "(2) Authors' scores, all" = 2, "(3) Forests" = 2, "(4) Lasso" = 2)) %>%
+  tab_style(c("scale_down")) %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "none") %>%
+  row_spec(length(term_order), hline_after = TRUE)
+```
+
+```{r component-numbers, echo = FALSE}
+get_coef <- function(d, term) d$estimate[d$term == term]
+```
+
+**Reading Table \@ref(tab:tab-components).** Column (2) has the same
+coefficients as column (1) up to sampling: the subsample costs precision
+(its standard errors are larger by a factor near
+`r fmt(median(cols[[1]]$std.error[-1] / cols[[2]]$std.error[-1]), 1)`) and
+nothing else, which is why the authors could use it for the public
+release. Columns (3) and (4) transform our pairwise ATEs, and because
+those ATEs are precise the component coefficients are precise too; the
+authors' columns inherit the imprecision of their scores. Since the
+system is exactly identified, agreement between columns is agreement
+between the ATE columns of Table \@ref(tab:tab-ates) and nothing more;
+the paper's overidentified Table 10, with 33 emails behind 19
+coefficients, is the version in which the projection averages evidence
+across emails and the star pattern carries information about
+components.
+
+**Why the paper reports adjusted R-squared values near 0.01 without
+concern.** The dependent variable is an individual score whose variance
+is dominated by the outcome residual divided by a propensity; the
+projection explains the conditional mean, not the individual noise. A
+low R-squared is expected, and the standard errors, not the fit, tell
+whether the component effects are learned.
+
+# Heterogeneous effects by engagement segment {#sec-segments}
+
+## Why two segments, and why k-means
+
+**The paper wants heterogeneity that a manager can act on, so it
+summarizes the fifteen covariates into two customer types before
+projecting.** A projection on all covariates would give fifteen
+interaction coefficients per component, which no targeting rule uses.
+K-means on the standardized covariates with the elbow heuristic gives two
+clusters; Table 11 shows that one cluster is more recent, more frequent,
+and higher spending on every variable, so the labels high engagement (HE)
+and low engagement (LE) need no further justification. The segments are
+built from pretreatment covariates only, so conditioning on them keeps
+the identification argument intact.
+
+```{r segments}
+X_std <- scale(promo[, covs])
+set.seed(1)
+wss <- sapply(1:6, function(k) kmeans(X_std, centers = k, nstart = 10, iter.max = 50)$tot.withinss)
+km <- kmeans(X_std, centers = 2, nstart = 10, iter.max = 50)
+seg_means <- tapply(promo$Recency, km$cluster, mean)
+he_cluster <- as.integer(names(which.min(seg_means)))
+promo$segment <- ifelse(km$cluster == he_cluster, "High engagement", "Low engagement")
+table(promo$segment)
+```
+
+```{r fig-elbow, echo = FALSE, fig.height = 2.6, out.width = "60%", fig.cap = "Within-cluster sum of squares by number of k-means clusters on the standardized covariates. The bend at two clusters is the elbow the paper uses."}
+ggplot(tibble(k = 1:6, wss = wss), aes(k, wss)) + geom_line() + geom_point() +
+  labs(x = "Number of clusters", y = "Within-cluster sum of squares") + theme_minimal(base_size = 10)
+```
+
+```{r tab-segments, echo = FALSE}
+seg_stats <- promo %>% group_by(segment) %>%
+  summarise(across(all_of(covs), list(mean = mean, sd = sd)), n = n(), .groups = "drop")
+seg_tab <- tibble(
+  Group = cov_desc$Group[match(covs, cov_desc$Variable)],
+  Variable = covs,
+  he_m = sapply(covs, function(v) seg_stats[[paste0(v, "_mean")]][seg_stats$segment == "High engagement"]),
+  he_s = sapply(covs, function(v) seg_stats[[paste0(v, "_sd")]][seg_stats$segment == "High engagement"]),
+  le_m = sapply(covs, function(v) seg_stats[[paste0(v, "_mean")]][seg_stats$segment == "Low engagement"]),
+  le_s = sapply(covs, function(v) seg_stats[[paste0(v, "_sd")]][seg_stats$segment == "Low engagement"])
+) %>% mutate(across(c(he_m, he_s, le_m, le_s), ~ fmt(.x, 2)))
+seg_tab <- bind_rows(seg_tab, tibble(Group = "Number of customers", Variable = "",
+                                     he_m = fmt0(seg_stats$n[seg_stats$segment == "High engagement"]), he_s = "",
+                                     le_m = fmt0(seg_stats$n[seg_stats$segment == "Low engagement"]), le_s = ""))
+kbl(seg_tab, booktabs = TRUE, linesep = "", col.names = c("Recipient characteristic", "Pretreatment covariate", "Mean", "Standard deviation", "Mean", "Standard deviation"),
+    caption = "Summary statistics of the pretreatment covariates in the two k-means segments (the layout of the paper's Table 11).") %>%
+  add_header_above(c(" " = 2, "High engagement" = 2, "Low engagement" = 2)) %>%
+  tab_style() %>% collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+```
+
+## Component effects by segment
+
+**Tables 12 and 13 of the paper are Table 10 run twice, once per
+segment, and the reader is meant to compare the same coefficient across
+the two.** The paper's finding is that most components work better for
+engaged customers, with a few reversals at the purchase-amount stage. The
+segment enters the projection as a sample split rather than as an
+interaction so that every coefficient, the intercept included, is
+segment specific.
+
+```{r segment-projection}
+attach_segment <- function(pooled) {
+  pooled$data$segment <- promo$segment[match(pooled$data$ID, promo$ID)]
+  pooled
+}
+pooled_forest <- attach_segment(pooled_forest)
+subset_scores <- function(pooled, keep) {
+  out <- pooled
+  out$score <- pooled$score[keep]; out$y <- pooled$y[keep]; out$d <- pooled$d[keep]
+  out$nuisance <- pooled$nuisance[keep, ]; out$residuals <- pooled$residuals[keep, ]
+  out$data <- pooled$data[keep, ]; out$fold_id <- pooled$fold_id[keep]; out$n <- sum(keep)
+  out$ate <- list(estimate = mean(out$score), std.error = sd(out$score) / sqrt(out$n))
+  out
+}
+blp_by_segment <- lapply(c("High engagement", "Low engagement"), function(s) {
+  sub <- subset_scores(pooled_forest, pooled_forest$data$segment == s)
+  cate_blp(sub, ~ Characters + Component1 + Component2 + Component3, data = component_rows(sub), uniform = FALSE)
+})
+names(blp_by_segment) <- c("High engagement", "Low engagement")
+shipped_full$segment <- promo$segment[match(shipped_full$ID, promo$ID)]
+shipped_by_segment <- lapply(c("High engagement", "Low engagement"), function(s) {
+  estimatr::lm_robust(Score_rat ~ Characters + Component1 + Component2 + Component3,
+                      data = shipped_full[shipped_full$segment == s, ], se_type = "HC1")
+})
+```
+
+```{r tab-segment-components, echo = FALSE}
+seg_cols <- list(
+  coef_rows(setNames(blp_by_segment[[1]]$beta, blp_by_segment[[1]]$coefficients$term), blp_by_segment[[1]]$coefficients$std.error,
+            blp_by_segment[[1]]$coefficients$p.value, blp_by_segment[[1]]$n, blp_by_segment[[1]]$adj.r.squared, "(1) HE, forests"),
+  coef_rows(setNames(blp_by_segment[[2]]$beta, blp_by_segment[[2]]$coefficients$term), blp_by_segment[[2]]$coefficients$std.error,
+            blp_by_segment[[2]]$coefficients$p.value, blp_by_segment[[2]]$n, blp_by_segment[[2]]$adj.r.squared, "(2) LE, forests"),
+  coef_rows(coef(shipped_by_segment[[1]]), shipped_by_segment[[1]]$std.error, shipped_by_segment[[1]]$p.value,
+            nobs(shipped_by_segment[[1]]), shipped_by_segment[[1]]$adj.r.squared, "(3) HE, authors' scores"),
+  coef_rows(coef(shipped_by_segment[[2]]), shipped_by_segment[[2]]$std.error, shipped_by_segment[[2]]$p.value,
+            nobs(shipped_by_segment[[2]]), shipped_by_segment[[2]]$adj.r.squared, "(4) LE, authors' scores")
+)
+component_table <- function(cols, caption, headers) {
+  comp <- bind_rows(cols) %>%
+    mutate(cell_est = paste0(fmt(estimate, 4), stars(p.value)), cell_se = paste0("(", fmt(std.error, 4), ")"))
+  wide <- lapply(unique(comp$model), function(m) {
+    d <- comp %>% filter(model == m)
+    d <- d[match(term_order, d$term), ]
+    tibble(!!m := d$cell_est, !!paste0(m, " se") := d$cell_se)
+  })
+  body <- bind_cols(tibble(Type = type_of[term_order], Variables = term_order), wide)
+  foot <- bind_rows(
+    tibble(Type = "", Variables = "Observations", !!!setNames(as.list(unlist(lapply(cols, function(d) c(fmt0(d$nobs[1]), "")))), names(body)[-(1:2)])),
+    tibble(Type = "", Variables = "(Adjusted) R2", !!!setNames(as.list(unlist(lapply(cols, function(d) c(fmt(d$r2[1], 4), "")))), names(body)[-(1:2)]))
+  )
+  tab <- bind_rows(body, foot)
+  kbl(tab, booktabs = TRUE, linesep = "", escape = FALSE, align = c("l", "l", rep(c("r", "l"), length(cols))),
+      col.names = c("Type", "Variables", rep(c("", ""), length(cols))), caption = caption) %>%
+    add_header_above(headers) %>%
+    tab_style(c("scale_down")) %>%
+    collapse_rows(columns = 1, valign = "top", latex_hline = "none") %>%
+    row_spec(length(term_order), hline_after = TRUE)
+}
+component_table(seg_cols,
+  caption = "Effect of the treatment components on the open stage by engagement segment (the layout of the paper's Tables 12 and 13, side by side). Coefficient with significance stars and HC1 standard error in parentheses; (1)-(2) cate\\_blp() on our forest scores, (3)-(4) the same regression on the authors' trimmed scores. . p < 0.10; * p < 0.05; ** p < 0.01; *** p < 0.001.",
+  headers = c(" " = 2, "(1) HE, forests" = 2, "(2) LE, forests" = 2, "(3) HE, authors" = 2, "(4) LE, authors" = 2))
+```
+
+```{r segment-numbers, echo = FALSE}
+seg_diff <- tibble(term = term_order,
+                   he = sapply(term_order, function(t) get_coef(seg_cols[[1]], t)),
+                   le = sapply(term_order, function(t) get_coef(seg_cols[[2]], t)))
+bigger_he <- sum(abs(seg_diff$he[-1]) > abs(seg_diff$le[-1]))
+```
+
+**Reading Table \@ref(tab:tab-segment-components).** Within each
+segment the projection is again exactly identified, so each column is a
+transformation of that segment's five GATEs (Section
+\@ref(sec-gates)). For `r bigger_he` of the four components the
+coefficient is larger in absolute value for the engaged segment, the
+pattern the paper reports for its real components. Segment-specific
+coefficients are less precise than the pooled ones because each
+regression uses about half of the rows, which is why the paper reports
+the pooled Table 10 first and the segment tables as a refinement.
+
+## Group average effects of each email {#sec-gates}
+
+**Before projecting on components, the paper's first projection class is
+the GATE of each pairwise contrast on customer groups.** `cate_gate()`
+gives the doubly robust GATE of every email by segment with intervals that
+are simultaneous across the two segments and a test that the segments
+differ. This is the object the off-policy exercise needs.
+
+```{r gates}
+gate_by_email <- lapply(1:5, function(j) {
+  s <- scores_forest[[j]]
+  seg <- promo$segment[match(s$data$ID, promo$ID)]
+  cate_gate(s, seg, n_boot = 499, seed = 10 + j)
+})
+gate_tab <- bind_rows(lapply(1:5, function(j) gate_by_email[[j]]$table %>% mutate(Email = j, p_equal = gate_by_email[[j]]$test_equal$p.value)))
+```
+
+```{r tab-gates, echo = FALSE}
+gate_tab %>%
+  transmute(Email, Segment = group, n = fmt0(n), GATE = fmt(estimate, 4), `Std. error` = fmt(std.error, 4),
+            `95\\% CI` = paste0("[", fmt(conf.low, 4), ", ", fmt(conf.high, 4), "]"),
+            `p (equal)` = fmt(p_equal, 3)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      caption = "Doubly robust group average treatment effect of each email against the baseline, by engagement segment, with pointwise 95 percent intervals and the p-value of the test that the two segments share one effect.") %>%
+  tab_style() %>% collapse_rows(columns = c(1, 7), valign = "top", latex_hline = "major")
+```
+
+# Off-policy evaluation {#sec-ope}
+
+## Why the paper ends with a counterfactual
+
+**The paper closes by turning the estimates into money because a
+component effect is only useful if it changes a targeting decision.**
+Its Section 6.5 takes the two clearance emails of Table 8, notes that the
+firm sent the more generous deal to the less engaged customers, and asks
+what revenue would be under the swap. Doubly robust scores make this
+cheap: the value of any rule that assigns emails from pretreatment
+variables is an average of scores, so the same first-stage objects that
+produced the ATEs evaluate a new policy without new data (Dudík, Langford,
+and Li 2011). The paper reports an 11 percent revenue lift.
+
+## The pair of emails 3 and 5 with our scores
+
+**Within the pair, a policy is a rule that sends email 3 rather than
+email 5, and `policy_value()` prices it against sending either email to
+everyone.** The scores of Section \@ref(sec-ates) treat email 3 as the
+treatment, so a rule's value is its gain in opens over sending email 5 to
+all, and the gain over sending email 3 to all is reported by
+`baseline = "all"`.
+
+```{r ope-pair}
+sc_ex$data$segment <- promo$segment[match(sc_ex$data$ID, promo$ID)]
+gate_ex <- cate_gate(sc_ex, "segment", n_boot = 499, seed = 3)
+gate_ex$table[, c("group", "n", "estimate", "std.error", "conf.low", "conf.high")]
+rules <- list(
+  send_3_to_high_engagement = as.numeric(sc_ex$data$segment == "High engagement"),
+  send_3_to_low_engagement = as.numeric(sc_ex$data$segment == "Low engagement"),
+  send_3_to_everyone = rep(1, sc_ex$n)
+)
+ope_vs_5 <- policy_value(sc_ex, rules, baseline = "none")
+ope_vs_3 <- policy_value(sc_ex, rules, baseline = "all")
+```
+
+```{r tab-ope, echo = FALSE}
+bind_rows(ope_vs_5 %>% mutate(comparison = "Gain over sending email 5 to everyone"),
+          ope_vs_3 %>% mutate(comparison = "Gain over sending email 3 to everyone")) %>%
+  transmute(Comparison = comparison, Rule = gsub("_", " ", policy), `Share sent email 3` = fmt(share_treated, 3),
+            `Gain in open rate` = fmt(estimate, 4), `Std. error` = fmt(std.error, 4),
+            `95\\% CI` = paste0("[", fmt(conf.low, 4), ", ", fmt(conf.high, 4), "]")) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      caption = "Off-policy evaluation of rules that choose between emails 3 and 5 by segment, on the trimmed pair sample: gain in the open rate per customer over the two uniform policies, with standard errors from the doubly robust scores.") %>%
+  tab_style(c("scale_down")) %>% collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+```
+
+```{r ope-learn}
+sc_ex$data$segment_he <- as.numeric(sc_ex$data$segment == "High engagement")
+pol_ex <- policy_learn(sc_ex, x = "segment_he", method = "tree", depth = 1, seed = 1)
+```
+
+```{r ope-numbers, echo = FALSE}
+best_rule <- ope_vs_5$policy[which.max(ope_vs_5$estimate)]
+g3 <- gate_by_email[[3]]$table
+```
+
+**What the table says.** The segment GATEs give the direction. Email 5
+beats email 3 in both segments (`r fmt(gate_ex$table$estimate[1])` and
+`r fmt(gate_ex$table$estimate[2])` for the engaged and the disengaged),
+so no segment rule beats sending email 5 to everyone: every gain in the
+first block is negative. The paper's pair had a reversal across segments,
+which is why a swap paid there. Here the off-policy evaluation says that
+the firm should not swap, which is the point of evaluating a rule before
+deploying it.
+
+**Why the paper uses separate samples for estimation and prediction.**
+A rule chosen on the same scores that evaluate it is chosen to look good
+on them. `policy_learn()` holds out half of the rows before searching
+and reports the held-out value; the learned depth-one rule below sends
+email 3 to no one, and its held-out gain over sending email 3 to
+everyone is the honest version of the last block of the table.
+
+```{r ope-learn-print}
+pol_ex$value
+```
+
+## An email whose effect reverses by segment
+
+**Email 3 against the baseline is the pair with a reversal.** Its GATE
+is `r fmt(g3$estimate[1])` for the engaged segment and
+`r fmt(g3$estimate[2])` for the disengaged (Table \@ref(tab:tab-gates)),
+so the engaged should keep the baseline and the disengaged should
+receive email 3. The rule that sends email 3 only to the disengaged is priced
+below against sending it to everyone and to no one, and a depth-one tree
+on the segment indicator learns the same rule on held-out rows.
+
+```{r ope-email3}
+s3 <- scores_forest[[3]]
+s3$data$segment_he <- as.numeric(promo$segment[match(s3$data$ID, promo$ID)] == "High engagement")
+rules3 <- list(send_3_to_disengaged_only = 1 - s3$data$segment_he,
+               send_3_to_engaged_only = s3$data$segment_he,
+               send_3_to_everyone = rep(1, s3$n))
+policy_value(s3, rules3, baseline = "all")
+pol3 <- policy_learn(s3, x = "segment_he", method = "tree", depth = 1, seed = 2)
+pol3
+```
+
+**The gain is small in absolute terms but precisely estimated.** Sending
+email 3 only to the disengaged, rather than to everyone, raises the open
+rate by the first row's estimate per customer, and the held-out value of
+the learned rule confirms it. Scaled to the number of recipients, this is
+the analogue of the paper's revenue comparison between its factual and
+counterfactual policies.
+
+# What the replication teaches about the workflow {#sec-lessons}
+
+**One score object carries the whole analysis.** The pairwise ATEs, the
+component projection, the segment projections, the GATEs, and the policy
+values are all averages or regressions of the same doubly robust scores.
+Building the scores once, with cross-fitted nuisances and a recorded
+trimming rule, and then reusing them is the design of the paper and of
+the package.
+
+**Sample splitting is the ingredient that makes forests admissible.**
+The authors train on one half and score the other; two-fold cross-fitting
+does the same for both halves. Either way, no customer's outcome enters
+the nuisance model that scores it. That is what removes the overfitting
+bias of Section 04, and the price is a smaller effective training sample
+for each nuisance.
+
+**Multi-treatment propensities are a modelling choice with consequences
+for the trimmed population.** The paper estimates each email's propensity
+against the pooled population and stabilizes it; the pairwise propensity
+is the alternative. In the paper's data the two agree because overlap
+holds. In the synthetic data they disagree for the three emails whose
+targeting was deterministic, and the disagreement shows up as different
+trimmed populations and different ATEs. Balance tables are read before
+estimation for this reason.
+
+**The code is the estimator.** The script divides both residuals by the
+treatment email's pooled propensity while the paper's formula uses the
+pairwise control propensity for the control term. The shipped file was
+reproduced from its own columns with the code's formula, which is how the
+difference was found, and its cost was visible in the ATE table: the
+authors' scores carry standard errors an order of magnitude larger than
+the same forests give with the paper's formula. Replication means
+matching the script, then judging the script against the paper.
+
+**Subsampling in the projection is a release device, not part of the
+method.** The 25,000-row subsample changes the standard errors and nothing
+else; the full-sample projection with HC1 errors is `cate_blp()`, and it
+also provides simultaneous bands that the paper does not report.
+
+**Low R-squared values in the projection are expected.** The dependent
+variable is an individual score with a propensity in its denominator; the
+regression explains its conditional mean, and the standard errors carry
+the inference.
+
+**Segments and policies are where the estimates become decisions.**
+Two clusters on pretreatment variables are enough to show that component
+effects differ by engagement, and the off-policy value of a segment rule
+is a mean of scores with a standard error. The held-out value of a learned
+rule is the honest number to report.
+
+# References
+
+- Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C., Newey, W., and Robins, J. (2018). Double/debiased machine learning for treatment and structural parameters. *The Econometrics Journal*, 21(1), C1-C68.
+- Crump, R. K., Hotz, V. J., Imbens, G. W., and Mitnik, O. A. (2009). Dealing with limited overlap in estimation of average treatment effects. *Biometrika*, 96(1), 187-199.
+- Dudík, M., Langford, J., and Li, L. (2011). Doubly robust policy evaluation and learning. *Proceedings of the 28th International Conference on Machine Learning*, 1097-1104.
+- Ellickson, P. B., Kar, W., and Reeder, J. C. (2023). Estimating marketing component effects: Double machine learning from targeted digital promotions. *Marketing Science*, 42(4), 704-728.
+- Hernán, M. A. and Robins, J. M. (2006). Estimating causal effects from epidemiological data. *Journal of Epidemiology and Community Health*, 60(7), 578-586.
+- McCaffrey, D. F., Griffin, B. A., Almirall, D., Slaughter, M. E., Ramchand, R., and Burgette, L. F. (2013). A tutorial on propensity score estimation for multiple treatments using generalized boosted models. *Statistics in Medicine*, 32(19), 3388-3414.
+- Semenova, V. and Chernozhukov, V. (2021). Debiased machine learning of conditional average treatment effects and other causal functions. *The Econometrics Journal*, 24(2), 264-289.

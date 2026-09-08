@@ -1,0 +1,461 @@
+---
+title: "Replication: First-Generation Elite"
+subtitle: "The Role of School Social Networks (Cattan, Salvanes, and Tominey, AER 2025): an audit of the IV mediation design and a calibrated substitute for the registry data"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/10_mediation/cattan2025/"
+  n_boot: 199
+  n_sims: 100
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(fixest)
+data_path <- params$data_path
+n_boot <- params$n_boot
+n_sims <- params$n_sims
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+fmt0 <- function(x) formatC(x, digits = 0, format = "f", big.mark = ",")
+paren <- function(x, digits = 3) paste0("(", fmt(x, digits), ")")
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+dofiles <- list.files(file.path(data_path, "DoFiles_Sept2025"), pattern = "\\.do$")
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is whether going to high school with the children of the
+elite makes low-income students more likely to enter elite degrees, and
+the answer is yes, through a channel that runs against a channel through
+grades.** Norwegian registry data follow every student who finished
+middle school between 2002 and 2010 into high school, university, and
+the labour market. Exposure to elite peers is the share of a student's
+high-school cohort whose parents hold an elite degree, standardized.
+Within-school variation across cohorts identifies the effect, with
+school, cohort, and program fixed effects. For low-SES students a one
+standard deviation rise in exposure raises enrollment in an elite degree
+by 1.1 percentage points (Table 2), about a fifth of the baseline rate.
+
+**The mechanism section is an instrumental-variables mediation
+analysis.** Elite peers lower grades (competition, or teacher grading),
+and grades govern admission, so the total effect hides a negative
+channel. To separate the channels the authors instrument the high-school
+grade point average with a lottery: in the third year of high school
+students are randomly assigned to a written mathematics exam, which is
+graded blind and raises the GPA of those assigned. Table 4 reports the
+first stage (GPA on peers and on the lottery), the second stage
+(enrollment on peers and instrumented GPA), and the decomposition: the
+direct effect is the second-stage peer coefficient $\gamma_1$, the
+indirect effect is the first-stage peer coefficient times the
+instrumented GPA effect, $\delta_1 \gamma_2$, and the total effect is
+their sum. For low-SES students the direct effect (0.026) is larger than
+the total (0.011) because the indirect effect through grades is negative
+($-0.015$).
+
+**Why this paper anchors the endogenous-mediator part of Section 10.**
+The mediator is a choice-laden outcome, GPA, and the decomposition needs
+an exogenous shifter of it. The lottery is an encouragement design for
+the mediator. The extra assumption, that the effect of GPA on enrollment
+is the same for the lottery's compliers as for the students whose grades
+the peers move (Huber 2019), is what the paper's Appendix Figure A13
+checks by re-estimating $\gamma_2$ across subgroups.
+
+**What the replication package holds and does not hold.** The registry
+data cannot be released; the package contains the complete do-files, the
+auxiliary inputs (crosswalks, CPI series, subject codes, occupation
+lists), and the README. There is no synthetic dataset. This note audits
+the code path that produces Table 4, then builds a design calibrated to
+the published Table 4 and runs `mediate_iv()` on it to reproduce the
+table's layout, the homogeneity check, and the weak-instrument column.
+
+# Audit of the replication package {#sec-audit}
+
+**The package is a code map: `r length(dofiles)` do-files, no analysis
+data.** `Master_Replication.do` sets the paths to a restricted
+`replication_data` folder and calls the others in order.
+
+```{r audit-table, echo = FALSE}
+tibble(
+  `Do-file` = c("Replication\\_ElitePeers.do, Analysis\\_Replication.do", "Analysis\\_IV\\_Replication.do", "FigureA13\\_Replication.do",
+                "simulate\\_replication.do", "Analysis\\_Longrun\\_Replication.do, RankRank\\_Replication.do", "TeacherData\\_Replication.do, MeasurementError\\_Replication.do, Placebo\\_Replication.do"),
+  Produces = c("Tables 1-3, Figure 1: exposure measure, total effects by SES", "Table 4 (IV mediation), Table A11 (lottery balance)",
+               "Figure A13: gamma2 by subgroup (homogeneity check)", "Section VII: reallocation of low-SES pupils across schools and predicted mobility",
+               "Tables 5-6: earnings and rank-rank mobility", "Appendix: teacher composition, measurement error, placebo cohorts"),
+  `Missing input` = c("elitetemp.dta (analysis file from registries)", "tab\\_vitnemalfag\\_vgskole (exam registry), elitetemp.dta",
+                      "elitetemp.dta", "elitetemp.dta, rankrank\\_Replication.dta", "earnings registries", "teacher and census registries")
+) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE, caption = "The replication package by output and by missing input. Every analysis file is built from Norwegian registries that the package cannot include.") %>%
+  tab_style() %>% column_spec(1, width = "5.2cm") %>% column_spec(2, width = "5.5cm") %>% column_spec(3, width = "4cm")
+```
+
+**The Table 4 specification is explicit in `Analysis_IV_Replication.do`.**
+The instrument `writtenmaths` is built from the exam registry as an
+indicator for a written mathematics exam in the third year of a
+three-year high school. Then, for the low-SES sample:
+
+```
+xtivreg2 elitedegree mean_pexecutive_schoolstd $controlsminus spec alternative_educ
+    (gpa_tot_sd = writtenmaths) [pweight = meansize2] if parentedu == 1, fe first
+```
+
+with `xtset skole_orgnr1` (school fixed effects), cohort dummies and the
+parental-education, gender, origin, middle-school GPA, and parental
+occupation controls in `$controlsminus`, high-school program dummies
+(`spec`, `alternative_educ`), and weights equal to the school size. The
+same call on the high-SES sample gives columns 3 and 4, and `xtreg ...,
+fe` without GPA gives the OLS columns. Three observations from the audit:
+
+- The OLS columns of Table 4 are the total-effect regressions without
+  GPA (the Table 2 specification on the IV sample), not OLS with GPA as a
+  regressor. Panel C's "total effect" is that coefficient.
+- The IV call carries `[pweight = meansize2]`, which makes `xtivreg2`
+  report heteroskedasticity-robust standard errors; the table note says
+  "clustered at the school level". The cluster option appears in the
+  Table A11 regressions of the same file but not in the Table 4 line.
+- Panel C reports no standard errors for the direct, indirect, and total
+  effects. `mediate_iv()` bootstraps the whole system, which supplies
+  them.
+
+**`simulate_replication.do` is not a data generator.** It is the Section
+VII exercise: it reallocates low-SES students across schools cohort by
+cohort to raise their exposure, re-estimates the enrollment and earnings
+regressions by SES with `parmest`, and predicts outcomes under the new
+allocation. It reads `elitetemp.dta` on its first line. There is
+therefore no simulated dataset in the package to run, and the design
+below is this note's substitute.
+
+# A design calibrated to Table 4 {#sec-design}
+
+**The design keeps the structure of the paper's identification and the
+magnitudes of its Table 4.** Schools with sizes drawn around the paper's
+mean (58,304 pupils in 500 schools), nine cohorts, three programs,
+school-cohort exposure to elite peers standardized across school-cohorts,
+an unobserved ability that raises both GPA and enrollment (so that OLS
+on GPA is biased), a binary lottery for the written exam with the
+published first stage, and school-cohort shocks so that clustering by
+school matters. The outcome is kept linear so that the coefficients are
+the parameters of the design.
+
+```{r design-def}
+sim_cattan <- function(n_schools = 500, mean_size = 117, delta1 = -0.039, delta2 = 0.094,
+                       gamma1 = 0.026, gamma2 = 0.384, kappa = 0.15, sd_sc = 0.25, sd_gpa = 1.3, sd_y = 0.4,
+                       seed = 1) {
+  set.seed(seed)
+  size <- pmax(10, round(rgamma(n_schools, shape = 4, scale = mean_size / 4)))
+  n <- sum(size)
+  school <- rep(seq_len(n_schools), size)
+  cohort <- sample(2002:2010, n, replace = TRUE)
+  program <- sample(1:3, n, replace = TRUE)
+  school_fe <- rnorm(n_schools, 0, 0.3)[school]
+  cohort_fe <- (cohort - 2006) * 0.01
+  key <- paste(school, cohort)
+  sc_ids <- unique(key)
+  peer_raw <- rnorm(length(sc_ids), 0.10, 0.06)[match(key, sc_ids)]
+  peer <- (peer_raw - mean(peer_raw)) / sd(peer_raw)
+  u_sc_gpa <- rnorm(length(sc_ids), 0, sd_sc)[match(key, sc_ids)]
+  u_sc_y <- rnorm(length(sc_ids), 0, sd_sc / 4)[match(key, sc_ids)]
+  female <- rbinom(n, 1, 0.5)
+  ability <- rnorm(n)
+  z <- rbinom(n, 1, 0.5)
+  gpa <- school_fe + cohort_fe + delta1 * peer + delta2 * z + 0.1 * female + 0.5 * ability + u_sc_gpa + rnorm(n, 0, sd_gpa)
+  y <- 0.15 + 0.5 * school_fe + cohort_fe + gamma1 * peer + gamma2 * gpa + kappa * ability + 0.02 * female + u_sc_y + rnorm(n, 0, sd_y)
+  structure(data.frame(y = y, gpa = gpa, peer = peer, z = z, female = female, school = school, cohort = cohort,
+                       program = program, size = size[school]),
+            truth = list(direct = gamma1, indirect = delta1 * gamma2, total = gamma1 + delta1 * gamma2,
+                         first_stage = delta1, mediator_effect = gamma2, lottery = delta2))
+}
+low <- sim_cattan(seed = 1)
+high <- sim_cattan(n_schools = 409, mean_size = 49, delta1 = -0.010, delta2 = 0.043, gamma1 = 0.049, gamma2 = 0.384, seed = 2)
+c(low_n = nrow(low), low_schools = length(unique(low$school)), high_n = nrow(high), high_schools = length(unique(high$school)))
+```
+
+**The high-SES design differs in three published ways.** Fewer pupils
+(19,968 in 409 schools), a smaller first-stage effect of the lottery
+(0.043 against 0.094, with an F of 5.6 against 76.9), and a larger direct
+effect (0.049). The published $\gamma_2$ for high-SES students is 1.771
+with a standard error of 0.714, which a weak instrument produces from the
+same 0.384 as easily as from anything else; the design keeps 0.384 so
+that the weak-instrument column can be read against a known truth.
+
+# Table 4 in the published layout {#sec-table4}
+
+**One call per SES group gives every entry of the table.** `mediate_iv()`
+fits the first stage, the instrumented second stage, and the reduced
+forms with `fixest`, with the school, cohort, and program fixed effects,
+the school-size weights, and clustering by school, and bootstraps the
+system by school for the decomposition's standard errors.
+
+```{r table4-fit, cache = TRUE, cache.extra = list(n_boot)}
+fit_low <- mediate_iv(low, "y", "peer", "gpa", z = "z", x = "female", fe = c("school", "cohort", "program"),
+                      cluster = "school", weights = "size", n_boot = n_boot, seed = 1)
+fit_high <- mediate_iv(high, "y", "peer", "gpa", z = "z", x = "female", fe = c("school", "cohort", "program"),
+                       cluster = "school", weights = "size", n_boot = n_boot, seed = 1)
+```
+
+```{r table4-layout, echo = FALSE}
+col_iv <- function(f, dat) {
+  e <- f$effects; get <- function(t) e$estimate[e$term == t]; se <- function(t) e$std.error[e$term == t]
+  fs <- coeftable(f$models$first_stage)
+  iv <- coeftable(f$models$iv)
+  c(fmt(fs["peer", 1]), paren(fs["peer", 2]), fmt(fs["z", 1]), paren(fs["z", 2]), fmt(f$first_stage_F, 2),
+    fmt(get("direct")), paren(se("direct")), fmt(get("mediator_effect")), paren(se("mediator_effect")),
+    paste0(fmt(get("direct")), " ", paren(se("direct"))), paste0(fmt(get("indirect")), " ", paren(se("indirect"))),
+    paste0(fmt(get("total_z")), " ", paren(se("total_z"))),
+    fmt0(f$n), fmt0(length(unique(dat$school))))
+}
+col_ols <- function(f, dat) {
+  e <- f$effects
+  ols <- coeftable(f$models$reduced_form)
+  c("", "", "", "", "", fmt(ols["peer", 1]), paren(ols["peer", 2]), "", "", "", "", "", fmt0(f$n), fmt0(length(unique(dat$school))))
+}
+rows4 <- c("Proportion of parents with elite degree (std)", "", "Student took written math exam (IV)", "", "F-statistic",
+           "Proportion of parents with elite degree (std)", "", "High school GPA", "",
+           "Direct effect", "Indirect effect", "Total effect", "Number of pupils", "Number of schools")
+pub4 <- tibble(` ` = rows4,
+               `Low SES OLS` = c("", "", "", "", "", "0.011", "(0.004)", "", "", "", "", "", "58,304", "500"),
+               `Low SES IV` = c("-0.039", "(0.007)", "0.094", "(0.011)", "76.86", "0.026", "(0.004)", "0.384", "(0.053)", "0.026", "-0.015", "0.011", "58,304", "500"),
+               `High SES OLS` = c("", "", "", "", "", "0.032", "(0.009)", "", "", "", "", "", "19,968", "409"),
+               `High SES IV` = c("-0.010", "(0.010)", "0.043", "(0.018)", "5.57", "0.049", "(0.019)", "1.771", "(0.714)", "0.049", "-0.018", "0.031", "19,968", "409"))
+ours4 <- tibble(` ` = rows4, `Low SES OLS` = col_ols(fit_low, low), `Low SES IV` = col_iv(fit_low, low),
+                `High SES OLS` = col_ols(fit_high, high), `High SES IV` = col_iv(fit_high, high))
+ours4 %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lcccc",
+      caption = "Table 4 layout from the calibrated design: Panel A first stage (GPA on peers and the lottery, with the first-stage F), Panel B second stage (enrollment on peers and instrumented GPA; OLS columns are the total-effect regressions without GPA), Panel C the decomposition with school-bootstrap standard errors that the paper does not report. School, cohort, and program fixed effects; weights by school size; standard errors clustered by school.") %>%
+  pack_rows("Panel A. First-stage outcome: high school GPA", 1, 5) %>%
+  pack_rows("Panel B. Second-stage outcome: enrollment to elite degree", 6, 9) %>%
+  pack_rows("Panel C. Decomposition", 10, 12) %>%
+  tab_style("scale_down")
+pub4 %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lcccc", caption = "Table 4 as published (Cattan, Salvanes, and Tominey 2025), for comparison.") %>%
+  pack_rows("Panel A. First-stage outcome: high school GPA", 1, 5) %>%
+  pack_rows("Panel B. Second-stage outcome: enrollment to elite degree", 6, 9) %>%
+  pack_rows("Panel C. Decomposition", 10, 12) %>%
+  tab_style("scale_down")
+```
+
+```{r table4-numbers, echo = FALSE}
+gl <- function(t) fit_low$effects$estimate[fit_low$effects$term == t]
+sl <- function(t) fit_low$effects$std.error[fit_low$effects$term == t]
+gh <- function(t) fit_high$effects$estimate[fit_high$effects$term == t]
+sh <- function(t) fit_high$effects$std.error[fit_high$effects$term == t]
+tr_low <- attr(low, "truth")
+```
+
+**The low-SES column reproduces the published structure with the
+published magnitudes, and the decomposition now carries standard
+errors.** The direct effect is `r fmt(gl("direct"))` (`r fmt(sl("direct"))`)
+for a design value of `r fmt(tr_low$direct)`, the indirect effect
+`r fmt(gl("indirect"))` (`r fmt(sl("indirect"))`) for `r fmt(tr_low$indirect)`,
+and the total `r fmt(gl("total_z"))` for `r fmt(tr_low$total)`. The
+first-stage F is `r fmt(fit_low$first_stage_F, 1)` against the paper's
+76.9; both are the conventional F, which `xtivreg2` prints under `first`
+and `fixest` reports as `ivf`, and the gap is a matter of how much
+residual variance the design puts in GPA rather than a difference in
+definition. The identity total = direct + indirect holds
+exactly for the reduced form that includes the lottery, which is the
+`total_z` row of the object; the `total` row without the lottery differs
+by sampling error only.
+
+**The high-SES column shows what a first-stage F of
+`r fmt(fit_high$first_stage_F, 1)` does to the decomposition.** The
+instrumented GPA effect is `r fmt(gh("mediator_effect"))` with a standard
+error of `r fmt(sh("mediator_effect"))`, and the indirect effect's
+interval covers zero and values several times the design's
+`r fmt(attr(high, "truth")$indirect)`. The paper's 1.771 (0.714) is the
+same phenomenon on the real data. The Anderson-Rubin set from Section
+05's `iv_ar_confidence_set()` shows what a weak-instrument-robust
+interval for $\gamma_2$ looks like in this column. The helper takes
+controls but not fixed effects, so it is run on the high-SES design
+without the school, cohort, and program effects; its point estimate
+therefore differs from the table's, and the object of interest is the
+shape of the set, which is unbounded.
+
+```{r ar-set}
+ar_high <- iv_ar_confidence_set(high, "y", "gpa", z = "z", x = c("peer", "female"), cluster = "school", weights = "size")
+ar_high
+```
+
+# Figure A13: the homogeneity check {#sec-a13}
+
+**The decomposition assumes that the lottery compliers and the students
+whose grades the peers move share the same $\gamma_2$.** The paper checks
+this by re-estimating the second stage in subgroups (Appendix Figure
+A13). `mediate_iv(homogeneity_by = )` runs the system within each group.
+In the design $\gamma_2$ is homogeneous by construction, so the figure
+shows what the check looks like when the assumption holds: estimates
+scattered around one value with intervals that widen with the group's
+first stage.
+
+```{r a13-fit, cache = TRUE, cache.extra = list(n_boot)}
+low$cohort_group <- ifelse(low$cohort <= 2004, "2002-04", ifelse(low$cohort <= 2007, "2005-07", "2008-10"))
+low$sex <- ifelse(low$female == 1, "female", "male")
+low$program_f <- paste0("program ", low$program)
+hom <- bind_rows(lapply(c("sex", "cohort_group", "program_f"), function(g) {
+  h <- mediate_iv(low, "y", "peer", "gpa", z = "z", x = "female", fe = c("school", "cohort", "program"),
+                  cluster = "school", weights = "size", homogeneity_by = g, n_boot = 0)$homogeneity
+  # standard errors of the subgroup mediator effects from the subgroup IV fits
+  se <- sapply(h$group, function(lev) {
+    sub <- low[low[[g]] == lev, ]
+    coeftable(feols(y ~ peer + female | school + cohort + program | gpa ~ z, data = sub, weights = ~size, cluster = ~school))["fit_gpa", 2]
+  })
+  mutate(h, dimension = g, se = se)
+}))
+```
+
+```{r a13-plot, echo = FALSE, fig.height = 3.4, fig.cap = "Figure A13 analogue: the instrumented effect of GPA on enrollment by subgroup in the calibrated low-SES design, with 95 percent intervals clustered by school. The dashed line is the design's gamma2 = 0.384."}
+hom %>% mutate(group = factor(group, levels = unique(group))) %>%
+  ggplot(aes(x = group, y = mediator_effect, colour = dimension)) +
+  geom_hline(yintercept = 0.384, linetype = "dashed", colour = "grey40") +
+  geom_pointrange(aes(ymin = mediator_effect - 1.96 * se, ymax = mediator_effect + 1.96 * se)) +
+  scale_colour_manual(values = c("#0072B2", "#D55E00", "#009E73"), name = NULL) +
+  labs(x = NULL, y = "Effect of GPA on enrollment (IV)") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+```{r a13-table, echo = FALSE}
+hom %>% transmute(Dimension = dimension, Group = group, N = fmt0(n), `First stage (peers)` = fmt(first_stage), `GPA effect` = fmt(mediator_effect), `(se)` = paren(se), `Direct effect` = fmt(direct)) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "The homogeneity check as a table: subgroup first stages, instrumented GPA effects, and direct effects.") %>%
+  tab_style()
+```
+
+**What a failure would look like.** If $\gamma_2$ differed between, say,
+programs, the subgroup estimates would separate by more than their
+intervals, and the product $\delta_1 \gamma_2$ would be a weighted
+average whose weights depend on which students the lottery moves rather
+than on which students the peers move. The paper's Figure A13 shows
+estimates that are stable across gender, cohort, and program, and reads
+that as support for the assumption. It is a necessary check, not a
+sufficient one: homogeneity across observed groups does not imply
+homogeneity across the unobserved compliance types.
+
+# Sampling properties of the decomposition {#sec-mc}
+
+**Repeated draws of the low-SES design show that the system bootstrap
+is calibrated and that the weak-instrument column is not.** For each of
+`r n_sims` draws the direct and indirect effects are estimated with
+`mediate_iv()` without the bootstrap; the spread across draws is
+compared with the bootstrap standard error from the first draw.
+
+```{r mc, cache = TRUE, cache.extra = list(n_sims)}
+mc <- bind_rows(lapply(seq_len(n_sims), function(s) {
+  dl <- sim_cattan(seed = 100 + s)
+  dh <- sim_cattan(n_schools = 409, mean_size = 49, delta1 = -0.010, delta2 = 0.043, gamma1 = 0.049, gamma2 = 0.384, seed = 500 + s)
+  fl <- mediate_iv(dl, "y", "peer", "gpa", z = "z", x = "female", fe = c("school", "cohort", "program"), cluster = "school", weights = "size", n_boot = 0)$effects
+  fh <- mediate_iv(dh, "y", "peer", "gpa", z = "z", x = "female", fe = c("school", "cohort", "program"), cluster = "school", weights = "size", n_boot = 0)$effects
+  tibble(sim = s, sample = rep(c("low SES", "high SES"), each = 3), term = rep(c("direct", "indirect", "mediator_effect"), 2),
+         estimate = c(fl$estimate[match(c("direct", "indirect", "mediator_effect"), fl$term)], fh$estimate[match(c("direct", "indirect", "mediator_effect"), fh$term)]))
+}))
+```
+
+```{r mc-table, echo = FALSE}
+truth_tab <- tibble(sample = rep(c("low SES", "high SES"), each = 3), term = rep(c("direct", "indirect", "mediator_effect"), 2),
+                    truth = c(0.026, -0.039 * 0.384, 0.384, 0.049, -0.010 * 0.384, 0.384))
+boot_se <- tibble(sample = rep(c("low SES", "high SES"), each = 3), term = rep(c("direct", "indirect", "mediator_effect"), 2),
+                  boot_se = c(sapply(c("direct", "indirect", "mediator_effect"), sl), sapply(c("direct", "indirect", "mediator_effect"), sh)))
+mc %>% group_by(sample, term) %>% summarise(mean = mean(estimate), sd = sd(estimate), median = median(estimate), .groups = "drop") %>%
+  left_join(truth_tab, by = c("sample", "term")) %>% left_join(boot_se, by = c("sample", "term")) %>%
+  mutate(sample = factor(sample, levels = c("low SES", "high SES"))) %>% arrange(sample, term) %>%
+  transmute(Sample = sample, Effect = term, Truth = fmt(truth), `Mean across draws` = fmt(mean), `Median` = fmt(median), `SD across draws` = fmt(sd), `Bootstrap SE (draw 1)` = fmt(boot_se)) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = paste0("Sampling distribution of the decomposition over ", n_sims, " draws of each design, against the design values and the school-bootstrap standard errors of the first draw.")) %>%
+  collapse_rows(columns = 1, latex_hline = "major", valign = "top") %>%
+  tab_style()
+```
+
+```{r mc-numbers, echo = FALSE}
+mc_sum <- mc %>% group_by(sample, term) %>% summarise(mean = mean(estimate), sd = sd(estimate), median = median(estimate), .groups = "drop")
+g_mc <- function(s, t, col) mc_sum[[col]][mc_sum$sample == s & mc_sum$term == t]
+mc_sum_med <- function(s, t) mc_sum$median[mc_sum$sample == s & mc_sum$term == t]
+```
+
+**In the low-SES design the estimator is centred and the bootstrap
+matches the sampling spread; in the high-SES design neither holds.** The
+mean of the low-SES direct effect across draws is
+`r fmt(g_mc("low SES", "direct", "mean"))` with a spread of
+`r fmt(g_mc("low SES", "direct", "sd"))`, against a bootstrap standard
+error of `r fmt(sl("direct"))`. The high-SES instrumented GPA effect is
+roughly centred (mean `r fmt(g_mc("high SES", "mediator_effect", "mean"))`,
+median `r fmt(mc_sum_med("high SES", "mediator_effect"))`, design value
+0.384) but its spread is `r fmt(g_mc("high SES", "mediator_effect", "sd"))`,
+ten times the low-SES one. The school bootstrap is not a remedy there:
+the first draw's bootstrap standard errors (`r fmt(sh("direct"))` for the
+direct effect, `r fmt(sh("mediator_effect"))` for the GPA effect) are many
+times even that spread, because replicates in which the first stage lands
+near zero produce arbitrarily large ratios. A weak first stage has to be
+reported as such, which is what the paper's F of 5.6 does; its high-SES
+decomposition (direct 0.049, indirect $-0.018$) should be read with that
+column's first stage in mind.
+
+# What the replication says {#sec-reading}
+
+**Nothing in the paper's Table 4 can be recomputed without the
+registries, and everything in its design can be.** The do-files fix the
+specification exactly, and the calibrated design reproduces the layout,
+the magnitudes, and the two features the paper relies on: a strong
+lottery for low-SES students and a weak one for high-SES students.
+
+**`mediate_iv()` is the paper's three regressions plus the standard
+errors the paper leaves out.** The direct effect is the second-stage
+peer coefficient, the indirect effect is the product, and the total
+effect is the reduced form; the school bootstrap of the system gives the
+decomposition's standard errors, and the homogeneity argument
+re-estimates the system by subgroup.
+
+**Two audit findings.** The Table 4 IV line carries probability weights
+without a cluster option, so its reported standard errors are robust
+rather than school-clustered as the note states; and the "simulated
+data" one might hope for in `simulate_replication.do` is the Section VII
+reallocation exercise, which needs the same registry file as everything
+else.
+
+## Mapping to the lecture's checklist
+
+1. Estimands: total effect of peer exposure, direct effect holding GPA,
+   indirect effect through GPA; identified by the lottery plus
+   homogeneity.
+2. Graph: peers to GPA to enrollment, peers to enrollment directly,
+   ability confounding GPA and enrollment, lottery to GPA only.
+3. Total effect and the effect on the mediator first: Table 2 and Panel
+   A.
+4. Natural effects need an instrumented mediator here: `mediate_iv()`.
+5. Sensitivity: to the homogeneity assumption, via subgroups (Figure
+   A13); to the exclusion of the lottery, argued from the blind grading.
+6. Instrument: the written-exam lottery; weak in the high-SES sample.
+7. No treatment-induced confounder is modelled.
+8. No regression accounting.
+
+# References
+
+- Cattan, Sarah, Kjell G. Salvanes, and Emma Tominey. 2025. "First-Generation Elite: The Role of School Social Networks." *American Economic Review* 115(12), 4369-4403. Replication package: openICPSR.
+- Dippel, Christian, Andreas Ferrara, and Stephan Heblich. 2020. "Causal Mediation Analysis in Instrumental-Variables Regressions." *Stata Journal*.
+- Huber, Martin. 2019. "A Review of Causal Mediation Analysis for Assessing Direct and Indirect Treatment Effects." IZA Discussion Paper 12660.

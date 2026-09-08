@@ -1,0 +1,643 @@
+---
+title: "Replication: Using Text Analysis in Parallel Mediation Analysis"
+subtitle: "Zhang, Li, and Allenby (Marketing Science 2024), a two-step version with the authors' integrated model as the reference"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/10_mediation/zhang2024/"
+  n_splits: 50
+  n_sim: 1000
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(quanteda)
+library(seededlda)
+data_path <- params$data_path
+n_splits <- params$n_splits
+n_sim <- params$n_sim
+data_md5 <- tools::md5sum(file.path(data_path, c("W_mtx.csv", "Dictionary.csv")))
+fmt <- function(x, digits = 2) formatC(x, digits = digits, format = "f")
+fmt3 <- function(x) formatC(x, digits = 3, format = "f")
+paren <- function(x, digits = 2) paste0("(", fmt(x, digits), ")")
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+mcmc_none_path <- file.path(data_path, "derived", "mcmc_none_R20000.rds")
+mcmc_direct_path <- file.path(data_path, "derived", "mcmc_direct_R20000.rds")
+have_mcmc <- file.exists(mcmc_none_path) && file.exists(mcmc_direct_path)
+topics <- c("animal", "disgust", "sustainability", "other")
+share_cols <- paste0("s_", topics)
+topic_labels <- c("Animal welfare", "Disgust", "Sustainability", "Free topic")
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is why consumers reject cultivated meat, and the paper's
+answer is to let the reasons they write down be the mediators.** Four
+hundred and forty-two respondents read a description of cultivated meat.
+A third also saw a picture of a laboratory (Petri dish), a third a picture
+of a slaughterhouse, and a third no picture. Each then wrote an
+open-ended answer about their reaction, rated their disgust on a 1 to 7
+scale, and said whether they would consume the product. The conditions
+are the treatment, the choice is the outcome, and the text is where the
+mediators live.
+
+**The model is a seeded topic model with the treatment and the outcome
+inside it.** Each answer is a bag of words drawn from four topics. Three
+topics are seeded with word lists the authors chose in advance (animal
+welfare, disgust, environmental sustainability); the fourth is free. The
+treatment shifts the Dirichlet prior of each respondent's topic shares
+(the parameters $\delta$, Table 4), and the topic shares enter a logistic
+regression for the choice (the parameters $\beta$, Table 6), with an
+optional direct path from the treatment (Table 7). Everything is
+estimated in one Markov chain Monte Carlo run, so the uncertainty in the
+topic shares propagates into the mediation parameters.
+
+**The comparisons are the argument.** Against an unseeded topic model the
+mediators do not emerge (Tables 8 and 9). Against the traditional
+mediation analysis on the disgust rating scale (Table 11), the text model
+predicts the choice far better (Table 12). Against two-step pipelines,
+where a text summary is estimated first and then plugged into the
+outcome model (standard LDA, seeded LDA, LIWC categories, Poisson
+factorization), the integrated model again predicts better (Table 14).
+
+**Why this paper anchors the last part of Section 10.** It is the
+parallel-mediator model of the lecture with latent mediators built from
+text, and it shows both what a mediator measured from text can do and
+what the two-step shortcut costs. The identification burden is the same
+as for any mediator: the topics must be unconfounded with the choice
+given the treatment. The paper's design randomizes the treatment, not
+the topics.
+
+**What this note does.** It builds the two-step version with the package:
+a seeded topic model from `seededlda` on the released document-word
+matrix and seed lists, then `mediate_reg()` with the three seeded topic
+shares as parallel mediators and a logistic outcome model, for each
+stimulus against the control. It reproduces Table 11 to the digit,
+rebuilds the two-step rows of Table 14, and prints the authors' own
+integrated estimates, from a full-length run of their released MCMC
+scripts, next to ours.
+
+# Data {#sec-data}
+
+**The release contains the document-word matrix, the dictionary, the
+seed lists, and the three MCMC scripts; it contains no saved posterior.**
+`W_mtx.csv` has one row per respondent with the word indices of the
+answer, the condition, the choice, and the disgust rating. The scripts
+read the matrix, define the likelihood, run the Gibbs and
+Metropolis-Hastings steps, and print summaries.
+
+```{r load}
+raw <- read.csv(file.path(data_path, "W_mtx.csv"), header = TRUE, stringsAsFactors = FALSE)
+dict <- read.csv(file.path(data_path, "Dictionary.csv"))
+W <- as.matrix(raw[, -c(1, (ncol(raw) - 2):ncol(raw))])
+dat <- tibble(id = paste0("d", seq_len(nrow(raw))), condition = raw$condition, choice = raw$Choice, disgust = raw$Disgust,
+              n_words = rowSums(!is.na(W)))
+dat$lab <- as.integer(dat$condition == "lab")
+dat$slaughter <- as.integer(dat$condition == "slaughter")
+seeds <- lapply(c(animal = "seed words_animal.csv", disgust = "seed words_disgust.csv", sustainability = "seed words_sustainability.csv"),
+                function(f) dict$word[match(read.csv(file.path(data_path, f))$Index, dict$Index)])
+c(respondents = nrow(dat), vocabulary = nrow(dict), tokens = sum(dat$n_words), seed_words = sum(lengths(seeds)))
+```
+
+```{r table1, echo = FALSE}
+dat %>% mutate(Condition = recode(condition, "no stimuli" = "Control", lab = "Laboratory", slaughter = "Slaughterhouse")) %>%
+  group_by(Condition) %>%
+  summarise(N = n(), `Willing to consume` = fmt(mean(choice)), `Disgust (1-7)` = fmt(mean(disgust)), `Words per answer` = fmt(mean(n_words), 1), .groups = "drop") %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 1 of the paper: sample by condition, with the share willing to consume cultivated meat, the mean disgust rating, and the mean number of dictionary words per answer.") %>%
+  tab_style()
+```
+
+**The slaughterhouse picture raises disgust and the laboratory picture
+does not; neither moves the choice much on average.** That is the
+paper's Table 11 in one line, and it is why the paper looks for the
+mechanism in the text rather than in the average treatment effect on the
+choice.
+
+# Step one: the seeded topic model {#sec-topics}
+
+**The two-step version estimates the topic shares without the outcome
+and without the treatment.** `seededlda` fits a latent Dirichlet
+allocation whose word distributions for the three seeded topics put prior
+mass on the seed words (the lexical prior of the paper, in a different
+parameterization) and adds one residual topic. The document-topic shares
+$\theta_n$ are the mediators. The paper's own Table 3 reports the twenty
+highest-probability words per topic from the integrated model.
+
+```{r dfm}
+counts <- lapply(seq_len(nrow(W)), function(i) {
+  w <- W[i, !is.na(W[i, ])]
+  table(factor(w, levels = dict$Index))
+})
+M <- do.call(rbind, counts)
+colnames(M) <- dict$word
+rownames(M) <- dat$id
+dfm_all <- as.dfm(M)
+dfm_all
+```
+
+```{r seeded-lda, cache = TRUE, cache.extra = list(data_md5)}
+set.seed(1)
+lda_seeded <- textmodel_seededlda(dfm_all, dictionary = dictionary(seeds), residual = 1, max_iter = 5000, verbose = FALSE)
+theta <- lda_seeded$theta
+colnames(theta) <- share_cols
+top_words <- terms(lda_seeded, 20)
+colnames(top_words) <- topic_labels
+```
+
+```{r table3, echo = FALSE}
+as_tibble(top_words) %>% mutate(Rank = 1:20, .before = 1) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 3 analogue: the twenty highest-probability words per topic in the two-step seeded model (the paper's Table 3 lists the same for the integrated model).") %>%
+  tab_style()
+```
+
+**The seeded topics are recognizable, and the free topic collects
+product language.** Animal welfare gathers animals, feel, people, humans;
+disgust gathers safe, health, chemicals, gross; sustainability gathers
+environment, natural, future, consumption; the free topic holds taste,
+real, lab, picture, texture. The paper's Table 3 reads the same way.
+
+# Table 5 and Table 4: the treatment and the topic shares {#sec-delta}
+
+**The paper reports the Dirichlet parameters by condition (Table 5) and
+the coefficients that shift them (Table 4); the two-step analogue is the
+mean topic share by condition and a regression of the shares on the
+stimuli.** The published Table 5 parameters imply expected shares
+(each parameter over their sum), which is the scale of our means.
+
+```{r table5}
+share_means <- sapply(share_cols, function(k) tapply(theta[, k], dat$condition, mean))[c("no stimuli", "lab", "slaughter"), ]
+pub5 <- rbind(`no stimuli` = c(2, 2, 2, 2), lab = c(6.25, 3.21, 2.98, 3.86), slaughter = c(3.82, 2.05, 2.63, 1.97))
+pub5_shares <- pub5 / rowSums(pub5)
+tibble(Condition = rep(c("Control", "Laboratory", "Slaughterhouse"), 2),
+       Source = rep(c("two-step share means", "published Table 5, implied shares"), each = 3),
+       !!!setNames(lapply(1:4, function(k) fmt(c(share_means[, k], pub5_shares[, k]), 3)), topic_labels)) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 5 analogue: mean topic shares by condition from the two-step seeded model, against the expected shares implied by the published Dirichlet parameters (parameter over the sum of the four).") %>%
+  tab_style()
+```
+
+```{r table4}
+delta_tab <- bind_rows(lapply(share_cols, function(k) {
+  f <- lm(theta[, k] ~ lab + slaughter, data = dat)
+  ct <- summary(f)$coefficients
+  tibble(topic = k, lab = ct["lab", 1], lab_se = ct["lab", 2], slaughter = ct["slaughter", 1], slaughter_se = ct["slaughter", 2])
+}))
+pub4 <- tibble(topic = topics, lab = c(1.63, 0.76, 0.65, 1.02), lab_sd = c(0.24, 0.25, 0.28, 0.24),
+               slaughter = c(1.02, 0.01, 0.47, -0.06), slaughter_sd = c(0.16, 0.25, 0.19, 0.23))
+tibble(Topic = topic_labels,
+       `Laboratory: share regression` = paste(fmt3(delta_tab$lab), paste0("(", fmt3(delta_tab$lab_se), ")")),
+       `Laboratory: published delta` = paste(fmt(pub4$lab), paren(pub4$lab_sd)),
+       `Slaughterhouse: share regression` = paste(fmt3(delta_tab$slaughter), paste0("(", fmt3(delta_tab$slaughter_se), ")")),
+       `Slaughterhouse: published delta` = paste(fmt(pub4$slaughter), paren(pub4$slaughter_sd))) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 4 analogue: the effect of each stimulus on the topic shares. Two-step: OLS of the share on the two stimulus indicators (control as the base), heteroskedasticity-consistent standard errors not needed at this size. Published: posterior mean (standard deviation) of delta, the shift of the log Dirichlet parameter.") %>%
+  tab_style("scale_down")
+```
+
+```{r table4-numbers, echo = FALSE}
+dl <- function(k, col) delta_tab[[col]][delta_tab$topic == paste0("s_", k)]
+```
+
+**The two scales are not the same, and the two-step shares move less than
+the published parameters suggest.** In the paper both pictures raise the
+animal-welfare parameter most, and the laboratory picture raises every
+parameter (the parameters are relative to a flat control prior of 2). In
+the two-step shares, a share can only rise if another falls, so a uniform
+increase has no analogue. The slaughterhouse picture raises the
+animal-welfare share by `r fmt3(dl("animal", "slaughter"))`
+(`r fmt3(dl("animal", "slaughter_se"))`), the one shift that is clear;
+the laboratory picture raises the free topic by
+`r fmt3(dl("other", "lab"))` (respondents write about the lab and the
+picture, as the top words show) and lowers each seeded share by a small
+and insignificant amount. The disgust share does not move under either
+picture, although the disgust rating rises by 0.69 points under the
+slaughterhouse picture (Section \@ref(sec-table11)). This is the first
+cost of the two-step version: the shares are compositional and noisy,
+and the paper's $\delta$ describe prior concentration, not shares.
+
+# Tables 6 and 7: the topics and the choice {#sec-beta}
+
+**The paper's $\beta$ are logistic coefficients of the choice on the four
+topic shares with no intercept, which is identified because the shares
+sum to one.** The same regression on the two-step shares is the second
+step of the pipeline. Table 7 adds the two stimulus indicators as a
+direct path.
+
+```{r table6}
+th <- as.data.frame(theta)
+d6 <- bind_cols(dat, th)
+fit6 <- glm(choice ~ 0 + s_animal + s_disgust + s_sustainability + s_other, data = d6, family = binomial)
+fit7 <- glm(choice ~ 0 + lab + slaughter + s_animal + s_disgust + s_sustainability + s_other, data = d6, family = binomial)
+ct6 <- summary(fit6)$coefficients; ct7 <- summary(fit7)$coefficients
+tibble(Parameter = c("Laboratory (direct)", "Slaughterhouse (direct)", paste0("beta: ", topic_labels)),
+       `Two-step, no direct path` = c("", "", paste(fmt(ct6[, 1]), paren(ct6[, 2]))),
+       `Published Table 6` = c("", "", "5.59 (1.25)", "-11.12 (2.33)", "3.44 (1.17)", "-1.32 (1.39)"),
+       `Two-step, with direct path` = paste(fmt(ct7[, 1]), paren(ct7[, 2])),
+       `Published Table 7` = c("0.08 (0.36)", "-0.65 (0.37)", "3.56 (0.93)", "-6.99 (1.47)", "3.44 (1.62)", "0.24 (1.19)")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Tables 6 and 7 analogues: logistic regression of the choice on the four topic shares without an intercept (and with the two stimulus indicators for the direct path). Two-step: maximum likelihood on the seededlda shares (standard errors). Published: posterior means (standard deviations) from the integrated model.") %>%
+  tab_style("scale_down")
+```
+
+```{r table6-numbers, echo = FALSE}
+b_disgust <- ct6["s_disgust", 1]
+b_animal <- ct6["s_animal", 1]
+```
+
+**The disgust topic is what predicts refusal in both versions, and the
+two-step coefficients are a fraction of the integrated ones.** The
+two-step disgust coefficient is `r fmt(b_disgust)` against $-11.12$ in
+the paper; animal welfare is `r fmt(b_animal)` against $5.59$. Two things
+produce the gap. The two-step shares are estimated with error from
+answers of `r fmt(mean(dat$n_words), 0)` words on average, and measurement
+error in a regressor attenuates its coefficient. And the integrated model
+chooses the topic shares partly to fit the choice, which sharpens the
+same coefficients; the paper's own in-sample comparison (Section
+\@ref(sec-auc)) is the other face of that.
+
+# Mediation: parallel latent mediators, one stimulus at a time {#sec-mediation}
+
+**`mediate_reg()` takes the three seeded shares as parallel mediators and
+a logistic outcome model, for each stimulus against the control.** The
+free topic is omitted from the mediator list because the four shares sum
+to one; the outcome model with an intercept and three shares is the
+paper's four-share model without an intercept. Effects are on the
+probability scale, so a natural indirect effect is a change in the share
+of respondents willing to consume, and the per-mediator effects sum to
+the joint indirect effect.
+
+```{r mediation}
+med_fit <- function(stim) {
+  d <- d6[d6$condition %in% c("no stimuli", stim), ]
+  d$d <- as.integer(d$condition == stim)
+  mediate_reg(d, "choice", "d", c("s_animal", "s_disgust", "s_sustainability"), outcome = "logit", mediator = "linear",
+              n_sim = n_sim, seed = 1)
+}
+med_lab <- med_fit("lab")
+med_slaughter <- med_fit("slaughter")
+terms_show <- c("total", "nde", "nie", "nie_s_animal", "nie_s_disgust", "nie_s_sustainability")
+tibble(Effect = c("Total", "Natural direct", "Natural indirect (joint)", "  through animal welfare", "  through disgust", "  through sustainability"),
+       `Laboratory` = paste(fmt3(med_lab$effects$estimate[match(terms_show, med_lab$effects$term)]),
+                            paste0("(", fmt3(med_lab$effects$std.error[match(terms_show, med_lab$effects$term)]), ")")),
+       `Slaughterhouse` = paste(fmt3(med_slaughter$effects$estimate[match(terms_show, med_slaughter$effects$term)]),
+                                paste0("(", fmt3(med_slaughter$effects$std.error[match(terms_show, med_slaughter$effects$term)]), ")"))) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Two-step parallel mediation with the seeded topic shares as mediators, each stimulus against the control: total, natural direct, and natural indirect effects on the probability of being willing to consume, with quasi-Bayesian standard errors.") %>%
+  tab_style()
+```
+
+```{r mediation-numbers, echo = FALSE}
+g <- function(f, t) f$effects$estimate[f$effects$term == t]
+```
+
+**The pictures do not change the choice on average, and in the two-step
+version the text mediators carry almost none of that null.** For the
+slaughterhouse picture the joint indirect effect is
+`r fmt3(g(med_slaughter, "nie"))`, the sum of
+`r fmt3(g(med_slaughter, "nie_s_animal"))` through animal welfare,
+`r fmt3(g(med_slaughter, "nie_s_disgust"))` through disgust, and
+`r fmt3(g(med_slaughter, "nie_s_sustainability"))` through sustainability;
+the direct effect is `r fmt3(g(med_slaughter, "nde"))`. The laboratory
+picture gives a joint indirect effect of `r fmt3(g(med_lab, "nie"))` with
+a direct effect of `r fmt3(g(med_lab, "nde"))`. None of these is
+distinguishable from zero. The largest term, animal welfare under the
+slaughterhouse picture, has the sign the paper's Tables 4 and 6 imply
+(the picture raises animal-welfare talk, which predicts acceptance), but
+the two-step shares move too little for a product of two small
+coefficients to be visible. The paper's Table 13 explains why it does not
+report $a \times b$ products at all: in the integrated model the
+indirect effect is read from $\delta$ and $\beta$ being jointly
+significant, and both are, on the paper's scale.
+
+```{r mediation-plot, echo = FALSE, fig.height = 3.4, fig.cap = "Per-mediator natural indirect effects of each picture, on the probability scale, with 95 percent quasi-Bayesian intervals."}
+bind_rows(mutate(med_lab$effects, stimulus = "Laboratory"), mutate(med_slaughter$effects, stimulus = "Slaughterhouse")) %>%
+  filter(term %in% c("nie_s_animal", "nie_s_disgust", "nie_s_sustainability", "nde")) %>%
+  mutate(term = factor(term, levels = c("nde", "nie_s_animal", "nie_s_disgust", "nie_s_sustainability"),
+                       labels = c("Direct", "Animal welfare", "Disgust", "Sustainability"))) %>%
+  ggplot(aes(x = term, y = estimate, colour = stimulus)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high), position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = c("#0072B2", "#D55E00"), name = NULL) +
+  labs(x = NULL, y = "Effect on P(willing to consume)") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+# Table 11: the traditional mediation analysis, reproduced {#sec-table11}
+
+**Table 11 is the Hayes-style analysis on the disgust rating: a linear
+mediator model and two logistic outcome models.** It needs no topic
+model, so it is the one table this note can match to the digit. The
+paper reports the mediator regression ($a_1$, $a_2$), the total-effect
+logit ($c_1$, $c_2$), and the logit with the mediator ($c'_1$, $c'_2$,
+$b$), with Nagelkerke's $R^2$ for the logits.
+
+```{r table11}
+m11 <- lm(disgust ~ lab + slaughter, data = dat)
+y11_tot <- glm(choice ~ lab + slaughter, data = dat, family = binomial)
+y11_full <- glm(choice ~ lab + slaughter + disgust, data = dat, family = binomial)
+nagelkerke <- function(f) {
+  n <- nobs(f); l0 <- as.numeric(logLik(update(f, . ~ 1))); l1 <- as.numeric(logLik(f))
+  (1 - exp(2 * (l0 - l1) / n)) / (1 - exp(2 * l0 / n))
+}
+cm <- summary(m11)$coefficients; ct <- summary(y11_tot)$coefficients; cf <- summary(y11_full)$coefficients
+tibble(Antecedent = c("Constant", "X: Laboratory", "X: Slaughterhouse", "M: Disgust", "Fit"),
+       `M (Disgust)` = c(paste(fmt(cm[, 1]), paren(cm[, 2])), "", paste0("adj. R2 = ", fmt3(summary(m11)$adj.r.squared))),
+       `Published` = c("3.04 (0.17)", "0.00 (0.23)", "0.69 (0.24)", "", "adj. R2 = 0.021"),
+       `logit P(Y = 1), total` = c(paste(fmt(ct[, 1]), paren(ct[, 2])), "", paste0("Nagelkerke R2 = ", fmt3(nagelkerke(y11_tot)))),
+       `Published ` = c("0.23 (0.17)", "-0.11 (0.23)", "-0.04 (0.24)", "", "Nagelkerke R2 = 0.001"),
+       `logit P(Y = 1), with M` = c(paste(fmt(cf[, 1]), paren(cf[, 2])), paste0("Nagelkerke R2 = ", fmt3(nagelkerke(y11_full)))),
+       `Published  ` = c("1.36 (0.24)", "-0.13 (0.25)", "0.23 (0.26)", "-0.37 (0.05)", "Nagelkerke R2 = 0.153")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 11 of the paper: traditional mediation analysis with the disgust rating as the mediator; OLS for the mediator model, logistic regressions for the outcome, with the published values beside each column.") %>%
+  tab_style("scale_down")
+```
+
+**Every entry reproduces.** The slaughterhouse picture raises disgust by
+`r fmt(cm["slaughter", 1])` points, disgust lowers the log-odds of
+consuming by `r fmt(abs(cf["disgust", 1]))` per point, and the direct
+paths are nothing. In the package's terms this is `mediate_reg()` with a
+linear mediator and a logistic outcome; its probability-scale effects for
+the slaughterhouse contrast follow.
+
+```{r table11-mediate}
+d_sl <- dat[dat$condition != "lab", ]; d_sl$d <- d_sl$slaughter
+med_disgust <- mediate_reg(d_sl, "choice", "d", "disgust", outcome = "logit", mediator = "linear", n_sim = n_sim, seed = 1)
+med_disgust$effects[1:3, ]
+```
+
+**The disgust scale carries an indirect effect of
+`r fmt3(g(med_disgust, "nie"))` for the slaughterhouse picture, offset by
+a direct effect of `r fmt3(g(med_disgust, "nde"))`; the two-step disgust
+topic carries `r fmt3(g(med_slaughter, "nie_s_disgust"))`.** The two
+mediators measure the same construct with different noise. The rating
+moves by 0.69 points under the picture and predicts the choice; the
+topic share, estimated from about 27 words per answer without the
+outcome, moves by `r fmt3(dl("disgust", "slaughter"))` and predicts the
+choice less sharply. On this data the scale is the better single
+measure of disgust, and the text adds channels the scale does not ask
+about rather than a better measure of the one it does. The paper's
+integrated model resolves this differently, by letting the outcome
+inform the shares (Section \@ref(sec-mcmc)).
+
+# Tables 12 and 14: predicting the choice {#sec-auc}
+
+**The paper's comparison across models is predictive: the area under the
+ROC curve, in sample and on holdout data.** Table 12 sets the integrated
+model with the disgust topic against the traditional disgust-scale model;
+Table 14 sets the full integrated model against the two-step pipelines.
+The two-step rows are reproducible here: a logit on the four seeded
+shares (the paper's Model 9), a logit on four unseeded LDA topics (Model
+8), and the disgust-scale logit (Model 6). The holdout AUC is averaged
+over `r n_splits` random splits, because a single 20 percent holdout of
+442 respondents is noisy; the paper reports one split.
+
+```{r lda-unseeded, cache = TRUE, cache.extra = list(data_md5)}
+set.seed(1)
+lda_plain <- textmodel_lda(dfm_all, k = 4, max_iter = 5000, verbose = FALSE)
+theta_plain <- lda_plain$theta
+colnames(theta_plain) <- paste0("t", 1:4)
+```
+
+```{r auc, cache = TRUE, cache.extra = list(data_md5, n_splits)}
+auc_of <- function(y, p) as.numeric(pROC::auc(pROC::roc(y, p, quiet = TRUE)))
+X_list <- list(
+  "9: seeded topics (two-step)" = th[, c("s_animal", "s_disgust", "s_sustainability")],
+  "8: standard LDA, four topics" = as.data.frame(theta_plain[, 1:3]),
+  "6: disgust scale" = data.frame(disgust = dat$disgust),
+  "6b: disgust scale and stimuli" = data.frame(disgust = dat$disgust, lab = dat$lab, slaughter = dat$slaughter))
+auc_tab <- bind_rows(lapply(names(X_list), function(nm) {
+  X <- X_list[[nm]]; dd <- data.frame(y = dat$choice, X)
+  fit_all <- glm(y ~ ., data = dd, family = binomial)
+  in_sample <- auc_of(dd$y, fitted(fit_all))
+  set.seed(1)
+  h <- lapply(c(0.8, 0.9), function(share) {
+    r <- replicate(n_splits, {
+      tr <- sample(nrow(dd), floor(share * nrow(dd)))
+      f <- glm(y ~ ., data = dd[tr, ], family = binomial)
+      c(auc_of(dd$y[tr], fitted(f)), auc_of(dd$y[-tr], predict(f, dd[-tr, ], type = "response")))
+    })
+    rowMeans(r)
+  })
+  tibble(Model = nm, `Full data, in-sample` = in_sample, `80/20 in-sample` = h[[1]][1], `80/20 holdout` = h[[1]][2],
+         `90/10 in-sample` = h[[2]][1], `90/10 holdout` = h[[2]][2])
+}))
+```
+
+```{r auc-table, echo = FALSE}
+pub_auc <- tibble(Model = c("1: proposed model, all mediators (published)", "3: proposed model, disgust only (published)",
+                            "9: seeded LDA (published)", "8: standard LDA (published)", "6: traditional, disgust only (published)"),
+                  `Full data, in-sample` = c(0.975, 0.878, 0.608, 0.559, 0.685), `80/20 in-sample` = c(0.925, 0.845, 0.618, 0.560, 0.678),
+                  `80/20 holdout` = c(0.944, 0.893, 0.563, 0.541, 0.669), `90/10 in-sample` = c(0.941, 0.834, 0.612, 0.559, 0.698),
+                  `90/10 holdout` = c(0.933, 0.793, 0.579, 0.545, 0.566))
+bind_rows(auc_tab, pub_auc) %>%
+  mutate(across(where(is.numeric), fmt3)) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = paste0("Tables 12 and 14 analogues: area under the ROC curve for the choice. Two-step rows from this note (holdout averaged over ", n_splits, " random splits); published rows from the paper's Tables 12 and 14 (one split).")) %>%
+  pack_rows("This note", 1, 4) %>%
+  pack_rows("Published", 5, 9) %>%
+  tab_style("scale_down")
+```
+
+```{r auc-numbers, echo = FALSE}
+a9 <- auc_tab[auc_tab$Model == "9: seeded topics (two-step)", ]
+a6 <- auc_tab[auc_tab$Model == "6: disgust scale", ]
+```
+
+```{r auc-numbers2, echo = FALSE}
+a8 <- auc_tab[auc_tab$Model == "8: standard LDA, four topics", ]
+```
+
+**The two-step text models predict about as well as the disgust scale
+here, and better than the paper's two-step rows.** Our seeded-share
+logit has an in-sample AUC of `r fmt3(a9[[2]])` and a holdout AUC of
+`r fmt3(a9[[4]])` (published 0.608 and 0.563); the unseeded four-topic
+LDA gives `r fmt3(a8[[2]])` and `r fmt3(a8[[4]])` (published 0.559 and
+0.541); the disgust scale gives `r fmt3(a6[[2]])` and `r fmt3(a6[[4]])`
+(published 0.685 and 0.669). The scale reproduces; the two text rows do
+not, and the paper does not say how its two-step topic models were fit
+(iterations, priors, the number of seeded versus residual topics, or
+whether the outcome-side logit used all four shares), so the gap cannot
+be traced. The ordering the paper stresses survives: the integrated
+model's 0.93 to 0.94 on holdout data is far above every two-step number.
+Part of that gap is the point of the paper: estimating the text
+representation jointly with the outcome extracts what predicts the
+choice. Part of it is a comparison that the two-step rows cannot win by
+construction: the integrated model's topic shares for a holdout
+respondent are inferred from that respondent's words with word-topic
+distributions that were trained with the outcome, while a two-step
+share never sees the outcome.
+
+# The authors' integrated model at full length {#sec-mcmc}
+
+**The released scripts were run once at their default settings, and the
+run does not reach the published posterior.** The scripts fix 20,000
+iterations, every twentieth draw kept, seed 1003, and the initial values
+in the code; the printing script summarizes the last fifth of the kept
+draws. Two patches were needed to run them at all: the
+working-directory line and the `bayesm` and `extraDistr` Dirichlet calls
+are replaced by `gtools`, and the direct-path script's undefined `Nseed`
+is set to the number of topics. Each run takes about an hour; the draws
+are cached in the data folder. The topics the run learns are the paper's
+topics. The outcome-side coefficients are not the paper's coefficients,
+and the log-likelihood is still wandering when the chain stops.
+
+```{r mcmc-load, eval = have_mcmc}
+mc_none <- readRDS(mcmc_none_path)
+mc_direct <- readRDS(mcmc_direct_path)
+post_idx <- function(m) seq.int(floor(m$ndraws * 0.8), m$ndraws)
+summ <- function(x) c(mean = mean(x), sd = sd(x))
+beta_none <- apply(mc_none$beta[post_idx(mc_none), ], 2, summ)
+beta_direct <- apply(mc_direct$beta[post_idx(mc_direct), ], 2, summ)
+delta_arr <- simplify2array(mc_none$delta[post_idx(mc_none)])
+delta_mean <- apply(delta_arr, c(1, 2), mean); delta_sd <- apply(delta_arr, c(1, 2), sd)
+theta_mcmc <- apply(mc_none$theta[, , post_idx(mc_none)], c(1, 2), mean)
+c(hours = round(mc_none$elapsed / 60, 2), kept_draws = mc_none$ndraws,
+  accept_beta = round(mc_none$accept["beta"] / mc_none$R, 3))
+```
+
+```{r mcmc-trace, eval = have_mcmc, echo = FALSE, fig.height = 3.2, fig.cap = "The run without a direct path: the log-likelihood of the text model (left) and the four outcome coefficients (right) across kept draws. The dashed line marks the start of the summarized fifth. The likelihood rises, then drifts down and wanders; the coefficients stay near their starting neighbourhood."}
+trace_ll <- tibble(draw = seq_along(mc_none$ll), ll = mc_none$ll)
+short_labels <- c("Animal", "Disgust", "Sustain.", "Free")
+trace_beta <- as_tibble(mc_none$beta) %>% setNames(short_labels) %>% mutate(draw = row_number()) %>%
+  pivot_longer(-draw, names_to = "topic", values_to = "beta") %>%
+  mutate(topic = factor(topic, levels = short_labels))
+cut_at <- floor(mc_none$ndraws * 0.8)
+p1 <- ggplot(trace_ll, aes(draw, ll)) + geom_line(colour = "#0072B2", linewidth = 0.3) +
+  geom_vline(xintercept = cut_at, linetype = "dashed", colour = "grey50") +
+  labs(x = "Kept draw", y = "Log-likelihood") + theme_minimal(base_size = 10)
+p2 <- ggplot(trace_beta, aes(draw, beta, colour = topic)) + geom_line(linewidth = 0.3) +
+  geom_vline(xintercept = cut_at, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  scale_colour_manual(values = c("#0072B2", "#D55E00", "#009E73", "#999999"), name = NULL) +
+  labs(x = "Kept draw", y = expression(beta)) + theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+patchwork::wrap_plots(p1, p2, widths = c(1, 1.3))
+```
+
+```{r mcmc-tables, eval = have_mcmc, echo = FALSE}
+tibble(Parameter = c("Laboratory (direct)", "Slaughterhouse (direct)", paste0("beta: ", topic_labels)),
+       `Our run, no direct path` = c("", "", paste(fmt(beta_none["mean", ]), paren(beta_none["sd", ]))),
+       `Published Table 6` = c("", "", "5.59 (1.25)", "-11.12 (2.33)", "3.44 (1.17)", "-1.32 (1.39)"),
+       `Our run, with direct path` = paste(fmt(beta_direct["mean", ]), paren(beta_direct["sd", ])),
+       `Published Table 7` = c("0.08 (0.36)", "-0.65 (0.37)", "3.56 (0.93)", "-6.99 (1.47)", "3.44 (1.62)", "0.24 (1.19)")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Tables 6 and 7 against a full-length run of the authors' released scripts (posterior mean and standard deviation over the last fifth of the kept draws). The run's coefficients are far smaller in absolute value than the published ones.") %>%
+  tab_style("scale_down")
+tibble(Stimulus = rep(c("Laboratory", "Slaughterhouse"), each = 4), Topic = rep(topic_labels, 2),
+       `Our run` = paste(fmt(as.vector(t(delta_mean))), paren(as.vector(t(delta_sd)))),
+       `Published Table 4` = c("1.63 (0.24)", "0.76 (0.25)", "0.65 (0.28)", "1.02 (0.24)", "1.02 (0.16)", "0.01 (0.25)", "0.47 (0.19)", "-0.06 (0.23)")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 4 against the same run: delta, the effect of each stimulus on the log Dirichlet parameter of each topic. Both agree that every stimulus raises topic concentration; they disagree on which topic gains most.") %>%
+  tab_style()
+```
+
+**The topics themselves are learned, and they are the paper's topics.**
+The highest-probability words of the run's four topics are animals, lab,
+animal, grown, protein; food, safe, health, healthy, chemicals;
+consuming, environment, natural, product, production; and meat,
+cultivated, eat, eating, taste. That is animal welfare, disgust,
+sustainability, and a free topic, in the seeded order, and it matches
+both the paper's Table 3 and the two-step model of Section
+\@ref(sec-topics).
+
+```{r mcmc-theta, eval = have_mcmc}
+round(cor(theta_mcmc, theta), 2)
+```
+
+```{r mcmc-missing, eval = !have_mcmc, echo = FALSE, results = "asis"}
+cat("*The cached draws from the full-length runs are not present on this machine; the reference tables are omitted.*\n")
+```
+
+```{r mcmc-text, eval = have_mcmc, echo = FALSE, results = "asis"}
+cors <- diag(cor(theta_mcmc, theta))
+cat(sprintf("**The run's respondent-level shares line up with the two-step shares on the three seeded topics and not on the free one.** The correlations along the diagonal are %s for animal welfare, %s for disgust, %s for sustainability, and %s for the free topic, and every off-diagonal correlation is negative or near zero, which is what compositional shares of the same corpus should look like. The two procedures are reading the same text the same way.\n\n",
+            fmt(cors[1]), fmt(cors[2]), fmt(cors[3]), fmt(cors[4])))
+cat(sprintf("**What does not reproduce is the outcome block.** The run's beta for disgust is %s (%s) against the paper's -11.12 (2.33), and for animal welfare %s (%s) against 5.59 (1.25); the direct-path run gives %s for the laboratory stimulus and %s for the slaughterhouse against the published 0.08 and -0.65. The run's coefficients are closer to the two-step estimates of Section 5 (%s for disgust) than to the published ones. Three facts say the chain has not settled rather than that the paper is wrong: the log-likelihood drifts down by about %s points after its peak and is still moving at the last draw; the beta path never leaves the neighbourhood of its starting value of zero, moving by steps of standard deviation 0.5 under a Metropolis step accepted %s of the time; and reaching -11 from 0 by that random walk requires a sustained run of accepted moves in one direction along a likelihood ridge.\n\n",
+            fmt(beta_none["mean", 2]), fmt(beta_none["sd", 2]), fmt(beta_none["mean", 1]), fmt(beta_none["sd", 1]),
+            fmt(beta_direct["mean", 1]), fmt(beta_direct["mean", 2]), fmt(b_disgust),
+            fmt(max(mc_none$ll) - mc_none$ll[length(mc_none$ll)], 0), paste0(round(100 * mc_none$accept["beta"] / mc_none$R), "%")))
+cat("**The honest conclusion is that the released scripts, at their default length and from their own initial values, do not reproduce the published Tables 4, 6, and 7 in a single chain.** The package ships no saved posterior, no convergence diagnostics, and no record of how many iterations or chains produced the published numbers, so the gap cannot be closed from the materials provided. What the run does establish is that the text side of the model works as described. The paper's estimates remain the reference for the integrated model in this note, and the comparison in Section 5 is between our two-step estimates and the paper's published integrated ones, not between two runs of ours.\n")
+```
+
+
+# What the replication says {#sec-reading}
+
+**The two-step version reproduces Table 11 exactly and the paper's
+qualitative structure, and it loses what the paper says it loses.** The
+seeded topics are recognizable, the disgust topic is what predicts
+refusal, the slaughterhouse picture raises animal-welfare talk, and the
+choice is barely affected on average. The two-step coefficients are a
+fraction of the integrated ones, the two-step indirect effects are
+indistinguishable from zero, and the two-step models predict the choice
+about as well as the disgust scale, far below the integrated model.
+
+**The authors' own scripts, run at full length, reproduce the model's
+text side but not its published outcome coefficients.** The topics and
+the respondent-level shares come out as described; the coefficients that
+turn those shares into a choice do not, and the chain is still moving
+when it stops. The package ships no saved posterior and no record of the
+run that produced the published tables, so a reader cannot close that
+gap from the materials provided. This is a statement about the
+replication package, not about the paper's estimates.
+
+**As a mediation analysis, the text model carries the same assumption as
+the scale.** The treatment is randomized; the topic shares are not. What
+a respondent writes and what they choose share unmeasured causes beyond
+the picture (attitudes to novel food, prior knowledge), and neither the
+integrated nor the two-step model conditions on them. The paper's
+comparison of mediators is a comparison of measurements of the
+mechanism, not of identification strategies, and the same sensitivity
+question applies to both: how much residual correlation between text and
+choice would erase the indirect effect through disgust.
+
+**What the package adds.** The natural effects on the probability scale
+with intervals, the per-mediator indirect effects, and one function for
+the scale and for the text mediators, so that the two are compared on
+the same estimand. The two-step version is transparent about
+measurement error; the integrated version handles it at the price of
+letting the outcome shape the mediators.
+
+## Mapping to the lecture's checklist
+
+1. Estimands: natural direct and indirect effects of each picture through
+   three topics, on the probability scale.
+2. Graph: randomized pictures; topics and choice with unmeasured common
+   causes; no treatment-induced confounder is modelled.
+3. Effects on the mediators first: Table 4 analogue, and the disgust
+   scale in Table 11.
+4. `mediate_reg()` with parallel mediators and a logistic outcome; the
+   authors' integrated estimates as the reference.
+5. Sensitivity: not reported in the paper; the linear version of the
+   disgust-scale analysis would give it.
+6. No instrument and no front-door structure.
+7. Not applicable.
+8. Not applicable.
+
+# References
+
+- Hayes, Andrew F. 2017. *Introduction to Mediation, Moderation, and Conditional Process Analysis*. Guilford.
+- Imai, Kosuke, Luke Keele, and Dustin Tingley. 2010. "A General Approach to Causal Mediation Analysis." *Psychological Methods*.
+- Watanabe, Kohei, and Phan Xuan Bao Trang. 2024. *seededlda: Seeded Sequential LDA for Topic Modeling*. R package.
+- Zhang, Judy (Zijing), H. Alice Li, and Greg M. Allenby. 2024. "Using Text Analysis in Parallel Mediation Analysis." *Marketing Science* 43(5), 953-970.

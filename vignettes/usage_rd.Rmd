@@ -1,0 +1,199 @@
+---
+title: "Using causalmetrics with the rdrobust family for regression discontinuity designs"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using causalmetrics with the rdrobust family for regression discontinuity designs}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4,
+                      message = FALSE, warning = FALSE)
+library(causalmetrics)
+set.seed(1)
+run_rd <- requireNamespace("rdrobust", quietly = TRUE)
+run_honest <- requireNamespace("RDHonest", quietly = TRUE)
+run_density <- requireNamespace("rddensity", quietly = TRUE)
+run_locrand <- requireNamespace("rdlocrand", quietly = TRUE)
+run_multi <- requireNamespace("rdmulti", quietly = TRUE)
+run_hte <- requireNamespace("rdhte", quietly = TRUE)
+run_mlr3 <- requireNamespace("mlr3", quietly = TRUE) && requireNamespace("mlr3learners", quietly = TRUE) &&
+  requireNamespace("ranger", quietly = TRUE)
+knitr::opts_chunk$set(eval = run_rd)
+```
+
+## What the package adds to the rdrobust family
+
+The packages of Cattaneo, Titiunik, and coauthors estimate regression
+discontinuity (RD) designs: `rdrobust` (local polynomial estimation with
+robust bias-corrected inference and bandwidth selection), `rddensity`
+(manipulation tests), `RDHonest` (honest inference), `rdlocrand` (local
+randomization), `rdmulti` (multiple cutoffs and scores), `rdhte`
+(heterogeneity at the cutoff). `causalmetrics` calls them as they are and
+adds what they do not do:
+
+| Task | Function |
+|---|---|
+| Flexible covariate adjustment with cross-fitted learners before `rdrobust` | `rd_adjust()` |
+| Effects away from the cutoff under conditional independence | `rd_extrapolate()` |
+| Weak-identification-robust intervals for fuzzy RD | `rd_weak_iv()` |
+| Balance with a joint test, placebo cutoffs, bandwidth sensitivity, donut holes, as one object | `rd_checks()`, `plot_rd_checks()` |
+| RD plots as modifiable ggplot objects | `rd_plot()`, `rd_bins()` |
+| One tidy table across packages | `rd_frame()`, `tidy()` for `RDHonest` and `rdhte` |
+| Regression kink reporting and the four kink graphs | `rd_kink()`, `plot_rd_kink()` |
+| Simulated designs with known effects | `sim_rd()` |
+
+All examples use simulated data from `sim_rd()`, whose effect at the
+cutoff is known.
+
+## Sharp RD with rdrobust, and the plot
+
+```{r sharp}
+dat <- sim_rd(3000, "lee", seed = 1)
+attr(dat, "tau_true")
+fit <- rdrobust::rdrobust(dat$y, dat$x, c = 0)
+summary(fit)
+rd_plot(dat, "y", "x")
+```
+
+`rd_plot()` returns a ggplot object. The default bins are the IMSE-optimal
+quantile-spaced bins of `rdrobust::rdplot()`; the fitted lines are global
+fourth-order polynomials on each side. Everything can be changed with
+`+`:
+
+```{r plot-modify}
+rd_plot(dat, "y", "x", fit = "local", ci = TRUE, n_bins = 25) +
+  ggplot2::labs(title = "Local linear fit inside the MSE-optimal bandwidth",
+                x = "Running variable", y = "Outcome") +
+  ggplot2::theme_bw()
+head(rd_bins(dat, "y", "x", n_bins = 10))
+```
+
+## The diagnostic battery
+
+`rd_checks()` runs the main estimate, covariate balance with a joint test,
+placebo cutoffs on each side, bandwidth sensitivity, and donut-hole
+estimates. Each piece is also available on its own.
+
+```{r checks}
+datc <- sim_rd(3000, "covariates", seed = 2)
+ck <- rd_checks(datc, "y", "x", covariates = paste0("z", 1:4))
+ck
+plot_rd_checks(ck, "sensitivity")
+plot_rd_checks(ck, "balance")
+```
+
+The joint balance test stacks the influence functions of the local linear
+jumps of all covariates at one bandwidth, which `rdrobust` does not
+provide.
+
+## Flexible covariate adjustment
+
+`rdrobust(covs = )` adjusts linearly. `rd_adjust()` subtracts a
+cross-fitted machine-learning prediction of the outcome from the
+covariates before the local polynomial step. Any function of the
+covariates leaves the RD estimand unchanged, so no rate condition is
+needed and the only effect is a smaller variance.
+
+```{r adjust, eval = run_rd && run_mlr3}
+library(mlr3)
+library(mlr3learners)
+adj_lin <- rd_adjust(datc, "y", "x", covariates = paste0("z", 1:4), seed = 1)
+adj_rf <- rd_adjust(datc, "y", "x", covariates = paste0("z", 1:4),
+                    learner = lrn("regr.ranger", num.trees = 300, min.node.size = 20), pooled = FALSE, seed = 1)
+rd_frame(raw = adj_lin$fits$raw, linear = adj_lin$fits$adjusted, forest = adj_rf$fits$adjusted, methods = "robust")
+```
+
+The design has a nonlinear covariate effect, so the forest removes more
+outcome variance than the linear model and the standard error falls
+further. The adjusted outcome is in `adj_rf$data$y_adj` for any further
+use.
+
+## Honest inference and local randomization
+
+```{r honest, eval = run_rd && run_honest}
+hn <- RDHonest::RDHonest(y ~ x, data = dat, cutoff = 0)
+tidy(hn)
+```
+
+```{r locrand, eval = run_rd && run_locrand}
+lr <- rdlocrand::rdrandinf(dat$y, dat$x, wl = -0.05, wr = 0.05, quietly = TRUE, ci = 0.05)
+```
+
+```{r frame, eval = run_rd && run_honest && run_locrand}
+rd_frame(rdrobust = fit, honest = hn, local_random = lr, methods = "robust")
+```
+
+## Manipulation
+
+```{r density, eval = run_rd && run_density}
+man <- sim_rd(4000, "manipulated", seed = 3)
+summary(rddensity::rddensity(man$x, c = 0))
+rd_plot(man, "y", "x")
+plot_rd_checks(rd_donut(man, "y", "x"))
+```
+
+## Fuzzy RD and weak first stages
+
+```{r fuzzy}
+fz <- sim_rd(3000, "fuzzy", compliance = 0.7, seed = 4)
+rd_weak_iv(fz, "y", "d", "x")
+```
+
+The table shows the local two-stage least squares estimate with its Wald
+interval, the Anderson-Rubin set, and the `rdrobust` fuzzy rows at the
+same bandwidth. With a weak first stage the Anderson-Rubin set widens or
+becomes unbounded while the Wald interval does not, which is the warning
+sign.
+
+## Effects away from the cutoff
+
+```{r extrapolate}
+cia <- sim_rd(4000, "cia", seed = 5)
+ex <- rd_extrapolate(cia, "y", "x", covariates = "z", window = 0.5)
+ex
+plot_rd_extrapolate(ex, truth = attr(cia, "tau_true"))
+```
+
+The conditional independence test does not reject on either side, and the
+average effects above and below the cutoff recover the true effect, which
+in this design is constant.
+
+## Multiple cutoffs and heterogeneity
+
+```{r multi, eval = run_rd && run_multi}
+mc_dat <- sim_rd(4000, "multi_cutoff", seed = 6)
+mc <- rdmulti::rdmc(mc_dat$y, mc_dat$x, C = mc_dat$cutoff, verbose = FALSE, plot = FALSE)
+rd_frame(multi = mc)
+```
+
+```{r hte, eval = run_rd && run_hte}
+datc$group <- as.integer(datc$z3 > 0)
+ht <- rdhte::rdhte(datc$y, datc$x, c = 0, covs.hte = datc$group)
+tidy(ht)
+```
+
+## Regression kink
+
+```{r kink}
+kd <- sim_rd(4000, "kink", seed = 7)
+kk <- rd_kink(kd, "y", "x", d = "d", elasticity = TRUE)
+kk
+```
+
+```{r kink-plot, fig.height = 6, eval = run_rd && requireNamespace("patchwork", quietly = TRUE)}
+plot_rd_kink(kk)
+```
+
+## References
+
+- Angrist, J. D. and Rokkanen, M. (2015). Wanna get away? Regression discontinuity estimation of exam school effects away from the cutoff. *Journal of the American Statistical Association*, 110(512).
+- Calonico, S., Cattaneo, M. D., and Titiunik, R. (2014). Robust nonparametric confidence intervals for regression-discontinuity designs. *Econometrica*, 82(6).
+- Calonico, S., Cattaneo, M. D., and Titiunik, R. (2015). Optimal data-driven regression discontinuity plots. *Journal of the American Statistical Association*, 110(512).
+- Card, D., Lee, D. S., Pei, Z., and Weber, A. (2015). Inference on causal effects in a generalized regression kink design. *Econometrica*, 83(6).
+- Feir, D., Lemieux, T., and Marmer, V. (2016). Weak identification in fuzzy regression discontinuity designs. *Journal of Business and Economic Statistics*, 34(2).
+- Noack, C., Olma, T., and Rothe, C. (2024). Flexible covariate adjustments in regression discontinuity designs. arXiv:2107.07942.

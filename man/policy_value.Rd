@@ -7,28 +7,57 @@
 policy_value(
   scores,
   policy,
-  baseline = c("none", "all"),
+  baseline = "none",
   cost = 0,
-  conf_level = 0.95
+  conf_level = 0.95,
+  n_boot = 0L,
+  seed = NULL,
+  weights = NULL
 )
 }
 \arguments{
-\item{scores}{A \code{cm_scores} object (held out from the policy's estimation
-sample for an honest value).}
+\item{scores}{A \code{cm_scores} or \code{cm_scores_multi} object (held out from
+the policy's estimation sample for an honest value).}
 
-\item{policy}{A 0/1 (or logical) vector, a \code{cm_policy} object, a function
-of the data returning 0/1, or a named list of such objects.}
+\item{policy}{Binary case: a 0/1 (or logical) vector, a \code{cm_policy}
+object, a function of the data returning 0/1, or a named list of such
+objects. Multi-arm case: a vector of arm labels, a \code{cm_policy} object,
+a function returning arm labels, or a named list of them.}
 
-\item{baseline}{\code{"none"} (value over treating no one) or \code{"all"}.}
+\item{baseline}{Binary case: \code{"none"} (value over treating no one) or
+\code{"all"}. Multi-arm case: \code{"none"} (the expected outcome under the
+policy) or an arm label (gain over the uniform policy that assigns that
+arm to everyone).}
 
-\item{cost}{Cost of treating one unit, in outcome units.}
+\item{cost}{Cost of treating one unit, in outcome units (binary case), or
+a vector of per-arm costs (multi-arm case).}
 
 \item{conf_level}{Confidence level.}
+
+\item{n_boot}{Number of nonparametric bootstrap draws (units resampled
+with replacement); 0 (default) reports influence-function standard
+errors only.}
+
+\item{seed}{Optional seed for the bootstrap.}
+
+\item{weights}{Optional positive unit weights (a numeric vector of length
+\code{nrow(scores$data)} or a column name): survey weights, or the
+time-decaying weights \code{h_t} of policy learning with adaptively collected
+data (Zhan et al. 2024). The value is \verb{sum(w_i c_i) / sum(w_i)} with
+\code{c_i} the unit contribution and its standard error
+\code{sqrt(sum(w_i^2 (c_i - value)^2)) / sum(w_i)}, the adaptively weighted
+form of Hadad et al. (2021), which reduces to the unweighted formula for
+constant weights. Shares treated are unweighted.}
 }
 \value{
-A data frame with one row per policy: \code{policy}, \code{share_treated},
+A data frame with one row per policy: \code{policy}, the share
+treated (binary) or the share assigned to each arm (multi-arm),
 \code{estimate}, \code{std.error}, \code{conf.low}, \code{conf.high}, and, when several
-policies are given, \code{diff_vs_first} and \code{diff_se}.
+policies are given, \code{diff_vs_first} and \code{diff_se}. In the multi-arm case
+with an arm baseline, \code{baseline_value} and \code{gain_pct} are added. With
+\code{n_boot > 0}, \code{boot.se}, \code{boot.low}, \code{boot.high} (percentile interval)
+are added and the draws are attached as attributes \code{"boot"} (values) and
+\code{"boot_diff"} (differences against the first policy).
 }
 \description{
 The gain of the rule \code{pi(X)} over treating no one is
@@ -37,6 +66,15 @@ average of the doubly robust pseudo-outcome, so it is estimated with a
 standard error from the influence function. With \code{baseline = "all"} the
 gain over treating everyone is \code{E[(pi(X) - 1)(Y(eta) - cost)]}. Several
 policies can be evaluated at once and are compared with the first one.
+}
+\details{
+With a multi-arm score object (see \code{\link[=dr_scores]{dr_scores()}} with more than two
+arms) a policy maps units to arms, its value is the mean of
+\code{Gamma[i, pi(X_i)]}, the expected outcome under the policy, and
+\code{baseline} names the arm of a uniform comparison policy: the gain is then
+\code{E[Gamma[i, pi(X_i)] - Gamma[i, baseline]]} and the percentage gain over
+the uniform policy is reported. With \code{type = "ipw"} scores this is the
+inverse-propensity-score reward of the off-policy evaluation literature.
 }
 \examples{
 dat <- sim_hte(1000, dgp = "policy", seed = 1)

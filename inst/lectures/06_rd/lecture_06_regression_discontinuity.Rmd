@@ -1,0 +1,1177 @@
+---
+title: "Causal Inference in Economics and Marketing"
+subtitle: "Section 06: Regression Discontinuity and Kink Designs"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.2, fig.align = "center", fig.pos = "H",
+  out.width = "95%", collapse = TRUE, comment = "#>"
+)
+# Code and output in footnotesize.
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+# This lecture lives in inst/lectures/06_rd/ of the package source. When
+# knitted from the source tree it loads the development version of the
+# package; when the package is installed it uses the installed helpers.
+helper_rel <- file.path("vignette_helpers", "06_rd", "rd_lecture_helpers.R")
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_path <- file.path(pkg_root, "inst", helper_rel)
+} else {
+  library(causalmetrics)
+  helper_path <- system.file(helper_rel, package = "causalmetrics")
+}
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(mlr3)
+library(mlr3learners)
+library(rdrobust)
+source(helper_path)
+helper_md5 <- tools::md5sum(helper_path)
+n_sims_estimators <- 200
+n_sims_coverage <- 200
+n_sims_adjust <- 60
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f")
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+```
+
+# A rule creates an experiment {#sec-problem}
+
+## Thresholds are everywhere
+
+A scholarship goes to students whose test score is at least 80. A party
+holds a seat when its vote share passes 50 percent. A class is split in two
+when enrollment exceeds 40. Unemployment benefits replace 55 percent of past
+earnings up to a cap. A house gets an energy label B rather than C when its
+score reaches 69. In each case a rule maps a continuous variable, the
+running variable, into a treatment through a cutoff.
+
+A regression discontinuity (RD) design uses that rule. Units just below the
+cutoff and units just above it are alike in everything that varies
+smoothly with the running variable; they differ only in the treatment.
+Comparing them is an experiment the rule ran for us.
+
+## The estimand and why it is local
+
+Let $X$ be the running variable, $c$ the cutoff, and $D = 1\{X \ge c\}$ the
+treatment in a sharp design. The target is
+$$
+\tau_{RD} = E[Y(1) - Y(0) \mid X = c],
+$$
+the average effect for units at the cutoff. Nothing in the design speaks
+about units far from $c$. That is the trade the design makes: the strongest
+internal validity among quasi-experimental designs (Dehejia's phrase) for
+an estimand that lives at one point. Section \@ref(sec-extensions) shows
+what extra assumptions buy effects away from the cutoff.
+
+## One design, six figures {#sec-six-figures}
+
+Every RD paper shows the same figures. The outcome jumps at the cutoff;
+predetermined covariates do not; the density of the running variable does
+not. We simulate the design of Lee (2008) as calibrated by Calonico,
+Cattaneo, and Titiunik (2014): a smooth outcome function with a jump of 0.04
+at zero.
+
+```{r six-figures-data}
+dat <- sim_rd(n = 3000, dgp = "covariates", seed = 1)
+attr(dat, "tau_true")
+```
+
+```{r six-figures, echo = FALSE, fig.height = 5.6, fig.cap = "The three RD figures on a simulated design. Top left: the outcome jumps at the cutoff (binned means with fourth-order polynomial fits per side). Top right: a predetermined covariate does not jump. Bottom left: the density of the running variable is continuous. Bottom right: the same outcome plot with local linear fits inside the MSE-optimal bandwidth, the estimator's own view of the data."}
+p1 <- rd_plot(dat, "y", "x", y_lab = "Outcome") + labs(title = "Outcome")
+p2 <- rd_plot(dat, "z1", "x", y_lab = "Covariate z1") + labs(title = "Predetermined covariate")
+p3 <- ggplot(dat, aes(x)) + geom_histogram(bins = 60, fill = "grey70", colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed") + labs(title = "Density of the running variable", y = "Count") + rd_theme()
+p4 <- rd_plot(dat, "y", "x", fit = "local", ci = TRUE, y_lab = "Outcome") + labs(title = "Local linear fits")
+patchwork::wrap_plots(p1, p2, p3, p4, ncol = 2)
+```
+
+`rd_plot()` draws these as ggplot objects: bins are the IMSE-optimal
+quantile-spaced bins of Calonico, Cattaneo, and Titiunik (2015), the fits
+are polynomials per side or local linear fits inside a bandwidth, and any
+layer can be added with `+`.
+
+## Where naive approaches fail {#sec-naive}
+
+Three ways to estimate the jump suggest themselves: compare means in a
+narrow window, fit one polynomial to the whole range on each side, or fit
+a line to the observations near the cutoff. The second was the original
+practice and is now discouraged (Gelman and Imbens 2019). The experiment
+below fits five estimators to `r n_sims_estimators` samples of size 1,000
+from the Lee design.
+
+```{r estimator-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_estimators)}
+est_res <- run_estimator_experiment(n_sims = n_sims_estimators, n = 1000, seed = 1)
+est_tab <- summarise_estimator_experiment(est_res)
+```
+
+```{r tab-estimators, echo = FALSE}
+est_tab %>%
+  mutate(across(c(bias, sd, rmse, mean_se), ~ fmt(.x, 4)), coverage = fmt(coverage, 2)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Estimator", "Bias", "SD", "RMSE", "Mean SE", "95\\% coverage"),
+      caption = paste0("Five estimators of the jump on the Lee design, true effect 0.04, n = 1,000, ",
+                       n_sims_estimators, " simulations. Local estimators use the MSE-optimal bandwidth of rdbwselect() ",
+                       "and conventional standard errors; global polynomials use HC1.")) %>%
+  tab_style()
+```
+
+```{r fig-estimators, echo = FALSE, fig.height = 3.6, fig.cap = "Sampling distributions of the five estimators, centered at the truth."}
+ggplot(est_res, aes(estimate - truth, colour = estimator)) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  geom_density(linewidth = 0.8) +
+  scale_colour_manual(values = rd_colors, name = NULL) +
+  labs(x = "Estimate minus truth", y = "Density") + rd_theme() + guides(colour = guide_legend(nrow = 2))
+```
+
+```{r estimator-numbers, echo = FALSE}
+get_row <- function(nm, col) est_tab[[col]][est_tab$estimator == nm]
+se_ratio <- function(nm) get_row(nm, "mean_se") / get_row(nm, "sd")
+```
+
+Three things are visible.
+
+- The global polynomials report standard errors that are
+  `r fmt(se_ratio("Global polynomial, order 4"), 2)` (quartic) and
+  `r fmt(se_ratio("Global polynomial, order 2"), 2)` (quadratic) times
+  their actual sampling standard deviations, with coverage
+  `r fmt(get_row("Global polynomial, order 4", "coverage"), 2)` and
+  `r fmt(get_row("Global polynomial, order 2", "coverage"), 2)`. Their bias
+  depends on whether the chosen order happens to match the curvature of
+  the truth, which is unknown; Gelman and Imbens (2019) show that
+  high-order fits also give observations far from the cutoff large weights
+  on the estimate at the cutoff (Section \@ref(sec-weights)).
+- The local linear estimator at the MSE-optimal bandwidth has a bias of
+  `r fmt(get_row("Local linear, MSE bandwidth", "bias"), 4)`, which is
+  `r round(100 * abs(get_row("Local linear, MSE bandwidth", "bias")) / 0.04)`
+  percent of the effect, and coverage of
+  `r fmt(get_row("Local linear, MSE bandwidth", "coverage"), 2)` with
+  conventional standard errors. The bias is not a mistake: the bandwidth
+  that minimizes the mean squared error balances bias against variance,
+  and the conventional interval ignores the bias. Section
+  \@ref(sec-inference) is about that gap.
+- Halving the bandwidth cuts the bias to
+  `r fmt(get_row("Local linear, half bandwidth", "bias"), 4)` and raises
+  the standard deviation to
+  `r fmt(get_row("Local linear, half bandwidth", "sd"), 4)`; the local
+  quadratic at the full bandwidth does the same trade in a different way.
+  Bias and variance are the currency of every choice in this lecture.
+
+## Roadmap
+
+Section \@ref(sec-identification) states what identifies the jump and what
+threatens it. Section \@ref(sec-estimation) builds the local polynomial
+estimator and its bandwidth. Section \@ref(sec-inference) repairs the
+interval, with bias correction and with honest intervals. Section
+\@ref(sec-diagnostics) is the diagnostic battery every RD paper reports.
+Section \@ref(sec-covariates) brings in covariates and machine learning.
+Section \@ref(sec-local-random) is local randomization, the other way to
+think about the design. Section \@ref(sec-extensions) goes beyond one
+sharp cutoff, Section \@ref(sec-kink) to kinks and bunching, and Section
+\@ref(sec-practice) to the replications and a checklist. Throughout, the
+estimators are those of the `rdrobust` family and the package adds the
+pieces around them.
+
+# Identification {#sec-identification}
+
+## Sharp RD: continuity at the cutoff {#sec-continuity}
+
+Write $\mu_d(x) = E[Y(d) \mid X = x]$. The observed conditional mean is
+$E[Y \mid X = x] = \mu_1(x)$ for $x \ge c$ and $\mu_0(x)$ for $x < c$.
+
+**Assumption (continuity).** $\mu_1$ and $\mu_0$ are continuous at $c$,
+and the density of $X$ is positive at $c$ (Hahn, Todd, and van der Klaauw
+2001).
+
+Then
+$$
+\lim_{x \downarrow c} E[Y \mid X = x] - \lim_{x \uparrow c} E[Y \mid X = x]
+= \mu_1(c) - \mu_0(c) = \tau_{RD}.
+$$
+*Skeleton.* The right limit is a limit of $\mu_1(x)$ and the left limit a
+limit of $\mu_0(x)$; continuity turns each into its value at $c$. Positive
+density makes both limits estimable. Appendix \@ref(app-identification)
+writes this out with the potential-outcome notation.
+
+Two remarks. Continuity is an assumption about the *potential* outcome
+functions, which no data can verify at $c$ itself; its testable
+implications are the balance and density checks of Section
+\@ref(sec-diagnostics). And nothing requires the density of $X$ to be
+continuous at $c$ for identification; a density jump is evidence about
+manipulation, which threatens continuity of $\mu_d$, not a requirement in
+itself.
+
+## Local randomization as the other assumption {#sec-locrand-assumption}
+
+A different story: inside a small window $[c - w, c + w]$, being above or
+below the cutoff is as good as randomly assigned, and the running variable
+has no effect on the outcome within the window (Cattaneo, Frandsen, and
+Titiunik 2015). This is stronger than continuity: it asks the potential
+outcome functions to be flat, not merely continuous, inside the window. It
+buys exact finite-sample inference by permutation and handles discrete
+running variables and small samples where local polynomials cannot be
+fitted. Section \@ref(sec-local-random) uses it.
+
+## Fuzzy RD: the cutoff as an instrument {#sec-fuzzy-id}
+
+When the cutoff changes the probability of treatment without determining
+it, $P(D = 1 \mid X = x)$ jumps at $c$ from $p^-$ to $p^+ < 1$. The jump in
+the outcome divided by the jump in treatment,
+$$
+\tau_{FRD} = \frac{\lim_{x \downarrow c} E[Y \mid X = x] - \lim_{x \uparrow c} E[Y \mid X = x]}
+                  {\lim_{x \downarrow c} E[D \mid X = x] - \lim_{x \uparrow c} E[D \mid X = x]},
+$$
+is the effect for compliers at the cutoff, the units whose treatment is
+switched by crossing it, under the monotonicity and exclusion conditions
+of Section 05 applied locally. The indicator $1\{X \ge c\}$ is the
+instrument, the running variable and its interaction with the indicator
+are the controls, and everything Section 05 said about weak instruments
+applies inside the window (Section \@ref(sec-fuzzy-est)).
+
+## Threats {#sec-threats}
+
+Three things break continuity of $\mu_d$ at $c$.
+
+- **Manipulation.** If units can place themselves on the preferred side
+  of the cutoff, those just above differ from those just below in whatever
+  drove the manipulation. Precise control over $X$ is the problem; partial
+  control with an idiosyncratic component is not (Lee 2008), because the
+  units who end up near the cutoff are still a mix. The density test looks
+  for the pile-up that precise control creates.
+- **Other discontinuities at the cutoff.** If a second policy uses the same
+  cutoff, the jump combines both. The remedy is institutional knowledge,
+  not statistics.
+- **Heaping.** Running variables recorded in round numbers (birth weight in
+  100-gram multiples, grades on a coarse scale) put atypical units at the
+  heaps; if a heap sits at the cutoff, the comparison at the cutoff is
+  between atypical groups (Barreca et al. 2011). Donut-hole estimates and
+  discrete-score methods respond to this.
+
+Covariate jumps at the cutoff are the symptom of all three, which is why
+balance is checked the way it is checked in an experiment.
+
+# Estimation {#sec-estimation}
+
+## Three approximations of one target {#sec-three}
+
+The target is a difference of two limits of a conditional mean. Any
+consistent estimator of $E[Y \mid X = x]$ evaluated on each side and pushed
+to $c$ will do; the estimators differ in how they trade bias for variance.
+
+- **Local means.** Average $Y$ in $[c - h, c)$ and in $[c, c + h]$ and
+  subtract. Bias of order $h$ from the slope; variance of order $1/(nh)$.
+- **Global polynomials.** Fit $Y$ on a polynomial in $X - c$ and its
+  interaction with $D$ on the whole support. Uses all data; the estimate at
+  $c$ depends on the shape far away, and no criterion chooses the order.
+- **Local polynomials.** Fit a polynomial of low order $p$ inside a
+  bandwidth $h$ with kernel weights, separately on each side, and take the
+  difference of the intercepts. Bias of order $h^{p + 1}$; variance of order
+  $1/(nh)$. With $p = 1$ this is the local linear estimator and the
+  default of every RD package.
+
+## The local linear estimator as weighted least squares {#sec-weights}
+
+On the right side, with $K$ a kernel and $h$ a bandwidth,
+$$
+(\hat\alpha_+, \hat\beta_+) = \arg\min_{\alpha, \beta} \sum_{i: X_i \ge c}
+K\!\Big(\frac{X_i - c}{h}\Big)\big(Y_i - \alpha - \beta (X_i - c)\big)^2,
+$$
+and likewise on the left; $\hat\tau = \hat\alpha_+ - \hat\alpha_-$. Because
+weighted least squares is linear in $Y$, the estimate is a weighted sum
+$\hat\tau = \sum_i w_i(X_i; h) Y_i$ with weights that depend on the
+running variable only. The weights are the estimator's identity card.
+
+```{r weights, echo = FALSE, fig.height = 3.4, fig.cap = "Weights on each observation's outcome in three estimators of the jump on the same sample of 1,000 units. The local linear estimator (triangular kernel, MSE-optimal bandwidth) uses only nearby units and its weights fall to zero at the bandwidth. The global quartic gives units far from the cutoff weights comparable to nearby units, some with the opposite sign."}
+dw <- sim_rd(1000, "lee", seed = 2)
+h_w <- rdbwselect(dw$y, dw$x, c = 0)$bws[1, 1]
+lin_weights <- function(x, h, cutoff = 0, kernel = "triangular") {
+  w <- numeric(length(x))
+  for (s in c(-1, 1)) {
+    idx <- if (s > 0) x >= cutoff else x < cutoff
+    k <- pmax(0, 1 - abs(x[idx] - cutoff) / h)
+    X <- cbind(1, x[idx] - cutoff)
+    A <- solve(crossprod(X * k, X))
+    w[idx] <- s * as.numeric((X %*% A[, 1]) * k)
+  }
+  w
+}
+poly_weights <- function(x, order, cutoff = 0) {
+  d <- as.integer(x >= cutoff); xc <- x - cutoff
+  X <- model.matrix(~ d * poly(xc, order, raw = TRUE))
+  A <- solve(crossprod(X))
+  as.numeric(X %*% A[, "d"])
+}
+wdf <- bind_rows(
+  tibble(x = dw$x, w = lin_weights(dw$x, h_w), estimator = "Local linear, MSE bandwidth"),
+  tibble(x = dw$x, w = poly_weights(dw$x, 4), estimator = "Global polynomial, order 4"),
+  tibble(x = dw$x, w = poly_weights(dw$x, 2), estimator = "Global polynomial, order 2")
+)
+ggplot(wdf, aes(x, w, colour = estimator)) +
+  geom_hline(yintercept = 0, colour = "grey50") + geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(size = 0.6, alpha = 0.7) +
+  scale_colour_manual(values = rd_colors, name = NULL) +
+  labs(x = "Running variable", y = "Weight on the outcome") + rd_theme()
+```
+
+## Bias and variance {#sec-bias-variance}
+
+Under twice-differentiable conditional means and $h \to 0$ with
+$nh \to \infty$,
+$$
+\hat\tau \approx N\!\Big(\tau + h^2 B,\ \frac{V}{nh}\Big), \qquad
+B = \frac{\bar\nu}{2}\big(\mu_1''(c) - \mu_0''(c)\big), \qquad
+V = \frac{\bar\kappa}{f_X(c)}\big(\sigma_1^2(c) + \sigma_0^2(c)\big),
+$$
+with kernel constants $\bar\nu, \bar\kappa$ and conditional variances
+$\sigma_d^2$. *Skeleton.* Expand $\mu_d(x)$ to second order around $c$;
+the local linear fit is exact for the linear part, so the bias is the
+curvature term times the second moment of the kernel weights, which
+scales with $h^2$. The effective sample size is proportional to $nh$, so
+the variance scales with $1/(nh)$. Appendix \@ref(app-rates) gives the
+argument and the minimax rate $n^{-4/5}$ for this class.
+
+Minimizing $h^4 B^2 + V/(nh)$ gives the MSE-optimal bandwidth
+$h^* \propto n^{-1/5}$. Two consequences shape everything below: at $h^*$
+the squared bias and the variance are of the same order, so the bias does
+not vanish relative to the standard error; and $h^*$ depends on $B$ and
+$V$, which must themselves be estimated from the data.
+
+## Kernel and order {#sec-kernel-order}
+
+The triangular kernel is optimal for estimating a boundary point among
+kernels, and it is the default. Local linear ($p = 1$) is preferred to
+local constant because the boundary bias of the constant fit is of order
+$h$; higher orders reduce bias at the cost of variance and are the
+standard choice for the bias correction step ($q = p + 1$), not for the
+point estimate. The experiment of Section \@ref(sec-naive) showed the
+local quadratic at the linear bandwidth: less bias, more spread.
+
+## Bandwidth selection {#sec-bandwidth}
+
+Imbens and Kalyanaraman (2012) plug estimates of $B$ and $V$ into $h^*$.
+Calonico, Cattaneo, and Titiunik (2014) refine the pilot estimates and
+add a second bandwidth $b$ for the bias correction of Section
+\@ref(sec-bias-correction). Calonico, Cattaneo, and Farrell (2020) derive
+the bandwidth that minimizes the coverage error of the interval rather
+than the MSE of the point estimate, which is smaller than $h^*$ by a
+factor $n^{-1/20}$. `rdbwselect()` returns all of them.
+
+```{r bwselect}
+dat <- sim_rd(3000, "lee", seed = 1)
+bw <- rdbwselect(dat$y, dat$x, c = 0, all = TRUE)
+bw$bws
+```
+
+The rows differ in whether the two sides share a bandwidth (`mserd`,
+`cerrd`) or not (`msetwo`, `certwo`) and in the criterion (MSE or coverage
+error). The reporting norm is to show the MSE-optimal choice and a
+sensitivity figure over a grid (Section \@ref(sec-diagnostics)); a result
+that survives only at one bandwidth is not a result.
+
+## Fuzzy RD estimation {#sec-fuzzy-est}
+
+Two local linear fits and a ratio: the jump in $Y$ over the jump in $D$,
+both at the same bandwidth. Equivalently, local two-stage least squares of
+$Y$ on $D$ with $1\{X \ge c\}$ as instrument and $(X - c)$,
+$1\{X \ge c\}(X - c)$ as controls, weighted by the kernel.
+`rdrobust(fuzzy = )` does the former with bias correction of the ratio.
+
+```{r fuzzy}
+fz <- sim_rd(3000, "fuzzy", compliance = 0.8, seed = 2)
+summary(rdrobust(fz$y, fz$x, c = 0, fuzzy = fz$d))
+```
+
+The first-stage jump is `r fmt(2 * 0.8 - 1, 2)` in this design, a strong
+instrument. When the jump is small, the ratio inherits the weak-instrument
+problem of Section 05: the Wald interval is too short and its coverage
+falls (Feir, Lemieux, and Marmer 2016). `rd_weak_iv()` computes the local
+first-stage F statistics and the Anderson-Rubin set on the kernel-weighted
+sample, which stays valid however small the jump.
+
+```{r weak-iv}
+weak <- sim_rd(3000, "fuzzy", compliance = 0.55, seed = 2)
+wk <- rd_weak_iv(weak, "y", "d", "x")
+wk
+```
+
+```{r weak-iv-numbers, echo = FALSE}
+wk_ar <- wk$table[wk$table$method == "Anderson-Rubin", ]
+wk_wald <- wk$table[wk$table$method == "local 2SLS (Wald)", ]
+```
+
+With a first-stage jump of 0.1 the effective F is
+`r fmt(wk$first_stage$F_effective, 1)`, far below the usual thresholds.
+The Wald interval ends at `r fmt(wk_wald$conf.high, 2)`; the
+Anderson-Rubin set is `r wk$ar_set$type` and reaches
+`r if (is.finite(wk_ar$conf.high)) fmt(wk_ar$conf.high, 2) else "infinity"`.
+The data cannot pin the ratio down, and the Wald interval's width is an
+artifact of treating a noisy denominator as fixed.
+
+# Inference {#sec-inference}
+
+## Why the MSE-optimal bandwidth breaks the naive interval {#sec-naive-ci}
+
+At $h^*$ the bias $h^{*2} B$ and the standard error $\sqrt{V/(nh^*)}$ are
+both of order $n^{-2/5}$. The conventional interval
+$\hat\tau \pm 1.96\,\widehat{se}$ is centered at a point that misses the
+truth by a fixed multiple of its width, so its coverage is below nominal
+no matter how large $n$ is. Section \@ref(sec-naive) measured that
+coverage at `r fmt(get_row("Local linear, MSE bandwidth", "coverage"), 2)`.
+
+## Undersmoothing, bias correction, and the robust variance {#sec-bias-correction}
+
+Two repairs. *Undersmoothing* picks $h$ smaller than $h^*$ so that the bias
+is negligible relative to the standard error; the point estimate is
+noisier, and no data-driven rule says how much smaller. *Bias correction*
+(Calonico, Cattaneo, and Titiunik 2014) keeps $h^*$, estimates $B$ with a
+local quadratic fit at a second bandwidth $b$, and subtracts $h^2 \hat B$.
+The estimated bias has its own sampling variability, which the
+conventional standard error ignores; the *robust* standard error adds it.
+That is the three-row output of `rdrobust()`: conventional (point
+estimate, naive SE), bias-corrected (corrected point estimate, naive SE),
+robust (corrected point estimate, SE that accounts for the correction).
+Only the last row has asymptotically valid coverage at $h^*$; in
+samples of a thousand the gap to nominal coverage closes slowly, as the
+experiment below shows. Appendix \@ref(app-bias-correction) states the
+result.
+
+```{r coverage-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_coverage)}
+cov_res <- run_coverage_experiment(n_sims = n_sims_coverage, n = 1000, seed = 2)
+cov_tab <- summarise_coverage_experiment(cov_res)
+```
+
+```{r tab-coverage, echo = FALSE}
+cov_tab %>%
+  mutate(across(c(bias, mean_length, mean_h), ~ fmt(.x, 4)), coverage = fmt(coverage, 2)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Interval", "Bias of the center", "95\\% coverage", "Mean length", "Mean bandwidth"),
+      caption = paste0("Coverage of four 95 percent intervals on the Lee design, n = 1,000, ", n_sims_coverage,
+                       " simulations. The first three come from rdrobust() at the MSE-optimal bandwidth; the fourth from RDHonest() with the rule-of-thumb smoothness bound.")) %>%
+  tab_style()
+```
+
+```{r coverage-numbers, echo = FALSE}
+cov_get <- function(nm, col) cov_tab[[col]][cov_tab$method == nm]
+```
+
+The conventional interval covers `r fmt(cov_get("Conventional", "coverage"), 2)`
+of the time and the robust bias-corrected interval
+`r fmt(cov_get("Robust bias-corrected", "coverage"), 2)`, at the cost of a
+length `r fmt(cov_get("Robust bias-corrected", "mean_length") / cov_get("Conventional", "mean_length"), 2)`
+times larger. The bias-corrected row without the robust variance shows why
+both steps are needed: recentering alone leaves coverage at
+`r fmt(cov_get("Bias-corrected", "coverage"), 2)`. The correction removes
+only part of the bias at this sample size (the center's bias falls from
+`r fmt(cov_get("Conventional", "bias"), 4)` to
+`r fmt(cov_get("Bias-corrected", "bias"), 4)`), because the curvature is
+itself estimated with error; the robust variance accounts for that error
+but cannot remove it, which is why the honest interval of the next section
+gets closer to nominal coverage.
+
+## Honest inference {#sec-honest}
+
+Bias correction estimates the curvature. Armstrong and Kolesár (2018,
+2020) start from a different question: if all we assume is that the second
+derivative of the conditional mean is bounded by $M$, what is the shortest
+interval with guaranteed coverage? The worst-case bias of any linear
+estimator with weights $w_i$ is $\frac{M}{2}\sum_i |w_i|(X_i - c)^2$, a
+number computable from the weights alone; the honest interval is
+$\hat\tau \pm cv_\alpha(\text{bias}/se) \cdot se$ with a critical value
+from the non-central normal distribution, and the bandwidth is chosen to
+minimize its length. Appendix \@ref(app-honest) has the calculation.
+
+The motivation is a negative result: without a bound like $M$ no interval
+can have finite expected length and correct coverage uniformly over the
+continuous functions the identification assumption allows (Bertanha and
+Moreira 2020), so any procedure that estimates the smoothness must
+undercover somewhere. The price of honesty is the choice of $M$;
+`RDHonest` offers a rule of thumb from a global quartic and the analysis
+should be reported for a range of $M$.
+
+```{r honest}
+hn <- RDHonest::RDHonest(y ~ x, data = dat, cutoff = 0)
+tidy(hn)
+```
+
+The honest row of Table \@ref(tab:tab-coverage) covers
+`r fmt(cov_get("Honest (RDHonest)", "coverage"), 2)` of the time with a
+length `r fmt(cov_get("Honest (RDHonest)", "mean_length") / cov_get("Robust bias-corrected", "mean_length"), 2)`
+times the robust bias-corrected interval; it also chooses a smaller
+bandwidth, because interval length rather than mean squared error is the
+criterion.
+
+## Discrete running variables {#sec-discrete}
+
+When the running variable takes few values (grade point averages, ages in
+years, test scores in integers), the observations at the cutoff share the
+same $X$ and the local polynomial's variance formula, which treats $X$ as
+continuous, understates the uncertainty of the extrapolation between mass
+points (Kolesár and Rothe 2018). Clustering by $X$ does not fix it. The
+honest interval does, because it never needs the density to be continuous:
+the bound on curvature controls the interpolation between the mass points
+nearest the cutoff.
+
+```{r discrete}
+dd <- sim_rd(3000, "discrete", grid = 0.1, seed = 3)
+length(unique(dd$x))
+rd_frame(rdrobust = rdrobust(dd$y, dd$x, c = 0), honest = RDHonest::RDHonest(y ~ x, data = dd, cutoff = 0),
+         methods = "robust")
+```
+
+This is the setting of Bleemer and Mehta (2022), whose running variable is
+an average of two course grades, and who report honest intervals as the
+robustness check for that reason.
+
+## Clustering and geographic designs {#sec-clustering}
+
+Standard errors cluster at the level at which the running variable is
+assigned or the outcome is correlated: a school, a district, a border
+segment. `rdrobust(cluster = )` handles it. Geographic designs use distance
+to a boundary as the running variable and cluster by boundary segment
+(Keele and Titiunik 2015); Bagwe, Margitic, and Stashko (2026) is the
+worked example in Section \@ref(sec-practice).
+
+# Diagnostics {#sec-diagnostics}
+
+## The density test {#sec-density}
+
+If units sort across the cutoff, the density of $X$ jumps there. McCrary
+(2008) estimated the density on each side with a smoothed histogram and
+tested the log difference; Cattaneo, Jansson, and Ma (2020) replaced the
+histogram with a local polynomial density estimator that needs no
+pre-binning and has bias-corrected inference. `rddensity()` implements the
+latter.
+
+```{r density}
+man <- sim_rd(4000, "manipulated", manip = 0.5, seed = 4)
+summary(rddensity::rddensity(man$x, c = 0))
+```
+
+```{r density-plot, echo = FALSE, fig.height = 3.4, fig.cap = "Density of the running variable in the manipulated design, where half of the units within 0.1 below the cutoff moved above it. Left: histogram. Right: the local polynomial density estimates on each side with confidence bands (rddensity)."}
+p1 <- ggplot(man, aes(x)) + geom_histogram(bins = 80, fill = "grey70", colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed") + labs(y = "Count") + rd_theme()
+dens <- rddensity::rddensity(man$x, c = 0)
+p2 <- rddensity::rdplotdensity(dens, man$x, plotRange = c(-0.5, 0.5))$Estplot + rd_theme() + labs(x = "x", y = "Density")
+patchwork::wrap_plots(p1, p2)
+```
+
+A rejection means the density jumps, not that the design is invalid: the
+question is whether the movers differ in potential outcomes. Partial
+manipulation with an idiosyncratic element (a student who studies harder
+but cannot control the exact score) leaves the comparison at the cutoff
+valid; precise control does not. A non-rejection is weak evidence, because
+sorting in both directions can cancel. The paper by Sejas-Portillo, Moro,
+and Stowasser (2025) shows both faces: sellers upgrade properties just
+below a label threshold, and the authors both test the density and remove
+the upgraded transactions.
+
+## Covariate balance {#sec-balance}
+
+Predetermined covariates are placebo outcomes: the RD estimator applied to
+them should find nothing. `rd_balance()` runs `rdrobust()` on each
+covariate and adds a joint Wald test from the stacked influence functions
+of the local linear jumps at one common bandwidth, which the per-covariate
+output cannot give.
+
+```{r balance}
+bal <- rd_balance(dat_c <- sim_rd(3000, "covariates", seed = 5), paste0("z", 1:4), "x")
+bal
+```
+
+```{r balance-plot, echo = FALSE, fig.height = 2.6, out.width = "70%", fig.cap = "Robust t-statistics of the jump in each covariate at the cutoff (the layout of Lee 2008, Figures III and IV)."}
+plot_rd_checks(bal)
+```
+
+## Placebo cutoffs, bandwidth sensitivity, donut holes {#sec-placebos}
+
+Three more checks, each a loop of estimates that a reader expects to see.
+
+- **Placebo cutoffs.** Estimate the jump at points where no treatment
+  changes, on each side using only that side's data so the true jump never
+  enters (Imbens and Lemieux 2008). Significant placebo jumps mean the
+  outcome function has features the local fit mistakes for jumps.
+- **Bandwidth sensitivity.** Re-estimate over a grid around $h^*$, holding
+  the ratio $h / b$ fixed. Estimates that swing with $h$ signal curvature
+  the bias correction is not handling.
+- **Donut holes.** Drop the observations within a radius of the cutoff and
+  re-estimate. Estimates that change signal heaping or manipulation right
+  at the threshold (Barreca et al. 2011).
+
+`rd_checks()` runs all of them with the main estimate and the balance
+table, and `plot_rd_checks()` draws each.
+
+```{r checks}
+ck <- rd_checks(dat_c, "y", "x", covariates = paste0("z", 1:4))
+ck$main
+```
+
+```{r checks-plot, echo = FALSE, fig.height = 5.4, fig.cap = "The diagnostic battery on the covariates design: placebo cutoffs (the true cutoff in orange), bandwidth sensitivity (dotted line at the MSE-optimal bandwidth), and donut-hole estimates. Robust 95 percent intervals throughout."}
+patchwork::wrap_plots(plot_rd_checks(ck, "placebo"), plot_rd_checks(ck, "sensitivity"), plot_rd_checks(ck, "donut"), ncol = 2)
+```
+
+## The RD plot done right {#sec-rd-plot}
+
+The plot is evidence, and it can mislead. Bins that are too fine show
+noise; bins that are too coarse hide a jump or invent one; a fitted
+polynomial can overshoot near the cutoff and make the fitted lines meet at
+a jump the bin means do not show. Calonico, Cattaneo, and Titiunik (2015)
+choose the number of bins to trade the bias of coarse bins against the
+variance of fine ones (the mimicking-variance choice makes the bin means
+as variable as the raw data, so the eye judges the jump against the right
+noise level). `rd_plot()` uses that choice by default and lets the fit be
+the estimator's own local linear lines rather than a global polynomial.
+Figure \@ref(fig:six-figures) showed both; report the local version when
+the estimate is local.
+
+## A diagnostics table for a paper {#sec-diag-table}
+
+One table with the main estimate, the balance rows, the density test, the
+placebo cutoffs, and the donut estimates, plus the sensitivity figure, is
+what Lee (2008), Sejas-Portillo et al. (2025), and Bagwe et al. (2026) all
+report. `rd_frame()` assembles the estimate rows from any of the packages
+into one frame for that table.
+
+```{r frame}
+rd_frame(main = ck$main_fit, honest = RDHonest::RDHonest(y ~ x, data = dat_c, cutoff = 0), methods = "robust")
+```
+
+# Covariates and machine learning {#sec-covariates}
+
+## Covariates are not needed, and what they buy {#sec-covariates-why}
+
+Identification needs the running variable and nothing else. Covariates
+enter for three reasons: precision, because the outcome variation they
+explain is noise for the jump; heterogeneity, because the effect at the
+cutoff may differ across groups; and extrapolation, because covariates can
+carry the comparison away from the cutoff (Section \@ref(sec-extensions)).
+Two rules follow. Covariates must be predetermined, since a covariate that
+responds to treatment absorbs part of the effect. And the point estimate
+should not move much when they are added; if it does, the covariates jump
+at the cutoff and the design has a problem that precision cannot fix.
+
+## Linear adjustment inside the local regression {#sec-linear-adjust}
+
+Calonico, Cattaneo, Farrell, and Titiunik (2019) add the covariates
+linearly to the local regression with a common coefficient on both sides.
+The result is the local linear estimator applied to the adjusted outcome
+$Y - Z'\hat\gamma$, with the same bias as without covariates and a smaller
+variance: the conditional variance of $Y - Z'\gamma_0$ replaces that of
+$Y$. *Skeleton.* The coefficient $\hat\gamma$ converges to a fixed vector;
+$E[Z \mid X = x]$ is smooth at $c$, so subtracting $Z'\gamma_0$ changes the
+two limits by the same amount and the jump is unchanged; what remains is
+the local linear estimator on a less noisy outcome. Appendix
+\@ref(app-adjustment) states the result. `rdrobust(covs = )` implements
+it.
+
+## Flexible adjustment: subtract any prediction from the covariates {#sec-flexible-adjust}
+
+The skeleton did not use linearity. Any function $\eta(Z)$ with
+$E[\eta(Z) \mid X = x]$ continuous at $c$ leaves the jump unchanged, and
+$Y - \eta(Z)$ has a smaller variance whenever $\eta$ predicts $Y$. Noack,
+Olma, and Rothe (2024) turn this into a two-step procedure: estimate
+$\eta$ with any machine learner, cross-fitted so that no observation's
+outcome enters its own adjustment, then run the standard local polynomial
+estimator on $Y_i - \hat\eta(Z_i)$. Because the estimand does not depend on
+$\eta$, the learner needs no rate condition for consistency, which is
+weaker than what Section 04 required for double machine learning: there
+the nuisances entered the estimand, here they only reduce noise. The
+recommended $\hat\eta$ is the average of the two side-specific
+predictions, which stays a function of $Z$ alone. Kreiss and Rothe (2023)
+obtain the same structure with a local lasso when the covariates are
+many.
+
+`rd_adjust()` implements the cross-fitted adjustment with any `mlr3`
+learner and, when `rdrobust` is installed, reports the raw and adjusted
+fits side by side.
+
+```{r adjust}
+z4 <- paste0("z", 1:4)
+adj_lin <- rd_adjust(dat_c, "y", "x", covariates = z4, seed = 1)
+adj_rf <- rd_adjust(dat_c, "y", "x", covariates = z4, pooled = FALSE, seed = 1,
+                    learner = lrn("regr.ranger", num.trees = 300, min.node.size = 20))
+rd_frame(no_covariates = adj_lin$fits$raw,
+         rdrobust_covs = rdrobust(dat_c$y, dat_c$x, c = 0, covs = as.matrix(dat_c[, z4])),
+         linear_adjustment = adj_lin$fits$adjusted,
+         forest_adjustment = adj_rf$fits$adjusted, methods = "robust")
+```
+
+The design's covariates enter the outcome nonlinearly (a quadratic in
+$z_2$). The linear adjustments, inside `rdrobust` or through `rd_adjust()`,
+remove the linear part and lower the standard error; the forest removes
+the curvature too and lowers it further. The point estimates move by less
+than two standard errors of the least precise one, as they should when
+the covariates are balanced; what changes is the precision.
+
+## Experiment: precision gains from adjustment {#sec-adjust-mc}
+
+```{r adjust-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_adjust)}
+adj_res <- run_adjustment_experiment(n_sims = n_sims_adjust, n = 2000, tau = 0.2, seed = 3)
+adj_tab <- summarise_adjustment_experiment(adj_res)
+```
+
+```{r tab-adjust, echo = FALSE}
+adj_tab %>%
+  mutate(method = gsub("_", "\\\\_", as.character(method)),
+         across(c(bias, sd, mean_se), ~ fmt(.x, 4)), coverage = fmt(coverage, 2)) %>%
+  kbl(booktabs = TRUE, linesep = "", escape = FALSE,
+      col.names = c("Adjustment", "Bias", "SD", "Mean robust SE", "95\\% coverage"),
+      caption = paste0("Robust bias-corrected estimates with and without covariate adjustment on the covariates design, true effect 0.2, n = 2,000, ",
+                       n_sims_adjust, " simulations (the layout of Table 17.1 in Chernozhukov et al. 2026).")) %>%
+  tab_style()
+```
+
+```{r adjust-numbers, echo = FALSE}
+adj_get <- function(nm, col) adj_tab[[col]][adj_tab$method == nm]
+```
+
+The forest adjustment cuts the standard deviation of the estimate from
+`r fmt(adj_get("No covariates", "sd"), 4)` to
+`r fmt(adj_get("Forest adjustment (rd_adjust)", "sd"), 4)`, a factor of
+`r fmt(adj_get("No covariates", "sd") / adj_get("Forest adjustment (rd_adjust)", "sd"), 1)`,
+with no change in bias and coverage of
+`r fmt(adj_get("Forest adjustment (rd_adjust)", "coverage"), 2)`. In
+sample-size terms, that factor squared is the multiple of observations the
+unadjusted estimator would need. Linear adjustment, through `rdrobust` or
+`rd_adjust()`, gets the part of the gain that a linear model can explain.
+
+## Heterogeneity at the cutoff {#sec-rd-hte}
+
+The effect at the cutoff may differ by group. The local linear regression
+with group indicators interacted with the treatment and the running
+variable estimates a group-specific jump, and a covariate dictionary in
+place of indicators gives the best linear predictor of the effect at the
+cutoff, with robust bias-corrected inference for each coefficient
+(Calonico, Cattaneo, Farrell, Palomba, and Titiunik 2025). This is the RD
+version of Section 08's group effects and best linear predictors, and
+`rdhte` implements it.
+
+```{r hte}
+dat_c$group <- as.integer(dat_c$z3 > 0)
+ht <- rdhte::rdhte(dat_c$y, dat_c$x, c = 0, covs.hte = dat_c$group)
+tidy(ht)
+```
+
+In this design the effect does not vary with $z_3$, and the two group
+estimates agree within their standard errors.
+
+# Local randomization {#sec-local-random}
+
+## The assumption and its window {#sec-locrand-window}
+
+Inside a window $W = [c - w, c + w]$, assume that treatment is as good as
+randomly assigned and that the potential outcomes do not depend on the
+running variable. Then the window is an experiment: differences in means
+estimate the effect for units in the window, and Fisher's randomization
+test gives exact finite-sample p-values by permuting treatment among the
+units in $W$. The estimand is an average over the window, not the effect
+at the point $c$.
+
+The window is the tuning parameter, in the role the bandwidth played
+before. Cattaneo, Frandsen, and Titiunik (2015) choose the largest window
+in which predetermined covariates are balanced, testing balance in nested
+windows and stopping when a test rejects.
+
+```{r locrand}
+win <- rdlocrand::rdwinselect(dat_c$x, as.matrix(dat_c[, c("z2", "z3", "z4")]), quietly = TRUE,
+                               wmin = 0.02, wstep = 0.02, nwindows = 15)
+c(window_left = win$w_left, window_right = win$w_right)
+lr <- rdlocrand::rdrandinf(dat_c$y, dat_c$x, wl = win$w_left, wr = win$w_right, quietly = TRUE, ci = 0.05)
+rd_frame(continuity = rdrobust(dat_c$y, dat_c$x, c = 0), local_randomization = lr, methods = "robust")
+```
+
+The window is selected on $z_2$ to $z_4$ only, starting from a half-width
+of 0.02 and growing in steps of 0.02 (the default starts from the ten
+observations nearest the cutoff, where a balance test at the 0.15 level
+rejects by chance often). The design's $z_1$ is
+correlated with the running variable, so it differs across the two sides
+of any window and no window passes its balance test: local randomization
+requires covariates that are balanced in a neighborhood, not merely
+continuous at the cutoff, which is the flatness assumption at work.
+
+## When to prefer it {#sec-locrand-when}
+
+Local randomization is the right tool when the local polynomial cannot be
+fitted: few observations near the cutoff, a running variable with a
+handful of values, or an outcome so noisy that any bandwidth large enough
+to estimate a slope is too large to trust. It is the wrong tool when the
+outcome moves with the running variable inside any usable window, because
+the flatness assumption then fails; the balance-based window selection
+protects against the covariates but not against the outcome itself.
+Reporting both estimates, as above, is the usual practice: agreement
+across two different assumptions is stronger evidence than either alone.
+
+# Beyond the single sharp cutoff {#sec-extensions}
+
+## Multiple cutoffs {#sec-multi-cutoff}
+
+Many rules use different cutoffs for different units: energy-label
+thresholds at six scores, scholarship cutoffs that differ by year or
+district. Two estimands follow. Cutoff-specific effects treat each cutoff
+as its own design. The normalize-and-pool estimate recenters every unit's
+score at its own cutoff and runs one RD; it estimates a weighted average of
+the cutoff-specific effects with weights proportional to the density of
+units at each cutoff (Cattaneo, Keele, Titiunik, and Vazquez-Bare 2016),
+and it is the right summary only when the effects are similar or the
+weights are the ones a decision maker wants. `rdmulti::rdmc()` reports
+both, and the difference between cutoffs is itself evidence about
+extrapolation: with a common untreated function across cutoffs one can
+predict the effect at one cutoff for units assigned to another (Cattaneo
+et al. 2021).
+
+```{r multi}
+md <- sim_rd(4000, "multi_cutoff", seed = 6)
+attr(md, "tau_true")
+mc <- rdmulti::rdmc(md$y, md$x, C = md$cutoff, verbose = FALSE, plot = FALSE)
+rd_frame(multi = mc)
+```
+
+Sejas-Portillo, Moro, and Stowasser (2025) estimate threshold by
+threshold, because the value of moving from label C to B need not equal
+that of moving from F to E, and they read the pattern across thresholds
+as the result.
+
+## Multi-score and geographic designs {#sec-geographic}
+
+When two scores define treatment (two test cutoffs, or latitude and
+longitude on either side of a boundary), the cutoff is a curve and the
+effect is a function along it. Estimation picks boundary points and runs
+an RD on the distance to each point, or uses the signed distance to the
+boundary as a single score (Keele and Titiunik 2015). The single-score
+version assumes the effect is constant along the boundary; clustering by
+boundary segment handles the dependence of nearby units. Bagwe, Margitic,
+and Stashko (2026) use the signed distance to the precinct border with the
+polling-place distance as a continuous treatment, a fuzzy design whose
+first stage is the jump in distance at the border; `rdmulti::rdms()`
+implements the multi-score version.
+
+## Difference-in-discontinuities and RD in time {#sec-diff-disc}
+
+When the same cutoff existed before the policy, the jump before the policy
+measures the other discontinuities at the cutoff, and the change in the
+jump is the effect (Grembi, Nannicini, and Troiano 2016). With `fixest`
+this is the local regression with a period indicator interacted with the
+jump. RD in time uses the date as the running variable; it inherits every
+problem of event studies (anticipation, serial correlation, other events)
+and Hausman and Rapson (2018) list the additional checks it needs.
+
+## Extrapolation with covariates {#sec-extrapolation}
+
+The effect at the cutoff is the RD estimand; effects for units away from it
+need an assumption that the design does not provide. Angrist and Rokkanen
+(2015) assume that, within a window, potential outcomes are mean
+independent of the running variable given covariates: the covariates
+carry all the information the score has about outcomes. The assumption has
+a testable implication, that the score does not predict the outcome given
+the covariates on either side, and it identifies the untreated mean of the
+treated side as the covariate-adjusted mean of the untreated side.
+`rd_extrapolate()` runs the test and the extrapolation, by regression or
+doubly robustly with the side indicator as the treatment, and traces the
+effect along the running variable.
+
+```{r extrapolate}
+cia <- sim_rd(4000, "cia", seed = 7)
+ex <- rd_extrapolate(cia, "y", "x", covariates = "z", window = 0.5)
+ex
+```
+
+```{r extrapolate-plot, echo = FALSE, fig.height = 3.2, fig.cap = "Extrapolated effects along the running variable in a design where the outcome depends on the score only through the covariate. The dotted line is the true effect, constant at 0.5."}
+plot_rd_extrapolate(ex, truth = 0.5)
+```
+
+The test does not reject on either side and the effects away from the
+cutoff recover the truth. On the Lee design, where the outcome depends on
+the score directly, the same test rejects at once:
+
+```{r extrapolate-bad}
+bad <- sim_rd(4000, "lee", seed = 7)
+bad$z <- rnorm(4000)
+rd_extrapolate(bad, "y", "x", covariates = "z", window = 0.5)$test
+```
+
+# Regression kink and bunching {#sec-kink}
+
+## From jumps to kinks {#sec-kink-idea}
+
+Some rules change the slope of the treatment rather than its level:
+benefits replace 55 percent of earnings up to a cap, so the benefit's slope
+in earnings drops from 0.55 to zero at the cap. A kink in the treatment
+produces a kink in the outcome, and the regression kink design estimates
+the ratio of the two slope changes (Card, Lee, Pei, and Weber 2015):
+$$
+\tau_{RKD} = \frac{\lim_{x \downarrow c} \partial_x E[Y \mid X = x] - \lim_{x \uparrow c} \partial_x E[Y \mid X = x]}
+                  {\lim_{x \downarrow c} \partial_x E[D \mid X = x] - \lim_{x \uparrow c} \partial_x E[D \mid X = x]}.
+$$
+In a sharp kink the denominator is known from the rule; in a fuzzy kink it
+is estimated. The assumptions mirror the RD ones one derivative up: the
+density of the score and the conditional means of covariates must be
+smooth (differentiable) at the kink, and units must not sort at it, with
+the same allowance for imprecise control.
+
+## Estimation and why kinks are hard {#sec-kink-est}
+
+A slope change is a derivative, and derivatives are estimated with more
+variance than levels: the bias of the local linear slope is of order $h$
+and its variance of order $1/(nh^3)$, so the optimal bandwidth is wider and
+the estimate noisier than for a jump at the same $n$. `rdrobust(deriv = 1)`
+selects the bandwidth for the derivative; `rd_kink()` reports the reduced
+form, the first stage, the ratio, and the elasticity.
+
+```{r kink}
+kd <- sim_rd(4000, "kink", seed = 8)
+kd$z1 <- kd$x + rnorm(4000)
+kk <- rd_kink(kd, "y", "x", d = "d", elasticity = TRUE)
+kk$kink
+```
+
+```{r kink-mc, echo = FALSE, fig.height = 3.4, fig.cap = "Fuzzy kink estimates with robust 95 percent intervals across bandwidths for local linear and local quadratic fits on one sample of 4,000 units (the pattern of Card et al. 2015, Figure 4). The dashed line is the true ratio."}
+kres <- run_kink_experiment(n = 4000, tau = 2, seed = 4)
+ggplot(kres, aes(h, estimate, colour = order)) +
+  geom_hline(yintercept = 2, linetype = "dashed") +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = order), alpha = 0.15, colour = NA) +
+  geom_line() + geom_point() +
+  coord_cartesian(ylim = c(-4, 8)) +
+  scale_colour_manual(values = c("#0072B2", "#009E73"), name = NULL) +
+  scale_fill_manual(values = c("#0072B2", "#009E73"), guide = "none") +
+  labs(x = "Bandwidth h", y = "Kink estimate") + rd_theme()
+```
+
+The figure reproduces the lesson of Card et al.: local linear estimates
+settle at bandwidths several times the RD-typical ones, and local
+quadratic estimates are too imprecise to be informative at any bandwidth
+the sample can support. Kink designs need many observations and a
+transparent bandwidth choice; a kink estimate reported at one narrow
+bandwidth should be read with suspicion.
+
+## The four kink graphs {#sec-kink-graphs}
+
+```{r kink-plot, echo = FALSE, fig.height = 5.4, fig.cap = "The four regression kink graphs: first stage, reduced form, density of the running variable, and a covariate index, each with binned means and linear fits per side."}
+plot_rd_kink(kk, covariates = "z1")
+```
+
+The first stage shows the kink in the rule, the reduced form the kink in
+the outcome, and the last two show that nothing else kinks there. Landais
+(2015) reports exactly these four for the unemployment benefit schedule in
+Section \@ref(sec-practice).
+
+## Bunching: when manipulation is the object {#sec-bunching}
+
+Section \@ref(sec-density) treated a density jump as a threat. When the
+rule creates an incentive to be on one side, the mass that piles up at the
+kink or notch measures the behavioral response: the excess mass relative
+to a smooth counterfactual density, divided by the change in the
+incentive, is an elasticity (Saez 2010; Chetty et al. 2011; Kleven 2016).
+The counterfactual is a polynomial fitted to the density outside an
+excluded region around the kink, and `bunching::bunchit()` implements the
+estimator with its bootstrap. What bunching identifies is limited:
+Blomquist, Newey, Kumar, and Liang (2021) show that without a restriction
+on the distribution of the underlying heterogeneity the elasticity is not
+identified from the excess mass alone, so the polynomial counterfactual is
+an assumption, not a diagnostic.
+
+# Practice {#sec-practice}
+
+## Replications and anchors {#sec-replications}
+
+- **Bagwe, Margitic, and Stashko (2026), polling place location.** A
+  geographic fuzzy RD with signed distance to the precinct border as the
+  score and polling-place distance as a continuous treatment, clustered by
+  border segment; `rdrobust(fuzzy = )` reproduces the main table from the
+  released files, and `rd_checks()` the balance and sensitivity figures.
+- **Sejas-Portillo, Moro, and Stowasser (2025), energy labels.** Sharp RD
+  at six label thresholds on seven million property sales, with density
+  tests, donut holes, and an instrument for the final score; `rdmc()`,
+  `rddensity()`, and `rd_checks()` cover the workflow, and `rd_adjust()`
+  with property characteristics the precision.
+- **Bleemer and Mehta (2022), the economics major.** Fuzzy RD on a
+  discrete grade average with honest intervals; the student data are
+  confidential, so the design is reproduced on simulated data with
+  `RDHonest` and `rd_weak_iv()`.
+- **Asher and Novosad (2020), rural roads.** Fuzzy RD on village
+  population thresholds; `rdrobust(fuzzy = )`, `rd_checks()`, and
+  `rddensity()`.
+- **Landais (2015), unemployment benefits.** A regression kink on the
+  benefit schedule; `rd_kink()` and the four graphs.
+
+## A reporting checklist {#sec-checklist}
+
+1. State the rule, the running variable, the cutoff, and who could
+   manipulate the score and how precisely.
+2. Show the RD plot with the estimator's own local fits, and the density
+   and covariate plots next to it.
+3. Report the robust bias-corrected estimate at the MSE-optimal bandwidth
+   with the effective sample sizes on each side, and an honest interval
+   for a range of smoothness bounds.
+4. Report the density test, the balance table with its joint test, placebo
+   cutoffs, the bandwidth sensitivity figure, and donut-hole estimates.
+5. In fuzzy designs, report the first stage with its effective F and an
+   Anderson-Rubin set.
+6. Use covariates for precision, not identification; show the estimate
+   with and without them.
+7. State the estimand: the effect at the cutoff, for compliers if fuzzy,
+   averaged over the window if local randomization, and what extrapolation
+   assumption any statement beyond that relies on.
+
+# Appendix {#sec-appendix}
+
+## Identification of the sharp RD effect {#app-identification}
+
+Let $Y = D\,Y(1) + (1 - D)\,Y(0)$ with $D = 1\{X \ge c\}$. For $x \ge c$,
+$E[Y \mid X = x] = E[Y(1) \mid X = x] = \mu_1(x)$; for $x < c$,
+$E[Y \mid X = x] = \mu_0(x)$. If $\mu_1$ and $\mu_0$ are continuous at
+$c$, then $\lim_{x \downarrow c} E[Y \mid X = x] = \mu_1(c)$ and
+$\lim_{x \uparrow c} E[Y \mid X = x] = \mu_0(c)$, and their difference is
+$E[Y(1) - Y(0) \mid X = c]$. Positive density at $c$ guarantees that both
+one-sided limits are limits of estimable quantities. No assumption on the
+joint distribution of $(Y(1), Y(0))$ beyond the two conditional means is
+used, and no assumption on the density's continuity is needed for the
+identity itself (Hahn, Todd, and van der Klaauw 2001).
+
+## Bias, variance, and the rate of the local linear estimator {#app-rates}
+
+Take the right side, $c = 0$, a uniform kernel on $[0, h]$, and
+$\mu_1$ twice continuously differentiable. The local linear intercept is
+$\hat\alpha_+ = \sum_i w_i Y_i$ with weights $w_i$ that reproduce linear
+functions exactly: $\sum_i w_i = 1$ and $\sum_i w_i X_i = 0$. Expanding
+$\mu_1(X_i) = \mu_1(0) + \mu_1'(0) X_i + \tfrac{1}{2}\mu_1''(\tilde X_i) X_i^2$,
+$$
+E[\hat\alpha_+ \mid X] - \mu_1(0) = \tfrac{1}{2}\sum_i w_i\,\mu_1''(\tilde X_i)\,X_i^2 = O(h^2),
+$$
+because $|X_i| \le h$ on the support of the weights and the weights are
+bounded in absolute sum. The number of observations with nonzero weight is
+proportional to $nh$ when the density is bounded away from zero, and
+$\mathrm{Var}(\hat\alpha_+ \mid X) = \sigma_1^2 \sum_i w_i^2 = O(1/(nh))$.
+The mean squared error $C_1 h^4 + C_2/(nh)$ is minimized at
+$h \propto n^{-1/5}$, giving MSE $\propto n^{-4/5}$, which is the minimax
+rate over the class of functions with bounded second derivative (Tsybakov
+2009). The kernel changes the constants, not the rates.
+
+## The covariate adjustment theorem {#app-adjustment}
+
+Let $\tilde Y = Y - Z'\gamma_0$ with $\gamma_0$ the probability limit of
+the local coefficient on $Z$. If $E[Z \mid X = x]$ is twice continuously
+differentiable at $c$ and $Z$ is predetermined, then
+$E[\tilde Y \mid X = x] = E[Y \mid X = x] - E[Z \mid X = x]'\gamma_0$ has
+the same jump at $c$ as $E[Y \mid X = x]$ and the same second derivatives
+up to a smooth term, so the local linear estimator on $\tilde Y$ has the
+bias $h^2 B$ of Section \@ref(sec-bias-variance) and the variance
+$V_{\text{lin}} = \bar\kappa\,[\mathrm{Var}(\tilde Y \mid X = c^+) + \mathrm{Var}(\tilde Y \mid X = c^-)]/f_X(c)$,
+which is at most $V$ (Calonico, Cattaneo, Farrell, and Titiunik 2019).
+Replacing $Z'\gamma_0$ by any $\eta(Z)$ with $E[\eta(Z) \mid X = x]$ smooth
+at $c$ leaves the argument unchanged, which is the flexible adjustment of
+Noack, Olma, and Rothe (2024); cross-fitting removes the dependence of
+$\hat\eta$ on the observation it adjusts, so the estimated adjustment
+behaves as a fixed function in the local step.
+
+## Bias correction and the robust variance {#app-bias-correction}
+
+Write the local linear estimator at bandwidth $h$ as $\hat\tau(h)$ with
+$\hat\tau(h) - \tau \approx h^2 B + \text{noise}$, and let $\hat B(b)$ be
+the estimate of $B$ from the difference of the local quadratic second
+derivatives at bandwidth $b$. The bias-corrected estimator is
+$\hat\tau^{bc} = \hat\tau(h) - h^2 \hat B(b)$. Its variance is
+$\mathrm{Var}(\hat\tau(h)) + h^4 \mathrm{Var}(\hat B(b)) - 2h^2 \mathrm{Cov}(\hat\tau(h), \hat B(b))$,
+which the robust standard error estimates; the conventional standard error
+keeps only the first term. Calonico, Cattaneo, and Titiunik (2014) show
+that with $h$ MSE-optimal and $b$ chosen so that the bias of $\hat B$ is
+negligible, $(\hat\tau^{bc} - \tau)/\widehat{se}^{rb}$ is asymptotically
+standard normal, whereas $(\hat\tau(h) - \tau)/\widehat{se}$ converges to a
+normal with nonzero mean. The ratio $h/b$ is reported by `rdrobust` as
+`rho`; when $b = h$ the correction and the variance adjustment take a
+particularly simple form and the estimator is a local quadratic fit.
+
+## Honest intervals {#app-honest}
+
+Let $\hat\tau = \sum_i w_i Y_i$ be any linear estimator with weights
+summing to $+1$ on the right and $-1$ on the left. Over the class of
+functions whose second derivative is bounded by $M$ on each side, the
+largest possible bias is attained by the function $\pm\frac{M}{2}(x - c)^2$
+and equals $\overline{b}(w) = \frac{M}{2}\sum_i |w_i|(X_i - c)^2$. With
+$se(w) = \sqrt{\sum_i w_i^2 \sigma_i^2}$, the interval
+$\hat\tau \pm cv_\alpha(\overline{b}/se)\, se$, where $cv_\alpha(t)$ is the
+$1 - \alpha$ quantile of $|N(t, 1)|$, has coverage at least $1 - \alpha$
+for every function in the class (Armstrong and Kolesár 2018). The
+bandwidth that minimizes the length of this interval is the fixed-length
+confidence interval choice; `RDHonest` computes it, and the rule-of-thumb
+$M$ is derived from a global quartic fit (Armstrong and Kolesár 2020). The
+same construction applies when $X$ is discrete, since it never uses the
+density of $X$ (Kolesár and Rothe 2018).
+
+## Fuzzy RD as local instrumental variables {#app-fuzzy}
+
+Inside the window, let $Z = 1\{X \ge c\}$, and write the local linear
+reduced form $\hat\tau_Y$ and first stage $\hat\tau_D$ with influence
+functions $\psi_Y$ and $\psi_D$ (Section \@ref(sec-weights) gives their
+weights). The ratio $\hat\tau_{FRD} = \hat\tau_Y / \hat\tau_D$ has
+influence function $(\psi_Y - \tau_{FRD}\,\psi_D)/\tau_D$ by the delta
+method, so its variance is
+$[\mathrm{Var}(\hat\tau_Y) + \tau_{FRD}^2 \mathrm{Var}(\hat\tau_D) - 2\tau_{FRD}\mathrm{Cov}(\hat\tau_Y, \hat\tau_D)]/\tau_D^2$;
+`rdrobust` applies the bias correction to numerator and denominator
+jointly. The Anderson-Rubin statistic for a candidate value $\tau_0$
+regresses $Y - \tau_0 D$ on $Z$ and the controls with kernel weights and
+tests the coefficient on $Z$; its distribution does not depend on
+$\tau_D$, which is what makes the inverted set valid when $\tau_D$ is small
+(Feir, Lemieux, and Marmer 2016).
+
+## References
+
+- Angrist, Joshua D., and Miikka Rokkanen. 2015. "Wanna Get Away? Regression Discontinuity Estimation of Exam School Effects Away from the Cutoff." *Journal of the American Statistical Association*.
+- Armstrong, Timothy B., and Michal Kolesár. 2018. "Optimal Inference in a Class of Regression Models." *Econometrica*.
+- Armstrong, Timothy B., and Michal Kolesár. 2020. "Simple and Honest Confidence Intervals in Nonparametric Regression." *Quantitative Economics*.
+- Asher, Sam, and Paul Novosad. 2020. "Rural Roads and Local Economic Development." *American Economic Review*.
+- Bagwe, Gaurav, Juan Margitic, and Allison Stashko. 2026. "Polling Place Location and the Costs of Voting." *American Economic Journal: Economic Policy*.
+- Barreca, Alan I., Melanie Guldi, Jason M. Lindo, and Glen R. Waddell. 2011. "Saving Babies? Revisiting the Effect of Very Low Birth Weight Classification." *Quarterly Journal of Economics*.
+- Bertanha, Marinho, and Marcelo J. Moreira. 2020. "Impossible Inference in Econometrics: Theory and Applications." *Journal of Econometrics*.
+- Bleemer, Zachary, and Aashish Mehta. 2022. "Will Studying Economics Make You Rich? A Regression Discontinuity Analysis of the Returns to College Major." *American Economic Journal: Applied Economics*.
+- Blomquist, Sören, Whitney K. Newey, Anil Kumar, and Che-Yuan Liang. 2021. "On Bunching and Identification of the Taxable Income Elasticity." *Journal of Political Economy*.
+- Calonico, Sebastian, Matias D. Cattaneo, and Max H. Farrell. 2020. "Optimal Bandwidth Choice for Robust Bias-Corrected Inference in Regression Discontinuity Designs." *The Econometrics Journal*.
+- Calonico, Sebastian, Matias D. Cattaneo, Max H. Farrell, Filippo Palomba, and Rocío Titiunik. 2025. "Treatment Effect Heterogeneity in Regression Discontinuity Designs." Working paper.
+- Calonico, Sebastian, Matias D. Cattaneo, Max H. Farrell, and Rocío Titiunik. 2019. "Regression Discontinuity Designs Using Covariates." *Review of Economics and Statistics*.
+- Calonico, Sebastian, Matias D. Cattaneo, and Rocío Titiunik. 2014. "Robust Nonparametric Confidence Intervals for Regression-Discontinuity Designs." *Econometrica*.
+- Calonico, Sebastian, Matias D. Cattaneo, and Rocío Titiunik. 2015. "Optimal Data-Driven Regression Discontinuity Plots." *Journal of the American Statistical Association*.
+- Card, David, David S. Lee, Zhuan Pei, and Andrea Weber. 2015. "Inference on Causal Effects in a Generalized Regression Kink Design." *Econometrica*.
+- Cattaneo, Matias D., Brigham R. Frandsen, and Rocío Titiunik. 2015. "Randomization Inference in the Regression Discontinuity Design: An Application to Party Advantages in the U.S. Senate." *Journal of Causal Inference*.
+- Cattaneo, Matias D., Michael Jansson, and Xinwei Ma. 2020. "Simple Local Polynomial Density Estimators." *Journal of the American Statistical Association*.
+- Cattaneo, Matias D., Luke Keele, Rocío Titiunik, and Gonzalo Vazquez-Bare. 2016. "Interpreting Regression Discontinuity Designs with Multiple Cutoffs." *Journal of Politics*.
+- Cattaneo, Matias D., Luke Keele, Rocío Titiunik, and Gonzalo Vazquez-Bare. 2021. "Extrapolating Treatment Effects in Multi-Cutoff Regression Discontinuity Designs." *Journal of the American Statistical Association*.
+- Chernozhukov, Victor, Christian Hansen, Nathan Kallus, Martin Spindler, and Vasilis Syrgkanis. 2026. *Applied Causal Inference Powered by ML and AI*, chapter 17.
+- Chetty, Raj, John N. Friedman, Tore Olsen, and Luigi Pistaferri. 2011. "Adjustment Costs, Firm Responses, and Micro vs. Macro Labor Supply Elasticities: Evidence from Danish Tax Records." *Quarterly Journal of Economics*.
+- Dehejia, Rajeev. "Regression Discontinuity" and "Regression Discontinuity: Advanced Topics." Lecture slides, NYU Wagner.
+- Feir, Donna, Thomas Lemieux, and Vadim Marmer. 2016. "Weak Identification in Fuzzy Regression Discontinuity Designs." *Journal of Business and Economic Statistics*.
+- Gelman, Andrew, and Guido Imbens. 2019. "Why High-Order Polynomials Should Not Be Used in Regression Discontinuity Designs." *Journal of Business and Economic Statistics*.
+- Grembi, Veronica, Tommaso Nannicini, and Ugo Troiano. 2016. "Do Fiscal Rules Matter?" *American Economic Journal: Applied Economics*.
+- Hahn, Jinyong, Petra Todd, and Wilbert van der Klaauw. 2001. "Identification and Estimation of Treatment Effects with a Regression-Discontinuity Design." *Econometrica*.
+- Hausman, Catherine, and David S. Rapson. 2018. "Regression Discontinuity in Time: Considerations for Empirical Applications." *Annual Review of Resource Economics*.
+- Imbens, Guido, and Karthik Kalyanaraman. 2012. "Optimal Bandwidth Choice for the Regression Discontinuity Estimator." *Review of Economic Studies*.
+- Imbens, Guido W., and Thomas Lemieux. 2008. "Regression Discontinuity Designs: A Guide to Practice." *Journal of Econometrics*.
+- Keele, Luke J., and Rocío Titiunik. 2015. "Geographic Boundaries as Regression Discontinuities." *Political Analysis*.
+- Kleven, Henrik J. 2016. "Bunching." *Annual Review of Economics*.
+- Kolesár, Michal, and Christoph Rothe. 2018. "Inference in Regression Discontinuity Designs with a Discrete Running Variable." *American Economic Review*.
+- Kreiss, Alexander, and Christoph Rothe. 2023. "Inference in Regression Discontinuity Designs with High-Dimensional Covariates." *The Econometrics Journal*.
+- Landais, Camille. 2015. "Assessing the Welfare Effects of Unemployment Benefits Using the Regression Kink Design." *American Economic Journal: Economic Policy*.
+- Lee, David S. 2008. "Randomized Experiments from Non-Random Selection in U.S. House Elections." *Journal of Econometrics*.
+- McCrary, Justin. 2008. "Manipulation of the Running Variable in the Regression Discontinuity Design: A Density Test." *Journal of Econometrics*.
+- Noack, Claudia, Tomasz Olma, and Christoph Rothe. 2024. "Flexible Covariate Adjustments in Regression Discontinuity Designs." Working paper, arXiv:2107.07942.
+- Saez, Emmanuel. 2010. "Do Taxpayers Bunch at Kink Points?" *American Economic Journal: Economic Policy*.
+- Sejas-Portillo, Rodolfo, Mirko Moro, and Till Stowasser. 2025. "The Simpler the Better? Threshold Effects of Energy Labels on Property Prices and Energy-Efficiency Investments." *American Economic Journal: Applied Economics*.
+- Tsybakov, Alexandre B. 2009. *Introduction to Nonparametric Estimation*. Springer.

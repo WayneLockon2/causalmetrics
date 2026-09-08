@@ -1,0 +1,780 @@
+---
+title: "Replication: LinkedIn(to) Job Opportunities"
+subtitle: "Experimental Evidence from Job Readiness Training (Wheeler, Garlick, Johnson, Shaw, and Gargano, AEJ: Applied 2022)"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/10_mediation/wheeler2022/"
+  n_boot_wild: 1000
+  n_boot: 499
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(fixest)
+library(mlr3)
+library(mlr3learners)
+data_path <- params$data_path
+n_boot_wild <- params$n_boot_wild
+n_boot <- params$n_boot
+data_md5 <- tools::md5sum(file.path(data_path, "panel_clean_final.dta"))
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+fmt0 <- function(x) formatC(x, digits = 0, format = "f", big.mark = ",")
+paren <- function(x, digits = 3) paste0("(", fmt(x, digits), ")")
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is whether teaching work seekers to use LinkedIn raises
+their employment, and the answer is a 7 percentage point gain that
+persists for a year.** Harambee, a South African job-readiness program,
+ran 30 training cohorts in 2016. Cohorts were paired into 14
+stratification blocks by city and date, and one cohort per block was
+randomized to receive a LinkedIn training module inside the program.
+Treated candidates were 31 percentage points more likely to hold a
+LinkedIn account and 7 percentage points more likely to be employed at
+the end of the program, with effects of the same size 6 and 12 months
+later.
+
+**The identification is the randomization; the mechanism is the harder
+question and the paper treats it as such.** The experiment identifies the
+effect of the training on employment and the effect on every LinkedIn
+measure (Table 2). It does not identify how much of the employment gain
+runs through LinkedIn use, because nobody randomized LinkedIn use. The
+paper assembles four pieces of evidence in Section IV: the nonexperimental
+association between account ownership and employment (Table 4), effect
+heterogeneity by baseline account (Table 5), effects on candidate
+mechanisms (Table 6), and, in Appendix C, two "share explained"
+statistics under stated assumptions. It says that none of this is
+prespecified and that the assumptions are strong.
+
+**Why this paper anchors Section 10.** It is a clean experiment whose
+authors reach for mediation only with explicit caveats. The Appendix C
+shares are the linear mediation model of the lecture, estimated as a
+system with delta-method standard errors, and the mechanism tables are
+the "effects on mediators" step that every mediation analysis should
+report first. The public data reproduce all of it.
+
+**What the public replication package holds.** `panel_clean_final.dta`
+(1,638 candidates, one row each, with the three survey waves stacked as
+variables), the Stata scripts for the paper and the appendices, the
+auxiliary programs (wild bootstrap, extensive/intensive decomposition),
+and the `.tex` and `.csv` artifacts of every table. The LinkedIn usage
+components behind the intensive-margin indices were redacted by LinkedIn
+before release, so four columns of Table 6 and the component detail of
+Table 2 cannot be rebuilt. Every reproduced number below is printed next
+to the published one.
+
+# Data and specifications {#sec-data}
+
+```{r load}
+wh <- as.data.frame(haven::zap_labels(haven::read_dta(file.path(data_path, "panel_clean_final.dta"))))
+wh$strata <- factor(wh$strata)
+wh$cohort <- factor(wh$studref)
+c(candidates = nrow(wh), treated = sum(wh$treated), cohorts = nlevels(wh$cohort), blocks = nlevels(wh$strata))
+```
+
+**Every treatment effect in the paper is one regression.** The outcome is
+regressed on the treatment indicator with stratification-block fixed
+effects, and standard errors are clustered by cohort (30 clusters). In
+Stata this is `reghdfe y treated, absorb(strata) cluster(studref)`; here it
+is one `fixest::feols` call. The helper below returns the coefficient, the
+standard error, the control-group mean, and the sample sizes the paper's
+tables report. `fixest`'s default small-sample correction matches
+`reghdfe`'s for this design (block fixed effects are not nested within
+cohorts), which the tables confirm to three decimals.
+
+```{r itt-helper}
+itt <- function(y, data = wh, cond = NULL) {
+  d <- data[!is.na(data[[y]]), ]
+  fit <- feols(as.formula(paste(y, "~ treated | strata")), data = d, cluster = ~studref)
+  ct <- coeftable(fit)
+  out <- tibble(outcome = y, estimate = ct["treated", "Estimate"], std.error = ct["treated", "Std. Error"],
+                control_mean = mean(d[[y]][d$treated == 0]), n = nobs(fit), n_cohorts = length(unique(d$studref)),
+                adj_r2 = unname(r2(fit, "ar2")))
+  if (!is.null(cond)) out$control_mean_cond <- mean(d[[y]][d$treated == 0 & d[[cond]] == 1], na.rm = TRUE)
+  out
+}
+```
+
+**Covariates enter only in Table 4 and in our additions, with the paper's
+missing-value convention.** The do-file replaces missing education dummies
+by zero and, for every other covariate with missing values, adds a
+missing indicator and a zero-filled copy. We build the same list.
+
+```{r covariates}
+covs <- c("age", "gender_composite", "prev_employ", "cog_num", "cog_comm", "cog_cft",
+          "edn_dummy3", "edn_dummy4", "region1", "region2")
+covs_miss <- character(0)
+for (v in covs) {
+  if (v %in% c("edn_dummy3", "edn_dummy4")) {
+    wh[[v]][is.na(wh[[v]])] <- 0
+    covs_miss <- c(covs_miss, v)
+  } else if (anyNA(wh[[v]])) {
+    wh[[paste0(v, "_miss")]] <- as.integer(is.na(wh[[v]]))
+    wh[[paste0(v, "_nomiss")]] <- ifelse(is.na(wh[[v]]), 0, wh[[v]])
+    covs_miss <- c(covs_miss, paste0(v, "_miss"), paste0(v, "_nomiss"))
+  } else {
+    covs_miss <- c(covs_miss, v)
+  }
+}
+covs_miss
+```
+
+# Table 1: sample characteristics and balance {#sec-table1}
+
+**Table 1 establishes that randomization produced comparable arms, and the
+paper's balance test is a regression.** For each characteristic the
+do-file regresses the variable on the two arm indicators without a
+constant, clustered by cohort, and tests their equality; that is the
+clustered t-test of the treatment coefficient. The standardized
+difference divides the arm gap by the pooled standard deviation. Two
+characteristics are cohort-level (size and completion rate), and their
+tests run on 30 cohort observations.
+
+```{r table1}
+table1_row <- function(v, label, binary = FALSE, cohort_level = FALSE) {
+  if (cohort_level) {
+    d <- wh %>% group_by(studref) %>% summarise(x = first(.data[[v]]), treated = first(treated), .groups = "drop")
+    fit <- lm(x ~ treated, data = d)
+    p <- coeftable(feols(x ~ treated, data = d, vcov = "hetero"))["treated", "Pr(>|t|)"]
+  } else {
+    d <- wh[!is.na(wh[[v]]), ]; d$x <- d[[v]]
+    p <- coeftable(feols(x ~ treated, data = d, cluster = ~studref))["treated", "Pr(>|t|)"]
+  }
+  q <- quantile(d$x, c(0.1, 0.9))
+  tibble(Variable = label, N = nrow(d), Mean = mean(d$x), `Std. dev.` = sd(d$x),
+         `10th` = if (binary) NA else q[[1]], `90th` = if (binary) NA else q[[2]],
+         `p-value` = p, `Std. diff.` = (mean(d$x[d$treated == 1]) - mean(d$x[d$treated == 0])) / sd(d$x))
+}
+t1 <- bind_rows(
+  table1_row("age", "Age"), table1_row("cog_num", "Numeracy score"), table1_row("cog_comm", "Communications score"),
+  table1_row("cog_cft", "Cognitive score"), table1_row("gender_composite", "Gender", binary = TRUE),
+  table1_row("edn_over12", "High school education", binary = TRUE),
+  table1_row("edn_postsecond", "Post-secondary education", binary = TRUE),
+  table1_row("edn_uni", "University education", binary = TRUE), table1_row("prev_employ", "Previously employed", binary = TRUE),
+  table1_row("cohort_size", "Size of cohort", cohort_level = TRUE),
+  table1_row("bridge_p_complete", "Program completion rate", cohort_level = TRUE))
+published1 <- read.csv(file.path(data_path, "output", "summstats.csv"), skip = 1, header = TRUE, check.names = FALSE)
+t1$`Published p` <- published1[["p-value"]][match(t1$Variable, trimws(published1$Variable))]
+t1$`Published std. diff.` <- published1[["Std Diff"]][match(t1$Variable, trimws(published1$Variable))]
+t1 %>% mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kbl(booktabs = TRUE, linesep = "", digits = 2, caption = "Table 1 of the paper: sample characteristics, balance p-values, and standardized differences, with the published p-values and standardized differences in the last two columns.") %>%
+  tab_style("scale_down")
+```
+
+**The reproduced p-values and standardized differences match the
+published ones, including the one communication-score imbalance at
+p = 0.05.** The paper reads that imbalance as chance among eleven tests
+and returns to it in Appendix B7 with heterogeneity by communication
+skill. Balance on baseline employment (previously employed, 38 percent)
+matters most for what follows, because previous employment is the
+strongest predictor of both LinkedIn use and later employment (Table 4).
+
+# Table 2: effects on LinkedIn account opening and usage {#sec-table2}
+
+**Table 2 is the first stage of any mechanism story: the training moved
+LinkedIn use, by a lot.** Three outcomes: any account between baseline
+and 12 months, an account opened during training, and the usage index
+(first principal component of ten usage measures, standardized in the
+control group). The usage index rows also split the effect into an
+extensive margin (more accounts, valued at the control-group usage of
+account holders) and an intensive margin (more use per account). The
+decomposition needs only the account regression, the index regression,
+and the control mean of the index among account holders, so the shares
+reproduce from the public data even though the ten components do not.
+
+```{r table2}
+t2 <- bind_rows(itt("li_account"), itt("account_in_bridge"), itt("summary_li_pca", cond = "li_account"))
+ext <- t2$estimate[1] * t2$control_mean_cond[3]
+shares <- c(extensive = ext / t2$estimate[3], intensive = (t2$estimate[3] - ext) / t2$estimate[3])
+pub2 <- list(est = c(0.314, 0.395, 0.935), se = c(0.049, 0.048, 0.145), shares = c(0.319, 0.682),
+             mean = c(0.484, 0.091, 0.000), cond = 0.950, n = c(1638, 1579, 1300), r2 = c(0.140, 0.260, 0.187))
+tibble(
+  ` ` = c("Treated cohort", "", "Share of treatment effect due to more accounts", "Share due to using accounts more",
+          "Control group mean", "Control mean | account", "Number of respondents", "Number of cohorts", "Adjusted R2"),
+  `(1) LinkedIn account` = c(fmt(t2$estimate[1]), paren(t2$std.error[1]), "", "", fmt(t2$control_mean[1]), "", fmt0(t2$n[1]), t2$n_cohorts[1], fmt(t2$adj_r2[1])),
+  `(2) Account during training` = c(fmt(t2$estimate[2]), paren(t2$std.error[2]), "", "", fmt(t2$control_mean[2]), "", fmt0(t2$n[2]), t2$n_cohorts[2], fmt(t2$adj_r2[2])),
+  `(3) LI usage index` = c(fmt(t2$estimate[3]), paren(t2$std.error[3]), fmt(shares[1]), fmt(shares[2]), fmt(abs(t2$control_mean[3])), fmt(t2$control_mean_cond[3]), fmt0(t2$n[3]), t2$n_cohorts[3], fmt(t2$adj_r2[3])),
+  `Published (1)` = c(fmt(pub2$est[1]), paren(pub2$se[1]), "", "", fmt(pub2$mean[1]), "", fmt0(pub2$n[1]), 30, fmt(pub2$r2[1])),
+  `Published (3)` = c(fmt(pub2$est[3]), paren(pub2$se[3]), fmt(pub2$shares[1]), fmt(pub2$shares[2]), fmt(pub2$mean[3]), fmt(pub2$cond), fmt0(pub2$n[3]), 30, fmt(pub2$r2[3]))
+) %>%
+  kbl(booktabs = TRUE, linesep = "", align = "lccccc",
+      caption = "Table 2 of the paper: treatment effects on LinkedIn account opening and usage, block fixed effects, standard errors clustered by cohort; columns 1 and 3 of the published table for comparison.") %>%
+  tab_style("scale_down")
+```
+
+**All three coefficients, their standard errors, the control means, and
+the two shares reproduce.** The usage index effect of `r fmt(t2$estimate[3])`
+standard deviations is the number the Appendix C shares divide by. About
+a third of it is more accounts and two thirds is more use per account,
+which the paper reads as candidates learning to use the platform rather
+than being pushed to open a dormant profile.
+
+# Figure 1: employment effects, with wild bootstrap p-values {#sec-figure1}
+
+**Figure 1 is the paper's headline: employment rises by 7 percentage
+points at the end of the program and stays up at 6 and 12 months.** The
+figure plots the control mean and the treated mean (control mean plus the
+fixed-effect ITT) at 0, 6, and 12 months with 95 percent intervals. With
+30 clusters the paper adds wild cluster bootstrap p-values (Cameron,
+Gelbach, and Miller 2008), computed by the `wildboot` program in the
+replication package: Rademacher weights drawn once per cohort, 1,000
+replications, the null imposed.
+
+**The wild bootstrap is defined here, in the note, not in the package, in
+the form the authors' program uses.** Their `wildboot` program fits the
+unrestricted model with block fixed effects, forms the fitted values with
+the treatment coefficient set to zero and keeps the unrestricted
+residuals, then rebuilds the outcome in each replication by flipping the
+sign of each cohort's residuals with probability one half and refits. The
+p-value is the share of bootstrap t-statistics at least as large in
+absolute value as the observed clustered t. The textbook version
+(Cameron, Gelbach, and Miller 2008; Roodman et al. 2019) takes both the
+fitted values and the residuals from the restricted regression; the
+function offers both.
+
+**One detail of the shipped program matters for the published numbers.**
+Inside `wildboot` the observed t-statistic uses the clustered standard
+error passed as an argument, but the bootstrap regressions reference a
+local macro named `myvce` that the program never defines, so each
+replication's t-statistic is computed with conventional standard errors.
+The `boot_vcov` argument reproduces that behaviour with `"iid"`; the
+clustered replications are `"cluster"`.
+
+```{r wild-boot-def}
+wild_cluster_boot_t <- function(data, y, d = "treated", fe = "strata", cluster = "studref",
+                                n_boot = 1000, seed = 1, residuals = c("authors", "restricted"),
+                                boot_vcov = c("cluster", "iid")) {
+  residuals <- match.arg(residuals)
+  boot_vcov <- match.arg(boot_vcov)
+  dat <- data[complete.cases(data[, c(y, d, fe, cluster)]), ]
+  cl_f <- as.formula(paste0("~", cluster))
+  fit <- feols(as.formula(paste(y, "~", d, "|", fe)), data = dat, cluster = cl_f)
+  b <- coef(fit)[[d]]
+  t_obs <- coeftable(fit)[d, "t value"]
+  if (residuals == "authors") {
+    yhat <- fitted(fit) - b * dat[[d]]
+    ehat <- resid(fit)
+  } else {
+    fit0 <- feols(as.formula(paste(y, "~ 1 |", fe)), data = dat)
+    yhat <- fitted(fit0)
+    ehat <- resid(fit0)
+  }
+  cl <- factor(dat[[cluster]])
+  G <- nlevels(cl)
+  vc <- if (boot_vcov == "cluster") cl_f else "iid"
+  set.seed(seed)
+  t_star <- vapply(seq_len(n_boot), function(r) {
+    s <- sample(c(-1, 1), G, replace = TRUE)[as.integer(cl)]
+    dat$.ystar <- yhat + s * ehat
+    fb <- feols(as.formula(paste(".ystar ~", d, "|", fe)), data = dat, vcov = vc)
+    coeftable(fb)[d, "t value"]
+  }, numeric(1))
+  list(estimate = b, std.error = coeftable(fit)[d, "Std. Error"], t = t_obs,
+       p_wild = mean(abs(t_star) >= abs(t_obs)), p_cluster = coeftable(fit)[d, "Pr(>|t|)"],
+       n_boot = n_boot, n_clusters = G)
+}
+```
+
+```{r figure1-fit, cache = TRUE, cache.extra = list(data_md5, n_boot_wild)}
+emp <- c("employed1_all", "employed2_all", "employed3_all")
+f1 <- bind_rows(lapply(seq_along(emp), function(k) {
+  y <- emp[k]
+  d <- wh[!is.na(wh[[y]]), ]
+  b0 <- coef(feols(as.formula(paste(y, "~ treated")), data = d, cluster = ~studref))[["(Intercept)"]]
+  r <- itt(y)
+  wa <- wild_cluster_boot_t(wh, y, n_boot = n_boot_wild, seed = 1, residuals = "authors", boot_vcov = "cluster")
+  wi <- wild_cluster_boot_t(wh, y, n_boot = n_boot_wild, seed = 1, residuals = "authors", boot_vcov = "iid")
+  wr <- wild_cluster_boot_t(wh, y, n_boot = n_boot_wild, seed = 1, residuals = "restricted", boot_vcov = "cluster")
+  tibble(month = c(0, 6, 12)[k], outcome = y, control = b0, estimate = r$estimate, std.error = r$std.error,
+         treated = b0 + r$estimate, p_cluster = wa$p_cluster, p_wild_authors = wa$p_wild, p_wild_iid = wi$p_wild, p_wild_restricted = wr$p_wild)
+}))
+```
+
+```{r figure1, echo = FALSE, fig.height = 3.6, fig.cap = "Figure 1 of the paper: employment status by survey wave. Red circles are control-group means; blue squares are the control mean plus the block-fixed-effect treatment effect, with 95 percent intervals from standard errors clustered by cohort."}
+ggplot(f1, aes(x = month)) +
+  geom_errorbar(aes(ymin = treated - 1.96 * std.error, ymax = treated + 1.96 * std.error), width = 0.6, colour = "#0072B2") +
+  geom_point(aes(y = control), colour = "#D55E00", shape = 16, size = 3) +
+  geom_point(aes(y = treated), colour = "#0072B2", shape = 15, size = 3) +
+  scale_x_continuous(breaks = c(0, 6, 12), labels = c("End of program", "6 months", "12 months")) +
+  labs(x = NULL, y = "Employment rate") +
+  theme_minimal(base_size = 11) + theme(panel.grid.minor = element_blank())
+```
+
+```{r figure1-table, echo = FALSE}
+f1 %>%
+  transmute(Wave = c("End of program", "6 months", "12 months"), Estimate = fmt(estimate), `Std. error` = paren(std.error),
+            `Cluster p` = fmt(p_cluster), `Wild p, clustered` = fmt(p_wild_authors), `Wild p, restricted` = fmt(p_wild_restricted),
+            `Wild p, as shipped` = fmt(p_wild_iid),
+            Published = c("0.070 (0.021) [<0.001]", "0.081 (0.039) [0.138]", "0.069 (0.024) [<0.001]")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = paste0("Employment effects behind Figure 1 with cluster-robust and wild cluster bootstrap p-values (", fmt0(n_boot_wild), " Rademacher replications, 30 cohorts). 'Clustered' uses the authors' residual construction with clustered t-statistics in the replications; 'restricted' uses restricted residuals; 'as shipped' reproduces the program's conventional bootstrap t-statistics. The published column quotes the figure note: estimate (standard error) [wild bootstrap p-value].")) %>%
+  tab_style("scale_down")
+```
+
+**The point estimates and standard errors reproduce, and the published
+p-values are reproduced only by the program as shipped.** With clustered
+t-statistics in the replications, the wild bootstrap p-values are
+`r fmt(f1$p_wild_authors[1])`, `r fmt(f1$p_wild_authors[2])`, and
+`r fmt(f1$p_wild_authors[3])`; with the conventional standard errors the
+program actually uses they are `r fmt(f1$p_wild_iid[1])`,
+`r fmt(f1$p_wild_iid[2])`, and `r fmt(f1$p_wild_iid[3])`, which are the
+published "<0.001", 0.138, and "<0.001" up to Monte Carlo error. The
+mixed statistic is not a valid bootstrap-t (the observed and bootstrap
+t-statistics are on different scales), and in this design it understates
+the p-values at the end of the program and at 12 months. The conclusion
+does not change: the end-of-program and 12-month effects are significant
+by every version, and the 6-month effect is borderline by every version.
+The restricted-residual version gives `r fmt(f1$p_wild_restricted[1])`,
+`r fmt(f1$p_wild_restricted[2])`, and `r fmt(f1$p_wild_restricted[3])`.
+
+# Table 3: effects on job type {#sec-table3}
+
+**Table 3 asks whether the new jobs are different jobs.** Hours worked
+(winsorized), currently employed in the first job, more than one
+employer, permanent contract, and promotion, at 6 and 12 months. The
+outcomes are coded zero for the non-employed, so the conditional control
+means (among the employed) show whether the effect is more jobs or
+different jobs. The paper concludes it is more jobs: hours rise because
+employment rises, not because the employed work longer (Appendix B3
+decomposes this).
+
+```{r table3}
+jobtype <- c("hourswork_wins", "employ_1tcurrent", "numemployers_bin", "permemploy", "promoted")
+labels3 <- c("Hours worked", "Employed in first job", "More than one employer", "Permanent contract", "Promoted")
+t3a <- bind_rows(lapply(paste0("tr_", jobtype), itt, cond = "employed2_all"))
+t3b <- bind_rows(lapply(paste0("tr_w2_", jobtype), itt, cond = "employed3_all"))
+panel <- function(t, published) {
+  tibble(` ` = c("Treated cohort", "", "Control group mean", "Control mean | employment", "Number of respondents", "Adjusted R2", "Published estimate", "Published SE"),
+         !!!setNames(lapply(seq_len(nrow(t)), function(j) c(fmt(t$estimate[j]), paren(t$std.error[j]), fmt(t$control_mean[j]), fmt(t$control_mean_cond[j]), fmt0(t$n[j]), fmt(t$adj_r2[j]), fmt(published$est[j]), paren(published$se[j]))), labels3))
+}
+pub3a <- list(est = c(4.200, 0.107, 0.001, 0.026, 0.007), se = c(1.700, 0.040, 0.021, 0.026, 0.010))
+pub3b <- list(est = c(2.879, 0.126, -0.044, 0.034, -0.023), se = c(1.029, 0.026, 0.025, 0.025, 0.021))
+bind_rows(panel(t3a, pub3a), panel(t3b, pub3b)) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 3 of the paper: treatment effects on job type six months (Panel A) and twelve months (Panel B) after the program, with the published estimates in the last two rows of each panel.") %>%
+  pack_rows("Panel A: six months after program completion", 1, 8) %>%
+  pack_rows("Panel B: twelve months after program completion", 9, 16) %>%
+  tab_style("scale_down")
+```
+
+**Every coefficient and standard error in both panels reproduces.** Hours
+rise by about four per week at six months; the only job-quality outcome
+that moves is being in the first job at twelve months, which is retention
+rather than quality.
+
+# Table 4: the nonexperimental association {#sec-table4}
+
+**Table 4 is the first mediation-style piece of evidence, and the paper
+labels it nonexperimental.** Among candidates, does having a LinkedIn
+account at baseline predict previous employment, and, in the control
+group, employment at the end of the program? The regressions are plain
+OLS with heteroskedasticity-robust standard errors; columns 2 and 4 add
+the covariates. In the language of Section 10, the column 4 coefficient
+is the delta of the Appendix C shares for a different mediator (the
+baseline account rather than the account by 12 months): a
+mediator-outcome association in the untreated, whose causal reading needs
+the mediator to be as good as random given the covariates.
+
+```{r table4}
+covs_noemp <- setdiff(covs_miss, c("prev_employ_miss", "prev_employ_nomiss"))
+ctrl <- wh[wh$treated == 0, ]
+fits4 <- list(
+  feols(prev_employ ~ s1_linkedin, data = wh, vcov = "hetero"),
+  feols(as.formula(paste("prev_employ ~ s1_linkedin +", paste(covs_noemp, collapse = " + "))), data = wh, vcov = "hetero"),
+  feols(employed1_all ~ s1_linkedin, data = ctrl, vcov = "hetero"),
+  feols(as.formula(paste("employed1_all ~ s1_linkedin +", paste(covs_miss, collapse = " + "))), data = ctrl, vcov = "hetero"))
+t4 <- sapply(fits4, function(f) c(coeftable(f)["s1_linkedin", 1:2], n = nobs(f), r2 = unname(r2(f, "ar2"))))
+tibble(` ` = c("LI account at baseline", "", "Covariates included?", "Number of respondents", "Adjusted R2", "Published"),
+       `(1) Previously employed` = c(fmt(t4[1, 1]), paren(t4[2, 1]), "", fmt0(t4[3, 1]), fmt(t4[4, 1]), "0.130 (0.035)"),
+       `(2)` = c(fmt(t4[1, 2]), paren(t4[2, 2]), "Y", fmt0(t4[3, 2]), fmt(t4[4, 2]), "0.090 (0.035)"),
+       `(3) Employed at end of program` = c(fmt(t4[1, 3]), paren(t4[2, 3]), "", fmt0(t4[3, 3]), fmt(t4[4, 3]), "0.068 (0.044)"),
+       `(4)` = c(fmt(t4[1, 4]), paren(t4[2, 4]), "Y", fmt0(t4[3, 4]), fmt(t4[4, 4]), "0.035 (0.049)")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 4 of the paper: nonexperimental relationship between employment and a LinkedIn account at baseline (columns 3-4 use control-group candidates only), heteroskedasticity-robust standard errors.") %>%
+  tab_style("scale_down")
+```
+
+**The association is positive and shrinks by a third to a half once
+covariates enter, which is the paper's own warning about selection into
+LinkedIn use.** The end-of-program association in the control group
+(column 4, `r fmt(t4[1, 4])`) is not significant. The lecture's
+sensitivity analysis in Section \@ref(sec-beyond) puts a number on how
+much residual selection would erase the mediated share.
+
+# Table 5: heterogeneity by baseline account {#sec-table5}
+
+**Table 5 asks whether the training helped those who already had an
+account, and finds the effect concentrated among those who did not.** The
+specification interacts the treatment with the baseline account indicator
+and interacts the block fixed effects with it too, so each group has its
+own randomization strata. The published table reports the effect for
+candidates without an account (the main coefficient) and the difference
+for those with one. `reghdfe` drops singleton fixed-effect cells, which
+`fixest` does with `fixef.rm = "singleton"`; one cell is a singleton in
+each wave, hence the sample sizes.
+
+```{r table5}
+wh$fe_times_li <- interaction(wh$s1_linkedin, wh$strata, drop = TRUE)
+t5 <- bind_rows(lapply(emp, function(y) {
+  d <- wh[!is.na(wh[[y]]) & !is.na(wh$s1_linkedin), ]
+  fit <- feols(as.formula(paste(y, "~ treated + treated:s1_linkedin | fe_times_li")), data = d, cluster = ~studref, fixef.rm = "singleton")
+  ct <- coeftable(fit)
+  tibble(outcome = y, b_treat = ct["treated", 1], se_treat = ct["treated", 2], b_int = ct["treated:s1_linkedin", 1], se_int = ct["treated:s1_linkedin", 2],
+         mean_acc = mean(d[[y]][d$treated == 0 & d$s1_linkedin == 1]), mean_noacc = mean(d[[y]][d$treated == 0 & d$s1_linkedin == 0]),
+         n = nobs(fit), adj_r2 = unname(r2(fit, "ar2")))
+}))
+pub5 <- list(b = c(0.083, 0.099, 0.087), sb = c(0.023, 0.041, 0.026), i = c(-0.031, -0.106, -0.067), si = c(0.030, 0.067, 0.051))
+tibble(` ` = c("Treated cohort", "", "... x baseline LinkedIn account", "", "Control group mean | account", "Control group mean | no account", "Number of respondents", "Adjusted R2", "Published: treated", "Published: interaction"),
+       !!!setNames(lapply(1:3, function(j) c(fmt(t5$b_treat[j]), paren(t5$se_treat[j]), fmt(t5$b_int[j]), paren(t5$se_int[j]), fmt(t5$mean_acc[j]), fmt(t5$mean_noacc[j]), fmt0(t5$n[j]), fmt(t5$adj_r2[j]),
+                                               paste(fmt(pub5$b[j]), paren(pub5$sb[j])), paste(fmt(pub5$i[j]), paren(pub5$si[j])))), c("(1) End of program", "(2) 6 months", "(3) 12 months"))) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 5 of the paper: employment effects by prior LinkedIn account, block fixed effects interacted with the baseline-account indicator, standard errors clustered by cohort.") %>%
+  tab_style()
+```
+
+**The interaction is negative in every wave and never significant, which
+the paper reads as the training working through the account margin.** In
+the language of Section 08, Table 5 is a group average treatment effect
+by one baseline covariate. The package estimates the same two group
+effects from a doubly robust score with the blocks and covariates as
+controls, without a linear interaction model.
+
+```{r table5-gate}
+d5 <- wh[!is.na(wh$employed1_all) & !is.na(wh$s1_linkedin), ]
+d5$account_baseline <- factor(ifelse(d5$s1_linkedin == 1, "account", "no account"))
+sc5 <- dr_scores(d5, "employed1_all", "treated", x = c("strata", covs_miss), seed = 1)
+g5 <- cate_gate(sc5, groups = "account_baseline", n_boot = 499, seed = 1)
+g5$table
+```
+
+```{r table5-gate-numbers, echo = FALSE}
+g5t <- g5$table
+gate_acc <- g5t$estimate[g5t$group == "account"]
+gate_noacc <- g5t$estimate[g5t$group == "no account"]
+gate_se_acc <- g5t$std.error[g5t$group == "account"]
+reg_acc <- t5$b_treat[1] + t5$b_int[1]
+```
+
+**Both approaches put the effect among candidates without an account and
+neither can resolve the effect among those with one.** The score gives
+`r fmt(gate_noacc)` for the `r fmt0(g5t$n[g5t$group == "no account"])`
+candidates without a baseline account, close to the regression's
+`r fmt(t5$b_treat[1])`. For the `r fmt0(g5t$n[g5t$group == "account"])`
+with an account it gives `r fmt(gate_acc)` against the regression's
+implied `r fmt(reg_acc)`, a gap well inside the group's standard error of
+`r fmt(gate_se_acc)`. That group is a sixth of the sample, so neither
+estimate says much about it; the regression borrows strength across
+groups through its functional form and the score does not.
+
+# Table 6: effects on potential mechanisms {#sec-table6}
+
+**Table 6 is the "effects on the mediators" step, and the paper runs it for
+ten candidate mechanisms.** Supply-side information (jobs and profiles
+viewed), placement in the targeted sector, placement through a partner
+firm, demand-side information (profile completeness and views), number of
+connections, job applications on the platform, self-placement, program
+completion, an engagement index, and an aspirations index. Each is an ITT
+with block fixed effects. Four of the ten (the LinkedIn usage indices and
+platform applications) were built from data LinkedIn redacted; the six
+others reproduce.
+
+```{r table6}
+mech <- c("targetsector", "harambee_partner_original", "selfplaced", "s2_completed", "summary_engage", "summary_aspire2")
+labels6 <- c("(2) Employed in target sector", "(3) Employed at partner firm", "(7) Self-placed", "(8) Completed program", "(9) Engagement index", "(10) Aspirations index")
+t6 <- bind_rows(lapply(mech, itt))
+pub6 <- list(est = c(0.155, -0.024, -0.013, -0.023, 0.151, 0.065), se = c(0.034, 0.059, 0.009, 0.030, 0.122, 0.054),
+             mean = c(0.539, 0.342, 0.056, 0.882, 0.000, 0.000), n = c(1626, 1626, 1626, 1612, 1246, 1231))
+tibble(` ` = c("Treated cohort", "", "Control group mean", "Number of respondents", "Number of cohorts", "Adjusted R2", "Published estimate", "Published SE", "Published N"),
+       !!!setNames(lapply(seq_along(mech), function(j) c(fmt(t6$estimate[j]), paren(t6$std.error[j]), fmt(t6$control_mean[j]), fmt0(t6$n[j]), t6$n_cohorts[j], fmt(t6$adj_r2[j]), fmt(pub6$est[j]), paren(pub6$se[j]), fmt0(pub6$n[j]))), labels6)) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Table 6 of the paper, the six columns that the public data support: treatment effects on potential mechanisms with block fixed effects and cohort-clustered standard errors. Columns 1, 4, 5, and 6 of the published table (supply-side information 0.316 (0.073), demand-side information 0.842 (0.144), connections 0.559 (0.093), job applications 0.009 (0.004)) use redacted LinkedIn data.") %>%
+  tab_style("scale_down")
+```
+
+**The six reproduced columns match the paper, and the pattern is the
+paper's argument for the mechanism.** Treated candidates are 15
+percentage points more likely to be placed in the targeted sector
+(finance and call centres), with no change in partner-firm placement,
+self-placement, completion, engagement, or aspirations. Together with the
+redacted columns (large effects on information and connections, none on
+on-platform applications), the paper concludes that LinkedIn worked as an
+information and signalling tool inside the program's own placement
+channel, not as a job board.
+
+# Appendix Table C1: the mediation shares {#sec-tableC1}
+
+**Table C1 converts the two first stages into a share of the employment
+effect explained by LinkedIn use, under two explicit assumptions.** For a
+mediator $M$ (the account by 12 months, or the usage index) the do-file
+estimates four regressions as a system with `suest` and cohort clustering:
+employment on treatment ($\beta$), $M$ on treatment ($\gamma$),
+employment on treatment and $M$ ($\tilde\beta$, $\alpha$), and employment
+on $M$ in the control group ($\delta$). The shares are
+$S_1 = \alpha\gamma/\beta$ and $S_2 = \delta\gamma/\beta$ with delta-method
+standard errors from the system covariance. $S_1$ assumes that the
+mediator-outcome relation is unconfounded given treatment and block; $S_2$
+replaces the mediator coefficient by its control-group value, which the
+paper motivates as "treatment increases LinkedIn use but does not change
+the relationship between LinkedIn use and employment".
+
+**`mediate_reg()` is this system.** With `method = "delta"` it fits the
+same four regressions, computes the joint covariance from the stacked
+influence functions clustered by cohort (what `suest` does, with its
+$G/(G-1)$ cluster correction and no degrees-of-freedom factor), and
+reports the shares with their standard errors in `shares`. Block fixed
+effects enter as a factor covariate. Panel A's standard errors below are
+read from the same stacked covariance, so that they match `suest` rather
+than `reghdfe` (which adds the $(n-1)/(n-k)$ factor and gives 0.021
+instead of 0.020 for $\beta$).
+
+```{r tableC1}
+c1_fit <- function(m) {
+  d <- wh[complete.cases(wh[, c("employed1_all", "treated", m)]), ]
+  mediate_reg(d, "employed1_all", "treated", m, x = "strata", method = "delta", cluster = "studref")
+}
+fit_acc <- c1_fit("li_account")
+fit_idx <- c1_fit("summary_li_pca")
+c1_col <- function(f) {
+  m <- f$spec$m
+  c(fmt(coef(f$models$total)[["treated"]]), paren(sqrt(vcov_of(f, "total"))),
+    fmt(coef(f$models$mediator[[1]])[["treated"]]), paren(sqrt(vcov_of(f, "mediator"))),
+    fmt(coef(f$models$outcome)[["treated"]]), paren(sqrt(vcov_of(f, "outcome_d"))),
+    fmt(coef(f$models$outcome)[[m]]), paren(sqrt(vcov_of(f, "outcome_m"))),
+    fmt(coef(f$models$control)[[m]]), paren(sqrt(vcov_of(f, "control"))),
+    fmt(f$shares$estimate[2]), paren(f$shares$std.error[2]), fmt(f$shares$estimate[3]), paren(f$shares$std.error[3]), fmt0(f$n))
+}
+vcov_of <- function(f, which) {
+  # suest's cluster-robust covariance: G/(G-1) only, no (n-1)/(n-k) factor
+  rows <- complete.cases(wh[, c("employed1_all", "treated", f$spec$m)])
+  cl <- wh$studref[rows]
+  n <- sum(rows)
+  m <- f$spec$m
+  se2 <- function(model, term, subset = seq_len(n)) {
+    infl <- causalmetrics:::.cm_infl(model, n, subset)
+    causalmetrics:::.cm_stacked_vcov(infl, cl)[term, term]
+  }
+  switch(which,
+    total = se2(f$models$total, "treated"),
+    mediator = se2(f$models$mediator[[1]], "treated"),
+    outcome_d = se2(f$models$outcome, "treated"),
+    outcome_m = se2(f$models$outcome, m),
+    control = se2(f$models$control, m, which(wh$treated[rows] == 0)))
+}
+rows_c1 <- c("Treatment effect on employment (beta)", "", "Treatment effect on LinkedIn use (gamma)", "",
+             "Treatment effect on employment | LinkedIn use (beta tilde)", "", "Employment-LinkedIn association | treatment (alpha)", "",
+             "Employment-LinkedIn association in control group (delta)", "", "S1 = alpha gamma / beta", "", "S2 = delta gamma / beta", "", "Sample size")
+tibble(` ` = rows_c1, `(1) LinkedIn account` = c1_col(fit_acc),
+       `Published (1)` = c("0.070", "(0.020)", "0.321", "(0.049)", "0.019", "(0.026)", "0.158", "(0.027)", "0.146", "(0.026)", "0.729", "(0.306)", "0.672", "(0.266)", "1626"),
+       `(2) LI usage index` = c1_col(fit_idx),
+       `Published (2)` = c("0.083", "(0.020)", "0.954", "(0.145)", "0.028", "(0.025)", "0.058", "(0.014)", "0.059", "(0.017)", "0.668", "(0.253)", "0.678", "(0.259)", "1288")) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Appendix Table C1 of the paper: relationship between treatment, initial employment, and LinkedIn use. Panel A reports the system's parameters, Panel B the shares of the treatment effect explained by LinkedIn use with delta-method standard errors; block fixed effects in every regression, standard errors clustered by cohort.") %>%
+  pack_rows("Panel A: parameter estimates", 1, 10) %>%
+  pack_rows("Panel B: share of treatment effect explained by LinkedIn use", 11, 14) %>%
+  tab_style("scale_down")
+```
+
+**Every entry, including the delta-method standard errors of the shares,
+reproduces to three decimals.** The shares say that two thirds to three
+quarters of the employment effect would run through LinkedIn use if the
+mediator were unconfounded; their standard errors say that the interval
+covers everything from zero to more than the whole effect. The paper's
+phrase is "suggestive evidence".
+
+# Beyond the paper: natural effects, machine learning, sensitivity, and accounting {#sec-beyond}
+
+**The four additions below keep the paper's data and specifications and
+ask what the Section 10 tools add.** Each is labelled as ours.
+
+## Natural effects with an interaction
+
+**The shares are the linear model's proportion mediated; allowing the
+account's effect to differ by treatment changes little.** With
+`interaction = TRUE` the outcome model adds treatment times mediator, and
+`mediate_reg()` reports both decompositions by simulation.
+
+```{r beyond-interaction}
+d_acc <- wh[complete.cases(wh[, c("employed1_all", "treated", "li_account")]), ]
+fit_int <- mediate_reg(d_acc, "employed1_all", "treated", "li_account", x = "strata", interaction = TRUE,
+                       cluster = "studref", n_sim = 1000, seed = 1)
+fit_int$effects
+fit_int$shares
+```
+
+```{r beyond-interaction-numbers, echo = FALSE}
+int_coef <- coef(fit_int$models$outcome)[["treated:li_account"]]
+```
+
+**The interaction coefficient is `r fmt(int_coef)` and not significant:
+the account's association with employment is similar in both arms.** The
+two decompositions differ by the mediated interaction,
+`r fmt(fit_int$effects$estimate[fit_int$effects$term == "nde_total"] - fit_int$effects$estimate[fit_int$effects$term == "nde"])`,
+and the proportion mediated is `r fmt(fit_int$shares$estimate[1], 2)` with
+a simulation standard error of `r fmt(fit_int$shares$std.error[1], 2)`:
+a ratio whose denominator is a 3-standard-error total effect has a wide
+interval whichever model computes it.
+
+## Double machine learning with the covariates
+
+**The linear system conditions on blocks only; the influence-function
+estimator adds the ten covariates with flexible learners.** The estimand
+is unchanged (sequential ignorability given block and covariates), so
+what changes is the credibility of the mediator model and the outcome
+model. Random forests for the outcome and logistic regressions for the two
+propensities; five folds.
+
+```{r beyond-dml, cache = TRUE, cache.extra = list(data_md5)}
+rf <- lrn("regr.ranger", num.trees = 500, min.node.size = 20)
+fit_dml <- mediate_dml(d_acc, "employed1_all", "treated", "li_account", x = c("strata", covs_miss),
+                       learner_y = rf, folds = 5, n_rep = 3, seed = 1)
+fit_dml$effects
+```
+
+```{r beyond-dml-numbers, echo = FALSE}
+nie_dml <- fit_dml$effects$estimate[fit_dml$effects$term == "nie"]
+nie_lin <- fit_acc$effects$estimate[fit_acc$effects$term == "nie"]
+```
+
+**The indirect effect with forests and covariates is `r fmt(nie_dml)`
+against `r fmt(nie_lin)` from the linear system.** The covariates change
+the split little, which is what balance (Table 1) and the small
+covariate adjustment in Table 4 lead one to expect. The standard errors
+are of the same order; the influence-function estimator does not buy
+precision here, it buys robustness to the functional form.
+
+## Sensitivity to an unmeasured mediator-outcome confounder
+
+**How much residual correlation between account opening and employment
+would erase the share.** `mediate_sensitivity()` traces the indirect
+effect against the correlation between the errors of the mediator and
+outcome regressions and reports where it crosses zero.
+
+```{r beyond-sensitivity, fig.height = 3.4, fig.cap = "The indirect effect of the training through the LinkedIn account as a function of the correlation between the account and employment errors. Sequential ignorability is rho = 0; the effect vanishes at the value reported as rho zero."}
+sens <- mediate_sensitivity(fit_acc, rho = seq(-0.5, 0.5, by = 0.02))
+c(rho_zero = sens$rho_zero, rho_tilde = sens$rho_tilde)
+plot_mediate_sensitivity(sens)
+```
+
+**An error correlation of `r fmt(sens$rho_zero, 2)` is enough.** For scale,
+the covariates of Table 4 move the account coefficient from 0.130 to
+0.090 among all candidates, a modest amount of observed selection; an
+unobserved trait of similar strength would take the share to zero. This
+is the quantitative form of the paper's caution.
+
+## Gelbach accounting of the mechanism variables
+
+**Adding the six public mechanism variables to the employment regression
+and attributing the change to each one.** Gelbach's (2016) decomposition
+assigns the fall in the treatment coefficient to each added covariate
+without depending on the order of addition.
+
+```{r beyond-gelbach, fig.height = 3.2, fig.cap = "Gelbach decomposition of the end-of-program employment effect on the LinkedIn account and the five public mechanism variables, block fixed effects, cluster bootstrap intervals."}
+mech_g <- c("li_account", "targetsector", "harambee_partner_original", "selfplaced", "s2_completed", "summary_engage")
+d_g <- wh[complete.cases(wh[, c("employed1_all", "treated", mech_g)]), ]
+g_wh <- gelbach_decomp(d_g, "employed1_all", "treated", x_add = mech_g, fe = "strata", cluster = "studref",
+                       n_boot = n_boot, seed = 1)
+g_wh$coefficients
+g_wh$contributions[, c("covariate", "Gamma", "beta_full", "contribution", "std.error", "share")]
+plot_gelbach(g_wh)
+```
+
+**The decomposition is an accounting of where the jobs came from, not a
+mechanism.** Placement in the targeted sector absorbs almost all of the
+coefficient because it is nearly the same event as being employed at the
+end of the program in this population. The LinkedIn account's own
+contribution is small once placement variables are in the regression,
+which is the lecture's point about post-treatment covariates that sit
+downstream of the mediator.
+
+## The first step by subgroup
+
+**Where did the training move the mediator?** The account ITT by baseline
+account and by education, from the doubly robust score.
+
+```{r beyond-gate}
+d_m <- wh[complete.cases(wh[, c("li_account", "treated", "s1_linkedin")]), ]
+d_m$account_baseline <- factor(ifelse(d_m$s1_linkedin == 1, "account", "no account"))
+d_m$education <- factor(ifelse(d_m$edn_dummy4 == 1, "university", ifelse(d_m$edn_dummy3 == 1, "post-secondary", "secondary")))
+sc_m <- dr_scores(d_m, "li_account", "treated", x = c("strata", covs_miss), seed = 1)
+cate_gate(sc_m, groups = "account_baseline", n_boot = 499, seed = 1)$table
+cate_gate(sc_m, groups = "education", n_boot = 499, seed = 1)$table
+```
+
+# What the replication says {#sec-reading}
+
+**The public data reproduce the paper.** Tables 1 to 6, Figure 1, and
+Appendix Table C1 match to three decimals wherever the inputs are public;
+the four redacted Table 6 columns are the only gap. The one finding about
+the code is that the wild bootstrap program computes its replication
+t-statistics with conventional standard errors because of an undefined
+local macro; the clustered version gives larger p-values for the two
+significant waves without changing the conclusion.
+
+**The mediation content is the linear system of Section 10, run as a
+regression system with a delta method.** `mediate_reg()` reproduces the
+shares and their standard errors because it computes the same stacked
+covariance. Its other outputs, the potential-outcome means and both
+decompositions, are free once the system is fitted.
+
+**The additions change no conclusion and sharpen the caveat.** Forests and
+covariates leave the indirect effect where the linear system put it; an
+error correlation of about `r fmt(sens$rho_zero, 2)` would erase it; the
+Gelbach accounting shows that placement variables absorb the coefficient
+for a reason that has nothing to do with LinkedIn. The paper's own
+reading, "suggestive evidence" that the training worked through LinkedIn
+use, is the right one.
+
+## Mapping to the lecture's checklist
+
+1. Estimand: total effect (RCT, Figure 1), effects on mediators (Tables 2
+   and 6), and a proportion mediated under sequential ignorability
+   (Table C1). Stated as such in the paper.
+2. Graph: treatment randomized; the account is a post-treatment choice
+   whose confounders with employment (motivation, prior experience) are
+   partly observed (Table 4).
+3. Total and mediator effects first: done, with cluster-robust and wild
+   bootstrap inference.
+4. Natural effects with and without interaction, and with machine
+   learning: this note's Section \@ref(sec-beyond).
+5. Sensitivity: rho at zero of `r fmt(sens$rho_zero, 2)`.
+6. No instrument for the mediator and no front-door structure.
+7. No treatment-induced confounder is modelled; program completion is a
+   candidate and moves little (Table 6).
+8. Regression accounting: the Gelbach decomposition, labelled as
+   accounting.
+
+# References
+
+- Cameron, A. Colin, Jonah B. Gelbach, and Douglas L. Miller. 2008. "Bootstrap-Based Improvements for Inference with Clustered Errors." *Review of Economics and Statistics*.
+- Gelbach, Jonah B. 2016. "When Do Covariates Matter? And Which Ones, and How Much?" *Journal of Labor Economics*.
+- Imai, Kosuke, Luke Keele, and Teppei Yamamoto. 2010. "Identification, Inference and Sensitivity Analysis for Causal Mediation Effects." *Statistical Science*.
+- Roodman, David, Morten Orregaard Nielsen, James G. MacKinnon, and Matthew D. Webb. 2019. "Fast and Wild: Bootstrap Inference in Stata Using boottest." *Stata Journal*.
+- Wheeler, Laurel, Robert Garlick, Eric Johnson, Patrick Shaw, and Marissa Gargano. 2022. "LinkedIn(to) Job Opportunities: Experimental Evidence from Job Readiness Training." *American Economic Journal: Applied Economics* 14(2), 101-125. Replication package: openICPSR.

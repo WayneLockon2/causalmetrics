@@ -13,6 +13,18 @@
 #'   fully heterogeneous effects, estimated by the doubly robust (AIPW) score
 #'   for the ATE or the ATT. This is [est_aipw()] with a choice of fold
 #'   solution and repeated cross-fitting added.
+#' * `model = "pliv"`, the partially linear instrumental variable model
+#'   `Y = theta D + g(X) + e` with `E[e Z | X] = 0`: residualize `Y`, `D`, and
+#'   the instrument(s) `Z` on `X`, then run instrumental variables on the
+#'   residuals (score `(Y - l)(Z - m_z) - theta (D - m)(Z - m_z)`). With
+#'   several instruments the residualized treatment is projected on the
+#'   residualized instruments first (two-stage least squares on residuals).
+#' * `model = "iivm"`, the interactive instrumental variable model with a
+#'   binary `D` and a binary `Z`: the local average treatment effect (LATE)
+#'   as the ratio of two AIPW-type scores, the effect of `Z` on `Y` over the
+#'   effect of `Z` on `D`, with the instrument propensity `P(Z = 1 | X)` in
+#'   the weights. Each score is doubly robust. The object also reports the
+#'   complier share and the intention-to-treat effect.
 #'
 #' The function owns the causal-estimation layer only. Nuisance predictions
 #' come either from `mlr3` learners fitted internally with cross-fitting, or
@@ -25,8 +37,25 @@
 #'   logical, or coercible) for `model = "irm"`; numeric for `model = "plr"`.
 #' @param x Character vector of pre-treatment covariate column names used when
 #'   nuisance predictions are estimated internally.
-#' @param model `"plr"` (partially linear regression, default) or `"irm"`
-#'   (interactive regression model).
+#' @param model `"plr"` (partially linear regression, default), `"irm"`
+#'   (interactive regression model), `"pliv"` (partially linear instrumental
+#'   variable model), or `"iivm"` (interactive instrumental variable model,
+#'   the LATE with a binary treatment and a binary instrument).
+#' @param z Instrument column name(s); required for `"pliv"` (one or more
+#'   instruments) and `"iivm"` (one binary instrument).
+#' @param z_hat Optional out-of-fold predictions of `E[Z | X]` for
+#'   `model = "pliv"` with one instrument.
+#' @param m0_hat,m1_hat Optional out-of-fold predictions of `E[D | Z = 0, X]`
+#'   and `E[D | Z = 1, X]` for `model = "iivm"`; there `p_hat` is
+#'   `P(Z = 1 | X)` and `mu0_hat`, `mu1_hat` are `E[Y | Z = 0, X]`,
+#'   `E[Y | Z = 1, X]`.
+#' @param learner_z `mlr3` learner for `E[Z | X]` (`"pliv"`).
+#' @param learner_m0,learner_m1 `mlr3` classification learners for
+#'   `E[D | Z = 0, X]` and `E[D | Z = 1, X]` (`"iivm"`).
+#' @param weak_iv Logical (IV models). Add the Anderson-Rubin confidence set
+#'   computed from the cross-fitted orthogonal score, which is valid under
+#'   weak identification (Chernozhukov et al. 2026, ch. 13).
+#' @param theta_grid Optional grid for `weak_iv`.
 #' @param estimand For `model = "irm"`: `"ATE"` (default) or `"ATT"`. Ignored
 #'   for `model = "plr"`, which estimates the coefficient `theta`.
 #' @param l_hat,m_hat Optional out-of-fold predictions of `E[Y | X]` and
@@ -150,19 +179,28 @@ est_dml <- function(data,
                     y,
                     d,
                     x = NULL,
-                    model = c("plr", "irm"),
+                    z = NULL,
+                    model = c("plr", "irm", "pliv", "iivm"),
                     estimand = c("ATE", "ATT"),
                     l_hat = NULL,
                     m_hat = NULL,
+                    z_hat = NULL,
                     p_hat = NULL,
                     mu0_hat = NULL,
                     mu1_hat = NULL,
+                    m0_hat = NULL,
+                    m1_hat = NULL,
                     fold_id = NULL,
                     learner_l = NULL,
                     learner_m = NULL,
+                    learner_z = NULL,
                     learner_p = NULL,
                     learner_mu0 = NULL,
                     learner_mu1 = NULL,
+                    learner_m0 = NULL,
+                    learner_m1 = NULL,
+                    weak_iv = FALSE,
+                    theta_grid = NULL,
                     folds = 5L,
                     n_rep = 1L,
                     cross_fit = TRUE,
@@ -176,6 +214,20 @@ est_dml <- function(data,
   call <- match.call()
   estimand_supplied <- !missing(estimand)
   model <- match.arg(model)
+  if (model %in% c("pliv", "iivm")) {
+    return(.cm_est_dml_iv(
+      data = data, y = y, d = d, z = z, x = x, model = model, z_hat = z_hat, m_hat = m_hat,
+      l_hat = l_hat, p_hat = p_hat, mu0_hat = mu0_hat, mu1_hat = mu1_hat, m0_hat = m0_hat,
+      m1_hat = m1_hat, fold_id = fold_id, learner_l = learner_l, learner_m = learner_m,
+      learner_z = learner_z, learner_p = learner_p, learner_mu0 = learner_mu0,
+      learner_mu1 = learner_mu1, learner_m0 = learner_m0, learner_m1 = learner_m1,
+      folds = folds, n_rep = n_rep, cross_fit = cross_fit, seed = seed,
+      solve = match.arg(solve), p_clip = p_clip, outcome_type = match.arg(outcome_type),
+      conf_level = conf_level, na_action = match.arg(na_action), weak_iv = weak_iv,
+      theta_grid = theta_grid, call = call
+    ))
+  }
+  if (!is.null(z)) stop("`z` is used only with model = \"pliv\" or \"iivm\".", call. = FALSE)
   if (!is.character(estimand) || length(estimand) == 0L) {
     stop("`estimand` must be \"ATE\" or \"ATT\".", call. = FALSE)
   }
@@ -664,7 +716,11 @@ est_dml <- function(data,
 #' @keywords internal
 #' @export
 print.cm_dml <- function(x, ...) {
-  label <- if (x$model == "plr") "partially linear regression, theta" else paste0("interactive regression model, ", x$estimand)
+  label <- switch(x$model,
+    plr = "partially linear regression, theta",
+    irm = paste0("interactive regression model, ", x$estimand),
+    pliv = "partially linear IV model, theta",
+    iivm = "interactive IV model, LATE")
   cat("Double ML estimate (", label, ")\n", sep = "")
   solution <- if (x$solve == "pooled") {
     paste0("pooled across ", x$folds, " fold(s)")
@@ -689,6 +745,22 @@ print.cm_dml <- function(x, ...) {
   if (!is.null(q)) {
     cat("  Nuisance RMSE: ",
         paste(sprintf("%s = %s", q$nuisance, formatC(q$rmse, digits = 3, format = "g")), collapse = ", "),
+        "\n", sep = "")
+  }
+  if (x$model == "pliv" && !is.null(x$first_stage)) {
+    cat("  First stage on residuals: F (robust) = ", formatC(x$first_stage$F_robust, digits = 2, format = "f"),
+        ", effective F = ", formatC(x$first_stage$F_effective, digits = 2, format = "f"), "\n", sep = "")
+  }
+  if (x$model == "iivm" && !is.null(x$compliance)) {
+    cat("  Complier share = ", formatC(x$compliance$complier_share, digits = 3, format = "f"),
+        " (SE ", formatC(x$compliance$std.error, digits = 3, format = "f"), "); ITT = ",
+        formatC(x$compliance$itt, digits = 4, format = "f"), "\n", sep = "")
+  }
+  if (!is.null(x$weak_iv)) {
+    iv <- x$weak_iv$set
+    cat("  Anderson-Rubin ", 100 * x$weak_iv$conf_level, "% set (", x$weak_iv$type, "): ",
+        if (nrow(iv) == 0L) "empty" else paste(sprintf("[%s, %s]", formatC(iv$lower, digits = 4, format = "f"),
+                                                       formatC(iv$upper, digits = 4, format = "f")), collapse = " U "),
         "\n", sep = "")
   }
   invisible(x)

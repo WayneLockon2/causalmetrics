@@ -9,19 +9,28 @@ est_dml(
   y,
   d,
   x = NULL,
-  model = c("plr", "irm"),
+  z = NULL,
+  model = c("plr", "irm", "pliv", "iivm"),
   estimand = c("ATE", "ATT"),
   l_hat = NULL,
   m_hat = NULL,
+  z_hat = NULL,
   p_hat = NULL,
   mu0_hat = NULL,
   mu1_hat = NULL,
+  m0_hat = NULL,
+  m1_hat = NULL,
   fold_id = NULL,
   learner_l = NULL,
   learner_m = NULL,
+  learner_z = NULL,
   learner_p = NULL,
   learner_mu0 = NULL,
   learner_mu1 = NULL,
+  learner_m0 = NULL,
+  learner_m1 = NULL,
+  weak_iv = FALSE,
+  theta_grid = NULL,
   folds = 5L,
   n_rep = 1L,
   cross_fit = TRUE,
@@ -45,8 +54,13 @@ logical, or coercible) for \code{model = "irm"}; numeric for \code{model = "plr"
 \item{x}{Character vector of pre-treatment covariate column names used when
 nuisance predictions are estimated internally.}
 
-\item{model}{\code{"plr"} (partially linear regression, default) or \code{"irm"}
-(interactive regression model).}
+\item{z}{Instrument column name(s); required for \code{"pliv"} (one or more
+instruments) and \code{"iivm"} (one binary instrument).}
+
+\item{model}{\code{"plr"} (partially linear regression, default), \code{"irm"}
+(interactive regression model), \code{"pliv"} (partially linear instrumental
+variable model), or \code{"iivm"} (interactive instrumental variable model,
+the LATE with a binary treatment and a binary instrument).}
 
 \item{estimand}{For \code{model = "irm"}: \code{"ATE"} (default) or \code{"ATT"}. Ignored
 for \code{model = "plr"}, which estimates the coefficient \code{theta}.}
@@ -55,9 +69,17 @@ for \code{model = "plr"}, which estimates the coefficient \code{theta}.}
 \code{E[D | X]} for \code{model = "plr"}. Each is a numeric vector of length
 \code{nrow(data)} or a character scalar naming a column in \code{data}.}
 
+\item{z_hat}{Optional out-of-fold predictions of \code{E[Z | X]} for
+\code{model = "pliv"} with one instrument.}
+
 \item{p_hat, mu0_hat, mu1_hat}{Optional out-of-fold predictions of
 \code{P(D = 1 | X)}, \verb{E[Y | D = 0, X]}, and \verb{E[Y | D = 1, X]} for
 \code{model = "irm"}. \code{mu1_hat} is not used for the ATT.}
+
+\item{m0_hat, m1_hat}{Optional out-of-fold predictions of \verb{E[D | Z = 0, X]}
+and \verb{E[D | Z = 1, X]} for \code{model = "iivm"}; there \code{p_hat} is
+\code{P(Z = 1 | X)} and \code{mu0_hat}, \code{mu1_hat} are \verb{E[Y | Z = 0, X]},
+\verb{E[Y | Z = 1, X]}.}
 
 \item{fold_id}{Optional fold identifier (vector of length \code{nrow(data)} or a
 column name). Use it to record the folds of externally produced
@@ -67,8 +89,19 @@ nuisances or to impose a fixed partition; implies \code{n_rep = 1}.}
 \code{E[D | X]} in the partially linear model. Defaults are \code{regr.lm}, or
 \code{classif.log_reg} with probabilities when the target is binary.}
 
+\item{learner_z}{\code{mlr3} learner for \code{E[Z | X]} (\code{"pliv"}).}
+
 \item{learner_p, learner_mu0, learner_mu1}{Optional \code{mlr3} learners for the
 interactive model, as in \code{\link[=est_aipw]{est_aipw()}}.}
+
+\item{learner_m0, learner_m1}{\code{mlr3} classification learners for
+\verb{E[D | Z = 0, X]} and \verb{E[D | Z = 1, X]} (\code{"iivm"}).}
+
+\item{weak_iv}{Logical (IV models). Add the Anderson-Rubin confidence set
+computed from the cross-fitted orthogonal score, which is valid under
+weak identification (Chernozhukov et al. 2026, ch. 13).}
+
+\item{theta_grid}{Optional grid for \code{weak_iv}.}
 
 \item{folds}{Number of cross-fitting folds (default 5).}
 
@@ -127,6 +160,18 @@ residuals on each other. \code{D} may be continuous or binary.
 fully heterogeneous effects, estimated by the doubly robust (AIPW) score
 for the ATE or the ATT. This is \code{\link[=est_aipw]{est_aipw()}} with a choice of fold
 solution and repeated cross-fitting added.
+\item \code{model = "pliv"}, the partially linear instrumental variable model
+\verb{Y = theta D + g(X) + e} with \verb{E[e Z | X] = 0}: residualize \code{Y}, \code{D}, and
+the instrument(s) \code{Z} on \code{X}, then run instrumental variables on the
+residuals (score \code{(Y - l)(Z - m_z) - theta (D - m)(Z - m_z)}). With
+several instruments the residualized treatment is projected on the
+residualized instruments first (two-stage least squares on residuals).
+\item \code{model = "iivm"}, the interactive instrumental variable model with a
+binary \code{D} and a binary \code{Z}: the local average treatment effect (LATE)
+as the ratio of two AIPW-type scores, the effect of \code{Z} on \code{Y} over the
+effect of \code{Z} on \code{D}, with the instrument propensity \code{P(Z = 1 | X)} in
+the weights. Each score is doubly robust. The object also reports the
+complier share and the intention-to-treat effect.
 }
 
 The function owns the causal-estimation layer only. Nuisance predictions

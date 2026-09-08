@@ -1,0 +1,275 @@
+skip_if_not_installed("mlr3")
+skip_if_not_installed("mlr3learners")
+x5 <- paste0("x", 1:5)
+
+test_that("est_dml pliv matches DoubleML and reduces to 2SLS on residuals", {
+  dat <- sim_iv(1500, dgp = "linear", seed = 1)
+  dat$x1sq <- dat$x1^2; dat$s2x2 <- sin(2 * dat$x2)
+  x5 <- c("x1sq", "s2x2", "x3", "x4", "x5")
+  set.seed(1)
+  fid <- sample(rep(1:5, length.out = 1500))
+  fit <- est_dml(dat, "y", "d", x5, z = "z", model = "pliv", fold_id = fid, weak_iv = TRUE)
+  expect_s3_class(fit, "cm_dml")
+  expect_equal(fit$model, "pliv")
+  # 2SLS on the cross-fitted residuals equals the score solution
+  r <- fit$residuals
+  ivr <- estimatr::iv_robust(y_tilde ~ 0 + d_tilde | 0 + z_tilde, data = r)
+  expect_equal(fit$estimate, unname(coef(ivr)[["d_tilde"]]), tolerance = 1e-8)
+  expect_lt(abs(fit$estimate - 1), 4 * fit$std.error)
+  expect_true(is.finite(fit$first_stage$F_effective))
+  expect_equal(nrow(fit$weak_iv$set), 1)
+  expect_true(fit$weak_iv$set$lower < fit$estimate && fit$weak_iv$set$upper > fit$estimate)
+  expect_output(print(fit), "partially linear IV")
+  expect_equal(tidy(fit)$estimate, fit$estimate)
+  # several instruments: two-stage least squares on residuals
+  dat$z2 <- dat$z + rnorm(1500)
+  fit2 <- est_dml(dat, "y", "d", x5, z = c("z", "z2"), model = "pliv", fold_id = fid)
+  r2 <- fit2$residuals
+  ivr2 <- estimatr::iv_robust(y_tilde ~ 0 + d_tilde | 0 + z_tilde.1 + z_tilde.2, data = r2)
+  expect_equal(fit2$estimate, unname(coef(ivr2)[["d_tilde"]]), tolerance = 1e-8)
+  skip_if_not_installed("DoubleML")
+  lgr::get_logger("mlr3")$set_threshold("warn")
+  obj <- DoubleML::DoubleMLData$new(dat, y_col = "y", d_cols = "d", x_cols = x5, z_cols = "z")
+  dml <- DoubleML::DoubleMLPLIV$new(obj, ml_l = mlr3::lrn("regr.lm"), ml_m = mlr3::lrn("regr.lm"),
+                                    ml_r = mlr3::lrn("regr.lm"), n_folds = 5)
+  dml$set_sample_splitting(list(list(train_ids = lapply(1:5, function(k) which(fid != k)),
+                                     test_ids = lapply(1:5, function(k) which(fid == k)))))
+  dml$fit()
+  expect_equal(fit$estimate, unname(dml$coef), tolerance = 1e-6)
+  expect_equal(fit$std.error, unname(dml$se), tolerance = 1e-2)
+})
+
+test_that("est_dml iivm matches DoubleML and recovers the LATE", {
+  dat <- sim_iv(3000, dgp = "late", seed = 2)
+  set.seed(2)
+  fid <- sample(rep(1:5, length.out = 3000))
+  fit <- est_dml(dat, "y", "d", c("x1", "x2"), z = "z", model = "iivm", fold_id = fid, weak_iv = TRUE)
+  expect_equal(fit$estimand, "LATE")
+  expect_lt(abs(fit$estimate - attr(dat, "late")), 3 * fit$std.error)
+  expect_lt(abs(fit$compliance$complier_share - attr(dat, "complier_share")), 3 * fit$compliance$std.error)
+  expect_equal(fit$estimate, mean(fit$score_components$psi_b) / mean(fit$score_components$psi_a))
+  expect_output(print(fit), "Complier share")
+  skip_if_not_installed("DoubleML")
+  lgr::get_logger("mlr3")$set_threshold("warn")
+  obj <- DoubleML::DoubleMLData$new(dat, y_col = "y", d_cols = "d", x_cols = c("x1", "x2"), z_cols = "z")
+  dml <- DoubleML::DoubleMLIIVM$new(obj, ml_g = mlr3::lrn("regr.lm"), ml_m = mlr3::lrn("classif.log_reg"),
+                                    ml_r = mlr3::lrn("classif.log_reg"), n_folds = 5, trimming_threshold = 0.01)
+  dml$set_sample_splitting(list(list(train_ids = lapply(1:5, function(k) which(fid != k)),
+                                     test_ids = lapply(1:5, function(k) which(fid == k)))))
+  dml$fit()
+  expect_equal(fit$estimate, unname(dml$coef), tolerance = 1e-6)
+  expect_equal(fit$std.error, unname(dml$se), tolerance = 1e-2)
+})
+
+test_that("late_scores and late_blp recover the complier CATE", {
+  dat <- sim_iv(4000, dgp = "late", seed = 3)
+  fit <- est_dml(dat, "y", "d", c("x1", "x2"), z = "z", model = "iivm", seed = 1)
+  ls <- late_scores(fit)
+  expect_s3_class(ls$outcome, "cm_scores")
+  expect_equal(mean(ls$outcome$score) / mean(ls$treatment$score), fit$estimate)
+  lb <- late_blp(ls, ~ x1, newdata = data.frame(x1 = c(-1, 0, 1)))
+  expect_equal(nrow(lb), 3)
+  # complier effect is 2 + x1
+  expect_true(all(abs(lb$estimate - (2 + lb$x1)) < 3 * lb$std.error))
+  expect_true(all(lb$std.error > 0))
+})
+
+test_that("iv_ar_confidence_set agrees with ivmodel and contains the estimate when the instrument is strong", {
+  dat <- sim_iv(800, dgp = "linear", seed = 4)
+  ar <- iv_ar_confidence_set(dat, "y", "d", "z", x5)
+  expect_equal(ar$type, "bounded")
+  expect_true(ar$intervals$lower < ar$estimate && ar$intervals$upper > ar$estimate)
+  ivr <- estimatr::iv_robust(y ~ d + x1 + x2 + x3 + x4 + x5 | z + x1 + x2 + x3 + x4 + x5, data = dat)
+  expect_equal(ar$estimate, unname(coef(ivr)[["d"]]), tolerance = 1e-8)
+  # the statistic at the 2SLS estimate is below the critical value
+  expect_lt(min(ar$statistic$statistic), ar$crit_val)
+  expect_output(print(ar), "Anderson-Rubin")
+  expect_s3_class(plot_ar_set(ar), "ggplot")
+  # weak design: an unbounded or whole-line set
+  weak <- sim_iv(500, dgp = "weak", concentration = 1, seed = 1)
+  arw <- iv_ar_confidence_set(weak, "y", "d", "z", paste0("x", 1:3))
+  expect_true(arw$type %in% c("unbounded", "whole line"))
+  # two instruments: grid version
+  dat$z2 <- dat$z + rnorm(800)
+  ar2 <- iv_ar_confidence_set(dat, "y", "d", c("z", "z2"), x5)
+  expect_equal(ar2$k, 2)
+  expect_true(nrow(ar2$intervals) >= 1)
+  skip_if_not_installed("ivmodel")
+  m <- ivmodel::ivmodel(Y = dat$y, D = dat$d, Z = dat$z, X = as.matrix(dat[, x5]), heteroSE = TRUE)
+  ci <- ivmodel::AR.test(m)$ci
+  expect_equal(unname(c(ar$intervals$lower, ar$intervals$upper)), unname(as.numeric(ci)), tolerance = 0.02)
+})
+
+test_that("iv_first_stage and iv_plausibly_exogenous behave", {
+  dat <- sim_iv(1000, dgp = "linear", seed = 6)
+  fs <- iv_first_stage(dat, "d", "z", x5)
+  expect_equal(fs$F_robust, fs$F_effective, tolerance = 1e-10)
+  expect_equal(fs$t^2, fs$F_robust, tolerance = 1e-8)
+  expect_gt(fs$F, 10)
+  fs2 <- iv_first_stage(dat, "d", "z", x5, cluster = "x1")
+  expect_true(is.finite(fs2$F_robust))
+  pe <- iv_plausibly_exogenous(dat, "y", "d", "z", x5, gamma_grid = c(-0.1, 0, 0.1))
+  expect_equal(nrow(pe), 3)
+  expect_true(attr(pe, "union")["lower"] <= min(pe$conf.low))
+  expect_true(all(diff(pe$estimate) < 0))
+})
+
+test_that("complier_profile recovers shares and complier means", {
+  dat <- sim_iv(4000, dgp = "late", seed = 7)
+  cp <- complier_profile(dat, "d", "z", covariates = c("x1", "x2"), x = "x1", n_boot = 20, seed = 1)
+  expect_equal(sum(cp$shares$share), 1, tolerance = 1e-10)
+  expect_lt(abs(cp$shares$share[1] - attr(dat, "complier_share")), 0.03)
+  truth <- mean(dat$x1[dat$type == "complier"])
+  expect_lt(abs(cp$table$compliers[1] - truth), 3 * cp$table$se_compliers[1] + 0.02)
+  at_truth <- mean(dat$x2[dat$type == "always"])
+  expect_lt(abs(cp$table$always_takers[2] - at_truth), 0.1)
+  expect_output(print(cp), "Compliance groups")
+  expect_equal(nrow(tidy(cp)), 3)
+})
+
+test_that("iv_late_weights decomposes 2SLS exactly", {
+  dat <- sim_iv(1500, dgp = "linear", seed = 8)
+  dat$z2 <- dat$z + rnorm(1500)
+  dat$z3 <- rnorm(1500)
+  lw <- iv_late_weights(dat, "y", "d", c("z", "z2", "z3"), x5)
+  ivr <- estimatr::iv_robust(y ~ d + x1 + x2 + x3 + x4 + x5 | z + z2 + z3 + x1 + x2 + x3 + x4 + x5, data = dat)
+  expect_equal(lw$estimate, unname(coef(ivr)[["d"]]), tolerance = 1e-8)
+  expect_equal(lw$check, lw$estimate, tolerance = 1e-8)
+  expect_equal(sum(lw$table$omega_k), 1, tolerance = 1e-10)
+  expect_output(print(lw), "Instrument-specific")
+})
+
+test_that("iv_ate_bounds contains the truth and tightens with the instrument", {
+  dat <- sim_iv(3000, dgp = "late", seed = 9)
+  dat$yb <- as.integer(dat$y > 1)
+  b <- iv_ate_bounds(dat, "yb", "d", "z", n_boot = 10, seed = 1)
+  expect_true(b$bounds$lower[3] <= b$bounds$upper[3])
+  expect_true(b$bounds$lower[3] >= b$no_instrument["lower"] - 1e-12)
+  expect_true(b$bounds$upper[3] <= b$no_instrument["upper"] + 1e-12)
+  expect_output(print(b), "Manski")
+})
+
+test_that("leniency_instrument computes leave-out means", {
+  dat <- sim_iv(2000, dgp = "judge", seed = 10)
+  out <- leniency_instrument(dat, "judge", "d")
+  # manual leave-one-out for one judge
+  j <- dat$judge[1]
+  manual <- (sum(dat$d[dat$judge == j]) - dat$d[1]) / (sum(dat$judge == j) - 1)
+  expect_equal(out$leniency[1], manual)
+  out2 <- leniency_instrument(dat, "judge", "d", x = "x1")
+  expect_gt(cor(out2$leniency, dat$leniency_true, use = "complete.obs"), 0.7)
+})
+
+test_that("mte_curve recovers a known MTE curve and its averages", {
+  dat <- sim_iv(8000, dgp = "mte", seed = 11)
+  m <- mte_curve(dat, "y", "d", "z", x = "x1", degree = 3, n_boot = 0)
+  truth <- attr(dat, "mte")
+  inside <- m$curve$u >= 0.2 & m$curve$u <= 0.8
+  expect_lt(max(abs(m$curve$mte[inside] - truth(m$curve$u[inside]))), 0.5)
+  expect_lt(abs(m$effects$estimate[m$effects$estimand == "ATE"] - attr(dat, "ate")), 0.3)
+  expect_lt(abs(m$effects$estimate[m$effects$estimand == "ATT"] - attr(dat, "att")), 0.3)
+  expect_equal(m$effects$estimand, c("ATE", "ATT", "ATU"))
+  m2 <- mte_curve(dat, "y", "d", "z", x = "x1", late_range = c(0.3, 0.7), policy = function(p) pmin(p + 0.1, 0.99), n_boot = 5, seed = 1)
+  expect_true(all(c("LATE", "PRTE") %in% m2$effects$estimand))
+  expect_true(all(is.finite(m2$curve$std.error)))
+  m3 <- mte_curve(dat, "y", "d", "z", x = "x1", method = "local", n_boot = 0)
+  expect_equal(nrow(m3$curve), length(m$curve$u))
+  expect_s3_class(plot_mte(m), "ggplot")
+  expect_s3_class(plot_mte(m, "weights"), "ggplot")
+  expect_output(print(m), "Marginal treatment effects")
+  expect_equal(tidy(m)$term[1], "ATE")
+})
+
+test_that("control functions reproduce 2SLS in the linear model and the APE in the probit model", {
+  dat <- sim_iv(1000, dgp = "linear", seed = 12)
+  cf <- cf_residuals(dat, "d", "z", x5)
+  ols <- lm(y ~ d + x1 + x2 + x3 + x4 + x5 + v_hat, data = cf)
+  ivr <- estimatr::iv_robust(y ~ d + x1 + x2 + x3 + x4 + x5 | z + x1 + x2 + x3 + x4 + x5, data = dat)
+  expect_equal(unname(coef(ols)[["d"]]), unname(coef(ivr)[["d"]]), tolerance = 1e-10)
+  # over-identified
+  dat$z2 <- dat$z + rnorm(1000)
+  cf2 <- cf_residuals(dat, "d", c("z", "z2"), x5)
+  ols2 <- lm(y ~ d + x1 + x2 + x3 + x4 + x5 + v_hat, data = cf2)
+  ivr2 <- estimatr::iv_robust(y ~ d + x1 + x2 + x3 + x4 + x5 | z + z2 + x1 + x2 + x3 + x4 + x5, data = dat)
+  expect_equal(unname(coef(ols2)[["d"]]), unname(coef(ivr2)[["d"]]), tolerance = 1e-10)
+  expect_true(!is.null(attr(cf, "first_stage")$strength))
+  # probit control function: APE close to the truth, naive probit far
+  dp <- sim_iv(3000, dgp = "probit_cf", rho = 0.6, seed = 13)
+  first <- function(df) cf_residuals(df, "d", "z", "x1")
+  second <- function(df) suppressWarnings(glm(y ~ d + x1 + v_hat, data = df, family = binomial("probit")))
+  aug <- first(dp)
+  fit <- second(aug)
+  ape <- cf_ape(fit, aug, "d")
+  naive <- cf_ape(glm(y ~ d + x1, data = dp, family = binomial("probit")), dp, "d")
+  expect_lt(abs(ape - attr(dp, "ape")), 0.02)
+  expect_gt(abs(naive - attr(dp, "ape")), 0.04)
+  cb <- cf_bootstrap(dp, first, second, n_boot = 15, seed = 1, ape = function(f, df) cf_ape(f, df, "d"))
+  expect_equal(cb$table$component, c(rep("coefficient", 4), "ape"))
+  expect_true(all(cb$table$std.error > 0))
+  expect_equal(cb$table$estimate[cb$table$term == "ape_d"], as.numeric(ape))
+  expect_output(print(cb), "bootstrap")
+  # generalized residual for a binary endogenous regressor
+  dp$db <- as.integer(dp$d > 0)
+  cfb <- cf_residuals(dp, "db", "z", "x1", family = "probit")
+  expect_equal(attr(cfb, "first_stage")$family, "probit")
+  expect_true(all(is.finite(cfb$v_hat)))
+  cfl <- cf_residuals(dp, "db", "z", "x1", family = "logit")
+  expect_equal(cfl$v_hat, dp$db - fitted(attr(cfl, "first_stage")$fit), tolerance = 1e-10, ignore_attr = TRUE)
+  # discrete APE
+  ape_d <- cf_ape(fit, aug, "d", delta = 1)
+  expect_true(is.finite(ape_d))
+})
+
+test_that("shift-share diagnostics reproduce the 2SLS estimate", {
+  dat <- sim_iv(500, dgp = "shift_share", n_industries = 10, seed = 14)
+  sh <- paste0("s", 1:10)
+  g <- attr(dat, "shocks")
+  rt <- ssiv_rotemberg(dat, "y", "d", sh, g, x = "x1")
+  ivr <- estimatr::iv_robust(y ~ d + x1 | b + x1, data = dat)
+  expect_equal(rt$estimate, unname(coef(ivr)[["d"]]), tolerance = 1e-8)
+  expect_equal(rt$check, rt$estimate, tolerance = 1e-8)
+  expect_equal(sum(rt$table$alpha_k), 1, tolerance = 1e-10)
+  sl <- ssiv_shock_level(dat, "y", "d", sh, g, x = "x1")
+  expect_equal(sl$estimate, rt$estimate, tolerance = 1e-8)
+  expect_true(sl$std.error > 0)
+  expect_output(print(rt), "Rotemberg")
+  expect_output(print(sl), "shock-level")
+  # weights and clusters run
+  dat$w <- runif(500, 0.5, 1.5)
+  rtw <- ssiv_rotemberg(dat, "y", "d", sh, g, x = "x1", weights = "w")
+  slw <- ssiv_shock_level(dat, "y", "d", sh, g, x = "x1", weights = "w", cluster = rep(1:5, each = 2))
+  expect_equal(rtw$estimate, slw$estimate, tolerance = 1e-8)
+})
+
+test_that("dml_sensitivity reproduces the bias bound formula", {
+  set.seed(15)
+  n <- 800; x <- rnorm(n); d <- 0.5 * x + rnorm(n); y <- d + x^2 + rnorm(n)
+  fit <- est_dml(data.frame(y, d, x), "y", "d", "x", seed = 1)
+  s <- dml_sensitivity(fit, r2_y = 0.1, r2_d = 0.05)
+  r <- fit$residuals
+  manual <- sqrt(0.1 * 0.05 / 0.95) * sqrt(mean((r$y_tilde - fit$estimate * r$d_tilde)^2) / mean(r$d_tilde^2))
+  expect_equal(s$bias, manual, tolerance = 1e-10)
+  expect_equal(unname(s$bounds), c(fit$estimate - manual, fit$estimate + manual))
+  rv <- s$robustness_value[["point"]]
+  expect_equal(sqrt(rv^2 / (1 - rv)) * s$scale, abs(fit$estimate), tolerance = 1e-8)
+  expect_s3_class(plot_dml_sensitivity(s), "ggplot")
+  expect_output(print(s), "robustness value")
+  skip_if_not_installed("sensemakr")
+  # linear model: sensemakr's bias for the same partial R2 equals ours when the nuisances are OLS
+  lmfit <- lm(y ~ d + x)
+  sm <- sensemakr::sensemakr(lmfit, treatment = "d", benchmark_covariates = "x", kd = 1)
+  b_sm <- sensemakr::ovb_bounds(lmfit, treatment = "d", benchmark_covariates = "x", kd = 1, ky = 1)
+  fit_lin <- est_dml(data.frame(y, d, x), "y", "d", "x", cross_fit = FALSE, seed = 1)
+  s_lin <- dml_sensitivity(fit_lin, r2_y = b_sm$r2yz.dx, r2_d = b_sm$r2dz.x)
+  expect_equal(s_lin$bias, abs(b_sm$adjusted_estimate - coef(lmfit)[["d"]]), tolerance = 0.02)
+})
+
+test_that("sim_iv designs carry their truths", {
+  for (g in c("linear", "weak", "late", "mte", "probit_cf", "shift_share", "judge")) {
+    d <- sim_iv(300, dgp = g, seed = 1)
+    expect_equal(attr(d, "dgp"), g)
+    expect_true(nrow(d) == 300)
+  }
+  expect_equal(attr(sim_iv(300, "linear", seed = 1), "theta"), 1)
+  expect_true(is.function(attr(sim_iv(300, "mte", seed = 1), "mte")))
+})

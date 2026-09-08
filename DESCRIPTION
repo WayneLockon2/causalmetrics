@@ -8,8 +8,10 @@ Description: Data cleaning utilities, descriptive table functions, diagnostics,
     and from-scratch causal estimators for applied empirical research in
     economics and marketing. The current estimator is augmented inverse
     propensity weighting ('est_aipw()'), double/debiased machine learning
-    ('est_dml()'), a difference-in-differences toolkit, and heterogeneous
-    treatment effect and policy learning tools built on doubly robust scores. Lecture notes (knitted PDFs under inst/lectures) and paper
+    ('est_dml()'), a difference-in-differences toolkit, heterogeneous treatment effect and
+    policy learning tools built on doubly robust scores, and instrumental-variable
+    tools (orthogonal IV scores, weak-instrument-robust sets, control functions,
+    compliers, marginal treatment effects, shift-share diagnostics). Lecture notes (knitted PDFs under inst/lectures) and paper
     replications document each identification strategy. Attaching the package
     also attaches the standard empirical analysis toolkit (tidyverse,
     data.table, fixest, estimatr, broom, modelsummary, kableExtra).
@@ -40,25 +42,46 @@ Suggests:
     did,
     dplyr,
     DRDID,
+    DoubleML,
     HonestDiD,
+    ivmodel,
+    ivreg,
+    lgr,
     ggthemes,
     glmnet,
     grf,
     MatchIt,
     mlr3,
     mlr3learners,
+    mlogit,
+    dfidx,
     patchwork,
     policytree,
+    dagitty,
+    ggdag,
+    haven,
+    mediation,
     quadprog,
+    bunching,
+    binsreg,
+    RDHonest,
     randomizr,
     ranger,
+    rdpower,
+    rdhte,
+    rdmulti,
+    rdlocrand,
+    rddensity,
+    rdrobust,
     ri2,
     rmarkdown,
     sandwich,
+    sensemakr,
     staggered,
     testthat (>= 3.0.0),
     tibble,
-    tidyr
+    tidyr,
+    xgboost
 Config/testthat/edition: 3
 VignetteBuilder: knitr
 Config/roxygen2/version: 8.0.0

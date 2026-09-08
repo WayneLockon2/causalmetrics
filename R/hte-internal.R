@@ -29,7 +29,7 @@ NULL
     stop("Learners must be valid `mlr3` learner objects.", call. = FALSE)
   }
   learner_i <- learner$clone(deep = TRUE)
-  df <- train[, c(target, features), drop = FALSE]
+  df <- .cm_numeric_features(train[, c(target, features), drop = FALSE], features)
   if (!is.null(weights)) {
     if (!("weights" %in% learner_i$properties)) {
       stop("Learner `", .cm_learner_label(learner),
@@ -61,12 +61,22 @@ NULL
             class = "cm_mlr3_fit")
 }
 
+# Integer and logical features are stored as doubles so that predictions on
+# new data (for instance a grid of non-integer values for a count variable)
+# do not fail mlr3's type check.
+.cm_numeric_features <- function(df, features) {
+  for (v in features) {
+    if (is.integer(df[[v]]) || is.logical(df[[v]])) df[[v]] <- as.numeric(df[[v]])
+  }
+  df
+}
+
 .cm_predict_fit <- function(fit, newdata) {
   miss <- setdiff(fit$features, names(newdata))
   if (length(miss)) {
     stop("`newdata` lacks columns: ", paste(miss, collapse = ", "), ".", call. = FALSE)
   }
-  df <- as.data.frame(newdata)[, fit$features, drop = FALSE]
+  df <- .cm_numeric_features(as.data.frame(newdata)[, fit$features, drop = FALSE], fit$features)
   pred <- fit$learner$predict_newdata(df)
   if (fit$type == "classif") {
     as.numeric(pred$prob[, fit$positive])

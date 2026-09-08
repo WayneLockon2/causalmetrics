@@ -1,0 +1,599 @@
+---
+title: "Replication: Carbon Taxes and CO2 Emissions"
+subtitle: "Synthetic control, illustrated with Andersson (American Economic Journal: Economic Policy, 2019)"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/09_Synthetic_Control/andersson2019carbon/"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center", fig.pos = "H",
+  out.width = "90%", collapse = TRUE, comment = "#>"
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(haven)
+library(sandwich)
+library(lmtest)
+library(ivreg)
+data_path <- params$data_path
+data_md5 <- tools::md5sum(file.path(data_path, c("carbontax_data.dta", "regression_data.Rds", "disentangling_data.dta", "descr_Sweden.Rds")))
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f", big.mark = ",")
+pct <- function(x, digits = 1) paste0(formatC(100 * x, digits = digits, format = "f"), " percent")
+tab_style <- function(k, ...) kable_styling(k, latex_options = c("hold_position", ...), font_size = 9)
+rep_theme <- function() theme_minimal(base_size = 11) + theme(legend.position = "bottom", panel.grid.minor = element_blank())
+tax_line <- geom_vline(xintercept = 1989.5, linetype = "dotted")
+```
+
+# The paper in one page {#sec-paper}
+
+**The question is whether a carbon tax reduces emissions, answered with
+one country and thirty years of history.** Sweden extended its value-added
+tax to transport fuel in 1990 and introduced a carbon tax on it in 1991,
+on top of an existing energy tax. Andersson (2019) asks what happened to
+per-capita CO2 emissions from transport, the sector the tax covers. The
+answer has to come from a comparison, and the natural comparison, the
+average of other OECD countries, does not trend like Sweden before 1990.
+
+**The design is a synthetic control with a donor pool chosen by hand and
+weights chosen by the data.** From 25 OECD countries the paper keeps 14
+donors: it drops the countries that introduced carbon taxes on transport
+(Finland, Norway, the Netherlands) or made large fuel-tax changes
+(Germany, Italy, the United Kingdom), two countries with fuel tourism
+(Austria, Luxembourg), and two whose development is unlike Sweden's
+(Turkey, Ireland). Synthetic Sweden is the convex combination of the 14
+donors that best reproduces Sweden's 1980 to 1989 averages of GDP per
+capita, motor vehicles, gasoline consumption, and urban population, and
+its emissions in 1970, 1980, and 1989. The weights on the predictors are
+chosen jointly with the country weights to minimize the pre-treatment
+mean squared prediction error of emissions over 1960 to 1989.
+
+**The headline is a reduction of almost 11 percent in an average
+post-treatment year.** Emissions in Sweden are 0.29 metric tons per capita
+below synthetic Sweden on average over 1990 to 2005, and 0.35 tons, or
+12.5 percent, below it in 2005. The paper then splits the effect between
+the VAT and the carbon tax with a time-series regression of gasoline
+consumption on the tax-exclusive price and the carbon tax, finds that
+consumers respond about three times more strongly to the carbon tax than
+to an equivalent price change, and attributes 6.3 percent of the 10.9
+percent to the carbon tax alone.
+
+**This notebook reproduces every table and figure from the replication
+data, adds the checks of Ferman and Pinto (2021), and reads each object
+as the paper does.** Section \@ref(sec-data) describes the data. Section
+\@ref(sec-descriptive) reproduces the descriptive figures and the
+pass-through regression. Section \@ref(sec-synthetic) builds synthetic
+Sweden (Tables 1 and 2, Figures 4 and 5). Section \@ref(sec-placebo) runs
+the placebo tests (Figures 6 to 9). Section \@ref(sec-confounder) checks
+the recession (Figures 11 and 12). Section \@ref(sec-disentangle)
+reproduces Table 3 and Figures 13 and 14. Section \@ref(sec-fp) adds the
+imperfect-fit diagnostics. All estimation uses `synth_control()` and its
+companions from `causalmetrics`; the regressions use `lm()`, `ivreg()`,
+and Newey-West standard errors from `sandwich`.
+
+# Data {#sec-data}
+
+**The panel is 15 countries over 1960 to 2005 with the outcome and five
+predictors.** The file `carbontax_data.dta` comes from the replication
+package as redistributed in the RTutor problem set of the paper. The
+outcome is CO2 emissions from transport in metric tons per capita (World
+Bank). The predictors are GDP per capita (PPP, 2005 dollars), motor
+vehicles per 1,000 people, gasoline consumption per capita (kilograms of
+oil equivalent), urban population (percent), and population density.
+Poland's GDP is missing before 1970, which matters only for the 1970
+in-time placebo, where the paper's code drops Poland.
+
+```{r data}
+carbon <- as.data.frame(read_dta(file.path(data_path, "carbontax_data.dta")))
+carbon$treated <- as.integer(carbon$country == "Sweden" & carbon$year >= 1990)
+donors <- sort(setdiff(unique(carbon$country), "Sweden"))
+xs <- c("GDP_per_capita", "vehicles_capita", "gas_cons_capita", "urban_pop")
+x_labels <- c(GDP_per_capita = "GDP per capita", vehicles_capita = "Motor vehicles (per 1,000 people)",
+              gas_cons_capita = "Gasoline consumption per capita", urban_pop = "Urban population",
+              `CO2_transport_capita(1989)` = "CO2 from transport per capita 1989",
+              `CO2_transport_capita(1980)` = "CO2 from transport per capita 1980",
+              `CO2_transport_capita(1970)` = "CO2 from transport per capita 1970")
+c(countries = length(unique(carbon$country)), years = length(unique(carbon$year)),
+  pre_years = sum(unique(carbon$year) < 1990), post_years = sum(unique(carbon$year) >= 1990))
+donors
+```
+
+**Three further files serve the descriptive figures and the second
+analysis.** `descr_Sweden.Rds` holds the Swedish price and tax components
+and the fuel consumption series (Figures 1 and 2 of the paper).
+`regression_data.Rds` holds the annual Swedish series for 1970 to 2015
+used in the pass-through regression and in Table 3: nominal and real
+prices, the energy and carbon taxes with and without VAT, the crude oil
+price, log gasoline consumption per capita, GDP per capita, urbanization,
+and unemployment. `disentangling_data.dta` holds the simulated emission
+paths under the three tax scenarios of Figure 13 and the synthetic
+control gap for Figure 14.
+
+```{r data-other}
+descr <- readRDS(file.path(data_path, "descr_Sweden.Rds"))
+reg <- readRDS(file.path(data_path, "regression_data.Rds"))
+disent <- as.data.frame(read_dta(file.path(data_path, "disentangling_data.dta")))
+c(descr = nrow(descr), regression = nrow(reg), regression_complete = sum(!is.na(reg$log_gas_cons)), disentangling = nrow(disent))
+```
+
+# Descriptive evidence and tax incidence {#sec-descriptive}
+
+**Figure 1 of the paper shows that the tax reform changed the price of
+fuel, which is the mechanism the whole design relies on.** The energy tax
+existed before 1990; the VAT and the carbon tax were added in 1990 and
+1991, and the carbon tax rose sharply after 2000 while the energy tax was
+reduced. The figure is there so the reader sees a large, dated change in
+the treatment variable.
+
+```{r fig-taxes, fig.height = 3.4, fig.cap = "Real energy tax, carbon tax, and total tax on gasoline in Sweden, SEK per liter (paper's Figure 1, panel A)."}
+descr %>% select(year, en_tax, CO2_tax, total_tax) %>%
+  pivot_longer(-year, names_to = "component", values_to = "value") %>%
+  mutate(component = recode(component, en_tax = "Energy tax", CO2_tax = "Carbon tax", total_tax = "Total tax")) %>%
+  ggplot(aes(x = year, y = value, colour = component, linetype = component)) +
+  geom_line() + tax_line +
+  labs(x = NULL, y = "Real tax, SEK per liter", colour = NULL, linetype = NULL) + rep_theme()
+```
+
+**Figure 3 of the paper is the reason for the method: Sweden and the
+donor average do not share a trend.** Before 1980 the two series grow at
+a similar pace; between 1980 and 1989 Sweden's emissions grow twice as
+fast. A difference-in-differences estimate would attribute that trend
+difference to the tax. The figure is placed before any estimation so that
+the reader accepts the need for a weighted comparison.
+
+```{r fig3, fig.height = 3.4, fig.cap = "Per-capita CO2 emissions from transport, Sweden versus the unweighted average of the 14 donor countries (paper's Figure 3)."}
+donor_avg <- carbon %>% filter(country != "Sweden") %>% group_by(year) %>%
+  summarise(y = mean(CO2_transport_capita), .groups = "drop") %>% mutate(series = "OECD sample")
+sweden <- carbon %>% filter(country == "Sweden") %>% transmute(year, y = CO2_transport_capita, series = "Sweden")
+plot_paths <- function(d, ylab = "Metric tons per capita (CO2 from transport)") {
+  ggplot(d, aes(x = year, y = y, colour = series, linetype = series)) +
+    geom_line() + tax_line +
+    scale_colour_manual(values = c("black", "grey45", "#B22222")[seq_along(unique(d$series))]) +
+    scale_y_continuous(limits = c(0, 3)) +
+    labs(x = NULL, y = ylab, colour = NULL, linetype = NULL) + rep_theme()
+}
+plot_paths(bind_rows(sweden, donor_avg))
+```
+
+**The pass-through regression (paper's equation 2) establishes that tax
+changes reach consumers, so that tax elasticities can be read as demand
+elasticities.** The nominal retail price is regressed in first
+differences on the crude oil price and the sum of the energy and carbon
+taxes, 1970 to 2015. The paper reports a coefficient of 1.15 on taxes
+with a 95 percent interval of 0.90 to 1.39.
+
+```{r passthrough}
+pass <- reg %>% arrange(year) %>%
+  mutate(delta_p = p_nom - lag(p_nom), delta_oil = oil_p - lag(oil_p), delta_tax = en_CO2_tax - lag(en_CO2_tax))
+pass_fit <- lm(delta_p ~ delta_oil + delta_tax, data = pass)
+cbind(estimate = coef(pass_fit), confint(pass_fit))[c("delta_oil", "delta_tax"), ]
+```
+
+The point estimate on taxes is the paper's 1.15. The interval above uses
+ordinary least-squares standard errors and is wider than the paper's; the
+paper does not state which standard errors it used for this regression,
+and the replication package's code for it is not part of the RTutor data.
+
+# Synthetic Sweden {#sec-synthetic}
+
+**The synthetic control is built exactly as in the paper: four
+covariates averaged over 1980 to 1989, three emission lags, and predictor
+weights chosen to minimize the pre-treatment MSPE over 1960 to 1989.**
+The `Synth` package solves the same nested problem with a different
+optimizer; the pre-treatment MSPE is flat near its minimum, so the
+predictor weights $V$ differ across optimizers while the country weights
+agree to about 0.04. The country weights are what the paper interprets.
+
+```{r synth-main, cache = TRUE, cache.extra = data_md5}
+set.seed(1)
+sc_sweden <- synth_control(carbon, id = "country", time = "year", y = "CO2_transport_capita", d = "treated",
+                           x = xs, lags = c(1989, 1980, 1970), pre_window = 1980:1989, v = "mspe",
+                           v_control = list(maxit = 2000, starts = 5))
+sc_sweden
+```
+
+**Table 1 reports the predictor means, and its purpose is to show that
+synthetic Sweden resembles Sweden on the drivers of emissions while the
+donor average does not.** The paper's last column is a
+population-weighted average of the donors; the replication data do not
+include population, so the column here is unweighted, as in the RTutor
+version. GDP per capita, vehicles, urban population, and the three
+emission lags match closely. Gasoline consumption does not, and the paper
+attributes that to the small weight $V$ assigns to it.
+
+```{r tab1}
+bal <- sc_sweden$balance
+tab1 <- data.frame(Variables = unname(x_labels[bal$predictor]), Sweden = bal$treated,
+                   `Synth. Sweden` = bal$synthetic, `OECD sample` = bal$donor_mean, `V matrix` = bal$v, check.names = FALSE)
+kable(tab1, digits = c(0, 3, 3, 3, 3), booktabs = TRUE, row.names = FALSE,
+      caption = "CO2 emissions from transport, predictor means before the tax reform (paper's Table 1). The OECD column is an unweighted donor average.") %>% tab_style()
+```
+
+**Table 2 reports the country weights, and the paper reads them as a
+plausibility check: Denmark, Belgium, and New Zealand, which resemble
+Sweden in institutions, GDP, and geography, make up three quarters of
+synthetic Sweden.** The paper's weights are Denmark 0.384, Belgium 0.195,
+New Zealand 0.177, Greece 0.090, the United States 0.088, and Switzerland
+0.061, with the rest at or near zero.
+
+```{r tab2}
+w <- sc_sweden$weights
+published <- c(Australia = 0.001, Belgium = 0.195, Canada = 0, Denmark = 0.384, France = 0, Greece = 0.090,
+               Iceland = 0.001, Japan = 0, `New Zealand` = 0.177, Poland = 0.001, Portugal = 0, Spain = 0,
+               Switzerland = 0.061, `United States` = 0.088)
+tab2 <- data.frame(Country = w$country, Weight = round(w$weight, 3), Published = published[w$country])
+kable(cbind(tab2[1:7, ], tab2[8:14, ]), booktabs = TRUE, row.names = FALSE,
+      caption = "Country weights in synthetic Sweden (paper's Table 2), replication against published values.") %>% tab_style()
+c(max_abs_difference = max(abs(tab2$Weight - tab2$Published)), pre_rmspe = sc_sweden$pre_rmspe,
+  concentration = unname(sc_sweden$concentration[["l2"]]))
+```
+
+**Figure 4 is the identification argument in one picture: synthetic
+Sweden tracks Sweden for thirty years and departs from it after 1990.**
+The paper reports an average absolute pre-treatment difference of about
+0.03 tons. The post-treatment distance is the estimate.
+
+```{r fig4, fig.height = 3.4, fig.cap = "Per-capita CO2 emissions from transport, Sweden versus synthetic Sweden (paper's Figure 4)."}
+paths <- sc_sweden$effects %>% transmute(year = time, Sweden = treated, `Synthetic Sweden` = synthetic) %>%
+  pivot_longer(-year, names_to = "series", values_to = "y")
+plot_paths(paths)
+```
+
+**Figure 5 plots the gap, and the paper reads three numbers off it: the
+2005 reduction, the average reduction, and the reduction in 2000, the
+last year before the energy tax was lowered.** The published values are
+12.5 percent (0.35 tons) in 2005, 10.9 percent (0.29 tons) on average
+over 1990 to 2005, and 11.5 percent (0.31 tons) in 2000. Percentages are
+gaps relative to the synthetic level.
+
+```{r fig5, fig.height = 3.4, fig.cap = "Gap in per-capita CO2 emissions from transport between Sweden and synthetic Sweden (paper's Figure 5)."}
+eff <- sc_sweden$effects
+ggplot(eff, aes(x = time, y = gap)) + geom_line() + geom_hline(yintercept = 0, linetype = "dotted") + tax_line +
+  scale_y_continuous(limits = c(-0.4, 0.4)) +
+  labs(x = NULL, y = "Gap in metric tons per capita") + rep_theme()
+headline <- eff %>% filter(post) %>%
+  summarise(average_gap = mean(gap), average_pct = mean(gap / synthetic),
+            gap_2005 = gap[time == 2005], pct_2005 = gap[time == 2005] / synthetic[time == 2005],
+            gap_2000 = gap[time == 2000], pct_2000 = gap[time == 2000] / synthetic[time == 2000],
+            pre_abs_diff = mean(abs(eff$gap[!eff$post])))
+round(as.data.frame(headline), 3)
+```
+
+The replication gives an average reduction of
+`r fmt(headline$average_gap, 2)` tons (`r pct(-headline$average_pct)`),
+a 2005 reduction of `r fmt(headline$gap_2005, 2)` tons
+(`r pct(-headline$pct_2005)`), and a 2000 reduction of
+`r fmt(headline$gap_2000, 2)` tons (`r pct(-headline$pct_2000)`),
+against the paper's 0.29 (10.9 percent), 0.35 (12.5 percent), and 0.31
+(11.5 percent).
+
+# Placebo tests {#sec-placebo}
+
+**The in-time placebos (Figure 6) move the tax to 1980 and to 1970 and
+ask the method to find an effect where there was none.** Each placebo
+uses only the data before 1990, shorter predictor windows, and emission
+lags shifted back, following the paper's code: for 1980, covariates over
+1970 to 1979 and lags in 1979, 1970, and 1965; for 1970, covariates over
+1960 to 1969, lags in 1969, 1965, and 1960, and Poland dropped because
+its GDP is missing before 1970.
+
+```{r fig6, cache = TRUE, cache.extra = data_md5, fig.height = 3.2, fig.cap = "Placebo in-time tests: the tax moved to 1980 (left) and to 1970 (right), estimated on data before 1990 (paper's Figure 6)."}
+set.seed(1)
+pt_1980 <- synth_placebo(sc_sweden, type = "time", placebo_time = 1980, lags = c(1979, 1970, 1965), pre_window = 1970:1979)
+sc_no_poland <- synth_control(carbon[carbon$country != "Poland", ], id = "country", time = "year",
+                              y = "CO2_transport_capita", d = "treated", x = xs, lags = c(1989, 1980, 1970),
+                              pre_window = 1980:1989, v = "mspe", v_control = list(maxit = 2000, starts = 5))
+pt_1970 <- synth_placebo(sc_no_poland, type = "time", placebo_time = 1970, lags = c(1969, 1965, 1960), pre_window = 1960:1969)
+placebo_paths <- bind_rows(
+  pt_1980$effects %>% transmute(panel = "Panel A. 1980", year = time, Sweden = treated, `Synthetic Sweden` = synthetic),
+  pt_1970$effects %>% transmute(panel = "Panel B. 1970", year = time, Sweden = treated, `Synthetic Sweden` = synthetic)
+) %>% pivot_longer(c(Sweden, `Synthetic Sweden`), names_to = "series", values_to = "y")
+ggplot(placebo_paths, aes(x = year, y = y, colour = series, linetype = series)) +
+  geom_line() + facet_wrap(~ panel) +
+  geom_vline(data = data.frame(panel = c("Panel A. 1980", "Panel B. 1970"), x = c(1979.5, 1969.5)),
+             aes(xintercept = x), linetype = "dotted") +
+  scale_colour_manual(values = c("black", "grey45")) + scale_y_continuous(limits = c(0, 3)) +
+  labs(x = NULL, y = "Metric tons per capita", colour = NULL, linetype = NULL) + rep_theme()
+c(placebo_1980_gap = pt_1980$estimate, placebo_1970_gap = pt_1970$estimate, real_gap = sc_sweden$estimate)
+```
+
+**The in-space placebos (Figure 7) reassign the tax to each donor; the
+paper first shows all 14 gaps and then drops the donors whose
+pre-treatment MSPE exceeds 20 times Sweden's, which leaves nine.** In the
+restricted set Sweden's post-1990 gap is the largest, so the
+permutation p-value is 1/10. Each placebo is fitted with the same
+predictors and with the other donors as its pool.
+
+```{r fig7, cache = TRUE, cache.extra = data_md5, fig.height = 3.4, fig.cap = "Permutation test: Sweden's gap (black) against the placebo gaps of all 14 donors (left) and of the nine donors with pre-treatment MSPE within 20 times Sweden's (right) (paper's Figure 7)."}
+pl <- synth_placebo(sc_sweden, mspe_limit = 20)
+gap_long <- function(keep, panel) {
+  g <- pl$gaps[, keep, drop = FALSE]
+  data.frame(panel = panel, year = rep(pl$time, ncol(g)), gap = as.vector(g),
+             id = rep(colnames(g), each = length(pl$time)),
+             series = rep(ifelse(colnames(g) == "Sweden", "Sweden", "Control countries"), each = length(pl$time)))
+}
+d7 <- bind_rows(gap_long(rep(TRUE, ncol(pl$gaps)), "Panel A. All 14 donors"), gap_long(pl$kept, "Panel B. MSPE within 20 times Sweden's"))
+ggplot() +
+  geom_line(data = filter(d7, series != "Sweden"), aes(x = year, y = gap, group = id), colour = "grey70") +
+  geom_line(data = filter(d7, series == "Sweden"), aes(x = year, y = gap), colour = "black", linewidth = 0.8) +
+  facet_wrap(~ panel) + geom_hline(yintercept = 0, linetype = "dotted") + tax_line +
+  coord_cartesian(ylim = c(-1, 1)) +
+  labs(x = NULL, y = "Gap in metric tons per capita") + rep_theme()
+c(kept_after_cut = sum(pl$kept) - 1L, sweden_rank_after_cut = pl$mspe$rank[1L], p_value_after_cut = pl$p_value)
+```
+
+**The ratio test (Figure 8) avoids the arbitrary cut by ranking every
+country on its post-to-pre MSPE ratio; Sweden's ratio is the largest of
+all 15, so the p-value is 1/15.** A large ratio needs both a good
+pre-treatment fit and a large post-treatment gap, which is why the paper
+prefers it with few donors.
+
+```{r fig8, fig.height = 3.6, fig.cap = "Ratio test: post-treatment MSPE over pre-treatment MSPE for Sweden and the 14 donors (paper's Figure 8)."}
+pl_all <- synth_placebo(sc_sweden)
+plot_synth(pl_all, type = "ratio")
+c(sweden_rank = pl_all$mspe$rank[1L], p_value = pl_all$p_value, sweden_ratio = pl_all$mspe$ratio[1L])
+```
+
+**The leave-one-out test (Figure 9) refits synthetic Sweden without each
+donor that has weight above 0.001; the paper reads the range of
+reductions, 8.8 percent without Switzerland to 13.0 percent without
+Denmark, as the sensitivity to any single donor.** All refits keep the
+estimate well away from zero and above the paper's DiD estimate of 8.1
+percent.
+
+```{r fig9, cache = TRUE, cache.extra = data_md5, fig.height = 3.4, fig.cap = "Leave-one-out distribution of synthetic Sweden (paper's Figure 9)."}
+loo <- synth_loo(sc_sweden, min_weight = 0.001)
+plot_synth(loo)
+loo_tab <- loo$table %>% mutate(pct = sapply(seq_along(loo$fits), function(i) {
+  e <- loo$fits[[i]]$effects; mean(e$gap[e$post] / e$synthetic[e$post]) }))
+loo_tab %>% mutate(estimate = round(estimate, 3), pct = round(100 * pct, 1), pre_rmspe = round(pre_rmspe, 4)) %>%
+  select(dropped, weight, estimate, pct, pre_rmspe)
+```
+
+**The full-sample test of the paper (Figure 10) re-estimates with all 24
+OECD countries; the replication data contain only the 14 donors, so that
+figure cannot be reproduced.** The paper reports that only the United
+Kingdom would receive a sizeable weight (0.128) and that the estimate is
+nearly unchanged.
+
+# The recession as a possible confounder {#sec-confounder}
+
+**Figures 11 and 12 answer the objection that the 1991 to 1993 recession,
+not the tax, cut emissions.** The check reuses the emission weights on GDP
+per capita. If synthetic Sweden reproduces Sweden's GDP through the
+recession, the recession is common to both and cannot explain the
+emissions gap. The paper then compares the two recessions: the GDP gap
+fell by about 2,300 dollars in both, while the emissions gap rose by 0.086
+tons in 1975 to 1978 and fell by 0.291 tons in 1989 to 1993. GDP per
+capita is missing for Poland before 1970, so the check runs on 1970 to
+2005; Poland's weight is zero.
+
+```{r fig11, fig.height = 3.4, fig.cap = "GDP per capita, Sweden versus synthetic Sweden with the emission weights; shaded areas are the 1976 to 1978 and 1991 to 1993 recessions (paper's Figure 11)."}
+gdp <- synth_control(carbon[carbon$year >= 1970, ], id = "country", time = "year", y = "GDP_per_capita", d = "treated",
+                     weights = sc_sweden)
+recessions <- data.frame(start = c(1976, 1991), end = c(1978, 1993))
+gdp_paths <- gdp$effects %>% transmute(year = time, Sweden = treated, `Synthetic Sweden` = synthetic) %>%
+  pivot_longer(-year, names_to = "series", values_to = "y")
+ggplot() +
+  geom_rect(data = recessions, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf), fill = "grey85") +
+  geom_line(data = gdp_paths, aes(x = year, y = y, colour = series, linetype = series)) + tax_line +
+  scale_colour_manual(values = c("black", "grey45")) +
+  scale_y_continuous(limits = c(0, 35000), labels = scales::comma) +
+  labs(x = NULL, y = "GDP per capita (PPP, 2005 USD)", colour = NULL, linetype = NULL) + rep_theme()
+```
+
+```{r fig12, fig.height = 3.6, fig.cap = "Gaps between Sweden and synthetic Sweden in CO2 emissions (left axis) and GDP per capita (right axis) (paper's Figure 12)."}
+gaps <- merge(data.frame(year = eff$time, emissions = eff$gap), data.frame(year = gdp$effects$time, gdp = gdp$effects$gap), by = "year")
+ggplot() +
+  geom_rect(data = recessions, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf), fill = "grey85") +
+  geom_hline(yintercept = 0, linetype = "dotted") + tax_line +
+  geom_line(data = gaps, aes(x = year, y = emissions, colour = "CO2 emissions (left axis)")) +
+  geom_line(data = gaps, aes(x = year, y = gdp / 5000, colour = "GDP per capita (right axis)")) +
+  scale_y_continuous(limits = c(-0.4, 0.4), sec.axis = sec_axis(~ . * 5000, name = "Gap in GDP per capita (PPP, 2005 USD)", labels = scales::comma)) +
+  scale_colour_manual(values = c("black", "#B22222")) +
+  labs(x = NULL, y = "Gap in metric tons per capita", colour = NULL) + rep_theme()
+change <- function(v, from, to) v[gaps$year == to] - v[gaps$year == from]
+data.frame(recession = c("1975 to 1978", "1989 to 1993"),
+           gdp_gap_change = c(change(gaps$gdp, 1975, 1978), change(gaps$gdp, 1989, 1993)),
+           emissions_gap_change = c(change(gaps$emissions, 1975, 1978), change(gaps$emissions, 1989, 1993)),
+           gdp_gap_post_average = mean(gaps$gdp[gaps$year >= 1990]) / mean(gdp$effects$synthetic[gdp$effects$post]))
+```
+
+# Disentangling the carbon tax and the VAT {#sec-disentangle}
+
+**Table 3 estimates the gasoline demand response separately to the
+carbon-tax-exclusive price and to the carbon tax, on Swedish annual data
+for 1970 to 2011.** The model is log gasoline consumption per capita on
+the real price excluding the carbon tax (with VAT), the real carbon tax
+(with VAT), a dummy for 1991 onward, a trend, and, across columns, GDP per
+capita, urbanization, and unemployment. Columns 5 and 6 instrument the
+price with the real energy tax and with the crude oil price. Standard
+errors are Newey-West with 16 lags. The table exists to show that the
+carbon tax coefficient is about three times the price coefficient, and
+that the difference survives controls and instruments.
+
+```{r tab3}
+reg42 <- reg %>% filter(year >= 1970, year <= 2011, !is.na(log_gas_cons))
+f1 <- log_gas_cons ~ p_real_vat + real_CO2_tax_vat + d_CO2_tax + t
+f2 <- update(f1, . ~ . + gdp_cap)
+f3 <- update(f2, . ~ . + urban_pop)
+f4 <- update(f3, . ~ . + unempl)
+ols <- list(lm(f1, reg42), lm(f2, reg42), lm(f3, reg42), lm(f4, reg42))
+iv_en <- ivreg(log_gas_cons ~ p_real_vat + real_CO2_tax_vat + d_CO2_tax + t + gdp_cap + urban_pop + unempl |
+                 real_CO2_tax_vat + d_CO2_tax + t + gdp_cap + urban_pop + unempl + real_en_tax_vat, data = reg42)
+iv_oil <- ivreg(log_gas_cons ~ p_real_vat + real_CO2_tax_vat + d_CO2_tax + t + gdp_cap + urban_pop + unempl |
+                  real_CO2_tax_vat + d_CO2_tax + t + gdp_cap + urban_pop + unempl + oil_p_real, data = reg42)
+models <- c(ols, list(iv_en, iv_oil))
+nw <- lapply(models, function(m) NeweyWest(m, lag = 16, prewhite = FALSE))
+weak_f <- sapply(list(iv_en, iv_oil), function(m) summary(m, diagnostics = TRUE)$diagnostics["Weak instruments", "statistic"])
+equal_p <- sapply(seq_along(models), function(i) {
+  b <- coef(models[[i]]); V <- nw[[i]]
+  d <- b[["p_real_vat"]] - b[["real_CO2_tax_vat"]]
+  v <- V["p_real_vat", "p_real_vat"] + V["real_CO2_tax_vat", "real_CO2_tax_vat"] - 2 * V["p_real_vat", "real_CO2_tax_vat"]
+  2 * pnorm(-abs(d / sqrt(v)))
+})
+rows <- data.frame(term = c("p-value: beta1 = beta2", "Instrument F-statistic"),
+                   rbind(formatC(equal_p, digits = 3, format = "f"), c(rep("", 4), formatC(weak_f, digits = 2, format = "f"))))
+names(rows) <- c("term", paste0("(", 1:6, ")"))
+modelsummary::modelsummary(
+  setNames(models, c("OLS (1)", "OLS (2)", "OLS (3)", "OLS (4)", "IV EnTax (5)", "IV OilPrice (6)")),
+  vcov = nw, stars = FALSE, fmt = 4,
+  coef_map = c(p_real_vat = "Gas price with VAT", real_CO2_tax_vat = "Carbon tax with VAT", d_CO2_tax = "Dummy carbon tax",
+               t = "Trend", gdp_cap = "GDP per capita", urban_pop = "Urban population", unempl = "Unemployment rate",
+               `(Intercept)` = "Constant"),
+  gof_map = list(list(raw = "nobs", clean = "Observations", fmt = 0), list(raw = "r.squared", clean = "R2", fmt = 2)),
+  add_rows = rows, output = "kableExtra",
+  title = "Estimation results from gasoline consumption regressions (paper's Table 3). Newey-West standard errors with 16 lags in parentheses.") %>%
+  tab_style()
+```
+
+The coefficients and Newey-West standard errors match the paper's Table
+3 to the third decimal in every column. The instrument F-statistics
+differ: `ivreg`'s diagnostic is the classical first-stage F, while the
+paper reports 3.57 and 310.9, presumably with heteroskedasticity and
+autocorrelation robust standard errors; the conclusion is the same, the
+energy tax is a weak instrument and the oil price is not.
+
+**The elasticities follow by multiplying the semi-elasticities of column
+4 by the 1990 real price of 8.48 SEK: the paper reports a price
+elasticity of -0.51 and a carbon tax elasticity of -1.57.** The ratio of
+about three is the paper's explanation for why a simulation using the
+price elasticity alone understates the effect of the tax.
+
+```{r elasticities}
+b4 <- coef(ols[[4]])
+c(price_semi = b4[["p_real_vat"]], tax_semi = b4[["real_CO2_tax_vat"]],
+  price_elasticity = 8.48 * b4[["p_real_vat"]], tax_elasticity = 8.48 * b4[["real_CO2_tax_vat"]],
+  ratio = b4[["real_CO2_tax_vat"]] / b4[["p_real_vat"]])
+```
+
+**Figure 13 uses the column 4 semi-elasticities to simulate emissions
+under three scenarios and reads the carbon tax's share of the reduction
+off the distances between the lines.** The three series are supplied in
+the replication data: no carbon tax and no VAT, VAT without the carbon
+tax, and both. Up to 2000 the two taxes contribute about equally; after
+2000 the carbon tax increases dominate. The paper then applies the carbon
+tax's share of the simulated reduction in each year to the synthetic
+control gap of that year, and attributes 6.3 percent, or 0.17 tons per
+capita, of the average post-treatment reduction to the carbon tax, 0.15
+tons (5.5 percent) in 2000 and 0.27 tons (9.4 percent, three quarters of
+the total) in 2005.
+
+```{r fig13, fig.height = 3.4, fig.cap = "Simulated per-capita CO2 emissions from transport under three tax scenarios, 1970 to 2005 (paper's Figure 13)."}
+d13 <- disent %>% filter(year >= 1970, year <= 2005) %>%
+  select(year, `Carbon tax and VAT` = CarbonTaxandVAT, `No carbon tax, with VAT` = NoCarbonTaxWithVAT,
+         `No carbon tax, no VAT` = NoCarbonTaxNoVAT) %>%
+  pivot_longer(-year, names_to = "scenario", values_to = "y")
+ggplot(d13, aes(x = year, y = y, colour = scenario, linetype = scenario)) + geom_line() + tax_line +
+  scale_colour_manual(values = c("black", "grey45", "#B22222")) +
+  labs(x = NULL, y = "Metric tons per capita (CO2 from transport)", colour = NULL, linetype = NULL) + rep_theme()
+carbon_share <- disent %>% filter(year >= 1990, year <= 2005) %>%
+  transmute(year, share = (CarbonTaxandVAT - NoCarbonTaxWithVAT) / (CarbonTaxandVAT - NoCarbonTaxNoVAT)) %>%
+  left_join(eff %>% transmute(year = time, gap, synthetic), by = "year") %>%
+  mutate(carbon_tax_gap = share * gap, carbon_tax_pct = carbon_tax_gap / synthetic)
+carbon_only <- carbon_share %>%
+  summarise(average_gap = mean(carbon_tax_gap), average_pct = mean(carbon_tax_pct),
+            gap_2000 = carbon_tax_gap[year == 2000], pct_2000 = carbon_tax_pct[year == 2000],
+            gap_2005 = carbon_tax_gap[year == 2005], pct_2005 = carbon_tax_pct[year == 2005], share_2005 = share[year == 2005])
+round(as.data.frame(carbon_only), 3)
+```
+
+**Figure 14 puts the simulation next to the synthetic control gap; the
+two agree through 2000 and diverge afterwards, because the simulation
+holds the energy tax fixed while the real tax reform lowered it as the
+carbon tax rose.** The paper reads the 2005 divergence, -0.757 against
+-0.355, as what the carbon tax increases would have done had the energy
+tax not been cut.
+
+```{r fig14, fig.height = 3.4, fig.cap = "Gap in per-capita CO2 emissions from transport: synthetic control versus simulation (paper's Figure 14)."}
+d14 <- disent %>% transmute(year, `Synthetic control result` = CO2_reductions_synth, `Simulation result` = CO2_reductions_simulation) %>%
+  pivot_longer(-year, names_to = "series", values_to = "y")
+ggplot() +
+  geom_rect(data = data.frame(start = 2000, end = 2005), aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf), fill = "grey85") +
+  geom_line(data = d14, aes(x = year, y = y, colour = series, linetype = series)) +
+  geom_hline(yintercept = 0, linetype = "dotted") + tax_line +
+  scale_colour_manual(values = c("black", "#B22222")) +
+  labs(x = NULL, y = "Gap in metric tons per capita", colour = NULL, linetype = NULL) + rep_theme()
+disent %>% filter(year %in% c(2000, 2005)) %>% select(year, CO2_reductions_synth, CO2_reductions_simulation)
+```
+
+# Checks the paper did not run {#sec-fp}
+
+**Ferman and Pinto (2021) showed that a synthetic control with an
+imperfect pre-treatment fit is biased when the weights miss the treated
+unit's level or when assignment is correlated with the factors, and
+recommended four checks; Sweden passes them.** The demeaned synthetic
+control matches trends only and gives almost the same estimate, so the
+level is matched. The fit remains close after subtracting the period mean
+of all countries. The weights are spread over four effective donors. And
+the specification test does not find the demeaned synthetic control and
+DiD to disagree.
+
+```{r fp-checks, cache = TRUE, cache.extra = data_md5}
+sc_all_lags <- synth_control(carbon, "country", "year", "CO2_transport_capita", "treated")
+sc_demeaned <- synth_control(carbon, "country", "year", "CO2_transport_capita", "treated", demean = TRUE)
+did <- sdid_weights(carbon, "country", "year", "CO2_transport_capita", "treated", estimator = "did")
+spec <- synth_spec_test(sc_demeaned)
+conf <- synth_conformal(sc_all_lags, per_period = TRUE)
+data.frame(estimator = c("Andersson's specification", "All 30 lags", "Demeaned, all lags", "DiD"),
+           estimate = c(sc_sweden$estimate, sc_all_lags$estimate, sc_demeaned$estimate, did$estimate),
+           pre_rmspe = c(sc_sweden$pre_rmspe, sc_all_lags$pre_rmspe, sc_demeaned$pre_rmspe, NA),
+           concentration = c(sc_sweden$concentration[["l2"]], sc_all_lags$concentration[["l2"]], sc_demeaned$concentration[["l2"]], 1 / 14))
+c(demeaned_intercept = sc_demeaned$intercept, spec_test_p = spec$p_value, conformal_joint_p = conf$p_value,
+  per_period_rejections_at_5pct = sum(conf$per_period$p_value <= 0.05))
+```
+
+```{r fig-demeaned, fig.height = 3.2, fig.cap = "Sweden and synthetic Sweden after subtracting each year's mean over all 15 countries: the fit the weights achieved beyond the common trend (Ferman and Pinto's Figure 2.C for this application)."}
+plot_synth(sc_sweden, type = "demeaned_path")
+```
+
+# Conclusion {#sec-conclusion}
+
+**The replication reproduces the paper's estimates and every robustness
+check within the tolerance one expects from a different optimizer.** The
+country weights agree with Table 2 to within
+`r fmt(max(abs(tab2$Weight - tab2$Published)), 2)`, the average
+post-treatment reduction is `r pct(-headline$average_pct)` against the
+paper's 10.9 percent, the in-time placebos find nothing, the ratio test
+puts Sweden first among 15, the leave-one-out range brackets the estimate,
+and the recession comparison reproduces the paper's numbers to three
+decimals. Table 3 and the disentangling follow from the supplied series.
+
+**What the package adds is the imperfect-fit reading.** The demeaned
+estimate, the detrended fit, the weight concentration, and the
+specification test are the checks a referee would now ask for, and they
+support the paper's design.
+
+# Session information {.unnumbered}
+
+```{r session}
+sessionInfo()
+```

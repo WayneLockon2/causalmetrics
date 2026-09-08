@@ -24,3 +24,7 @@ Rplots.pdf
 inst/lectures/**/*_cache/
 inst/lectures/**/*_files/
 inst/lectures/**/*.log
+inst/replications/**/*_cache/
+inst/replications/**/*_files/
+inst/replications/**/*.log
+dev/

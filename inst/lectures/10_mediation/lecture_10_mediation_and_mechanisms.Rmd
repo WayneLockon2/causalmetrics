@@ -1,0 +1,1380 @@
+---
+title: "Causal Inference in Economics and Marketing"
+subtitle: "Section 10: Mediation and Mechanisms"
+author: "Weiheng Zhang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+    keep_tex: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.2, fig.align = "center", fig.pos = "H",
+  out.width = "95%", collapse = TRUE, comment = "#>"
+)
+# Code and output in footnotesize.
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+# This lecture lives in inst/lectures/10_mediation/ of the package source.
+# When knitted from the source tree it loads the development version of the
+# package; when the package is installed it uses the installed helpers.
+helper_rel <- file.path("vignette_helpers", "10_mediation", "mediation_lecture_helpers.R")
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+  helper_path <- file.path(pkg_root, "inst", helper_rel)
+} else {
+  library(causalmetrics)
+  helper_path <- system.file(helper_rel, package = "causalmetrics")
+}
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(mlr3)
+library(mlr3learners)
+source(helper_path)
+helper_md5 <- tools::md5sum(helper_path)
+n_sims_bad <- 200
+n_sims_dml <- 50
+n_sims_fd <- 200
+# Public data of Wheeler et al. (2022), kept outside version control.
+wheeler_path <- file.path(pkg_root, "data_raw", "10_mediation", "wheeler2022", "panel_clean_final.dta")
+have_wheeler <- file.exists(wheeler_path) && requireNamespace("haven", quietly = TRUE)
+```
+
+# From effects to mechanisms {#sec-problem}
+
+## The question behind the average effect
+
+Sections 02 to 08 asked whether a treatment works and for whom. This
+section asks how. Two published experiments show why the question is
+different.
+
+Wheeler, Garlick, Johnson, Shaw, and Gargano (2022) randomized a LinkedIn
+training module inside a job-readiness program in South Africa. Employment
+at the end of the program rose by 7 percentage points. The obvious story is
+that the training raised LinkedIn use and LinkedIn use produced jobs. The
+experiment identifies the first step: treatment raised account ownership
+by 32 percentage points. It does not identify the second step. Nobody
+randomized LinkedIn use. The paper says so and then reports two "share
+explained" statistics under stated assumptions.
+
+Cattan, Salvanes, and Tominey (2025) study exposure to elite peers in
+Norwegian high schools. Exposure raises applications to elite programs. It
+also lowers grades, and grades matter for admission. The total effect is
+the sum of a positive direct channel and a negative channel through grades.
+To separate them the authors instrument grades with a lottery that assigns
+students to blind written mathematics exams.
+
+Both papers need a language for "part of the effect runs through $M$",
+and both need assumptions beyond the experiment. This section provides
+the language, the assumptions, and the estimators.
+
+## Why "control for the mediator" is not an answer {#sec-trap}
+
+The first instinct is to add the mediator to the regression and read the
+coefficient on $D$ as the direct effect. Figure \@ref(fig:bad-control)
+shows what that does. The design is linear: $D$ is randomized, $M$
+depends on $D$, and $Y$ depends on $D$ and $M$. An unmeasured variable $U$
+affects both $M$ and $Y$ with a strength we vary from zero upward. The
+true direct effect is 1 and the total effect is $1 + 1.2 \times 0.9 = 2.08$.
+
+```{r bad-control-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_bad)}
+bad <- mc_bad_control(n_sims = n_sims_bad, n = 2000)
+bad_summary <- bad %>% group_by(u_strength, coefficient) %>%
+  summarise(mean = mean(estimate), sd = sd(estimate), .groups = "drop")
+naive_at_1 <- bad_summary$mean[bad_summary$u_strength == 1 & grepl("naive", bad_summary$coefficient)]
+naive_at_0 <- bad_summary$mean[bad_summary$u_strength == 0 & grepl("naive", bad_summary$coefficient)]
+```
+
+```{r bad-control, echo = FALSE, fig.height = 3.6, fig.cap = "The coefficient on D across repeated samples (n = 2000) when the mediator is added to the regression. D is randomized, so the total-effect regression is right at every strength of the unmeasured mediator-outcome confounder U. The regression that adds M is right only when U is absent. The oracle regression that also adds U is always right, but U is not observed."}
+ggplot(bad, aes(x = factor(u_strength), y = estimate, fill = coefficient)) +
+  geom_hline(yintercept = c(1, 2.08), linetype = "dashed", colour = "grey50") +
+  geom_boxplot(outlier.size = 0.4, width = 0.6) +
+  scale_fill_manual(values = c("grey80", "#D55E00", "#0072B2"), name = NULL) +
+  annotate("text", x = 0.55, y = 2.16, label = "total effect", hjust = 0, size = 3) +
+  annotate("text", x = 0.55, y = 1.08, label = "direct effect", hjust = 0, size = 3) +
+  labs(x = "Strength of the unmeasured mediator-outcome confounder U", y = "Coefficient on D") +
+  med_theme()
+```
+
+With $U$ absent the regression with $M$ gives `r fmt(naive_at_0)`, the
+direct effect. At strength one it gives `r fmt(naive_at_1)`, and the
+error grows with the strength of $U$. Randomization of $D$ does not help.
+$D$ is exogenous, $M$ is not, and once $M$ is in the regression the
+coefficient on $D$ is a partial coefficient in a system where $M$ carries
+$U$ into the equation. Section \@ref(sec-graphs) gives the graphical
+reason: conditioning on $M$ opens the path $D \to M \leftarrow U \to Y$.
+
+The lesson is not "never condition on $M$". It is that the coefficient on
+$D$ with $M$ held fixed is a different estimand, and it is identified only
+under assumptions about $M$ that no experiment on $D$ delivers.
+
+## Three questions and three estimands
+
+Write $M(d)$ for the mediator under treatment $d$ and $Y(d, m)$ for the
+outcome under treatment $d$ and mediator level $m$. Three questions map to
+three estimands.
+
+| Question | Estimand | Name |
+|---|---|---|
+| What does the treatment do? | $E[Y(1, M(1)) - Y(0, M(0))]$ | total effect |
+| What would it do if the mediator were held at its untreated value? | $E[Y(1, M(0)) - Y(0, M(0))]$ | natural direct effect |
+| What does the treatment do through the mediator alone? | $E[Y(1, M(1)) - Y(1, M(0))]$ | natural indirect effect |
+
+The first estimand needs an experiment on $D$. The other two contain
+$Y(1, M(0))$: the outcome of a treated unit whose mediator takes the value
+it would have taken without treatment. No unit ever displays this. The
+literature calls such quantities cross-world. Identifying them requires
+either an assumption that makes the mediator as good as randomized given
+observables, or a design that moves the mediator on its own.
+
+## Roadmap
+
+Section \@ref(sec-graphs) gives the graphical vocabulary. Section
+\@ref(sec-estimands) defines the estimands with care, including the
+controlled direct effect and the interaction case. Section
+\@ref(sec-identification) states sequential ignorability, proves the
+mediation formula, and lists the designs that identify mediation without
+it. Sections \@ref(sec-linear) to \@ref(sec-dml) estimate: the linear
+system, regression with interaction and simulation, and doubly robust
+machine learning. Section \@ref(sec-accounting) covers the regression
+decompositions applied papers use. Section \@ref(sec-endogenous) treats
+mediators with their own exogenous variation: instruments and the front
+door. Section \@ref(sec-multiple) covers several mediators and mediators
+built from text. Sections \@ref(sec-credibility) and \@ref(sec-practice)
+close with sensitivity, design, and a checklist. Proofs are in the
+appendix.
+
+# Graphs for mechanisms {#sec-graphs}
+
+## Chains, forks, colliders
+
+A directed acyclic graph (DAG) has one node per variable and one arrow per
+direct causal effect. Three patterns explain every rule we need
+(Chernozhukov et al. 2026, ch. 7; Lattimore, MS&E 228 lecture 9).
+
+- **Chain** $D \to M \to Y$. $D$ and $Y$ are dependent. Conditioning on
+  $M$ blocks the path.
+- **Fork** $D \leftarrow X \to Y$. $D$ and $Y$ are dependent through the
+  common cause. Conditioning on $X$ blocks the path.
+- **Collider** $D \to M \leftarrow U$. $D$ and $U$ are independent.
+  Conditioning on $M$ makes them dependent.
+
+A path is blocked if it contains a non-collider that is conditioned on, or
+a collider that is not conditioned on (and none of whose descendants is
+conditioned on). Two variables are d-separated given a set $S$ when every
+path between them is blocked given $S$. In a DAG compatible with the data,
+d-separation implies conditional independence.
+
+The collider rule is the one that bites in mediation. In Figure
+\@ref(fig:dags-basic), right panel, $D$ and $U$ are independent. Among
+units with the same $M$, a high $D$ must go with a low $U$ or $M$ would
+not be the same. Conditioning on $M$ creates a negative association
+between $D$ and $U$, and $U$ drives $Y$. That is the mechanism behind
+Figure \@ref(fig:bad-control).
+
+```{r dags-basic, echo = FALSE, fig.height = 2.8, fig.cap = "Left: the mediation graph with pre-treatment covariates X. Centre: the same graph with an unmeasured mediator-outcome confounder U (shaded). Right: the collider structure that conditioning on M activates: D and U are independent, but not among units with the same M."}
+patchwork::wrap_plots(
+  draw_dag(dag_mediation(), title = "Mediation"),
+  draw_dag(dag_mediation_u(), latent = "U", title = "With U"),
+  draw_dag(dag_collider(), latent = "U", title = "Collider at M"),
+  nrow = 1)
+```
+
+## The mediation graph and its confounders
+
+The centre panel of Figure \@ref(fig:dags-basic) is the object of the
+section. Four kinds of confounding can sit on it.
+
+1. $D$-$Y$ confounding: a common cause of the treatment and the outcome.
+   Randomization removes it.
+2. $D$-$M$ confounding: a common cause of the treatment and the mediator.
+   Randomization removes it.
+3. $M$-$Y$ confounding: a common cause of the mediator and the outcome,
+   the $U$ of the figure. Randomization of $D$ does nothing about it.
+4. $M$-$Y$ confounding by a variable that the treatment itself affects,
+   $L$ in Figure \@ref(fig:dags-post). This is the hardest case.
+
+```{r dags-post, echo = FALSE, fig.height = 2.8, fig.cap = "Left: a treatment-induced confounder L of the mediator and the outcome. Conditioning on L is needed for the M-Y relation and forbidden for the D-Y relation. Centre: an instrument Z for the mediator. Right: the front-door structure, where the D-Y confounder U is unobserved but M is unconfounded and carries the whole effect."}
+patchwork::wrap_plots(
+  draw_dag(dag_post_treatment(), title = "Treatment-induced L"),
+  draw_dag(dag_iv_mediator(), latent = "U", title = "Instrument for M"),
+  draw_dag(dag_front_door(), latent = "U", title = "Front door"),
+  nrow = 1)
+```
+
+## Good and bad controls {#sec-controls}
+
+Lecture 10 of MS&E 228 organizes the adjustment question around one rule:
+a set $S$ identifies the total effect of $D$ on $Y$ if it blocks every
+back-door path (paths that start with an arrow into $D$) and contains no
+descendant of $D$. Pre-treatment covariates that cause both $D$ and $Y$
+are good controls. Post-treatment variables are bad controls for the
+total effect, for two reasons.
+
+- A mediator blocks part of the effect. The coefficient on $D$ then
+  measures something between the total and the direct effect.
+- A collider opens a path. Conditioning on $M$ in Figure
+  \@ref(fig:dags-basic) opens $D \to M \leftarrow U \to Y$.
+
+`dagitty` computes adjustment sets from a graph. For the total effect of
+$D$ in the graph with $U$, the only valid set is $\{X\}$; for the effect
+of $M$ on $Y$ it needs $U$, which is unobserved.
+
+```{r adjustment-sets}
+g <- dag_mediation_u()
+dagitty::adjustmentSets(g, exposure = "D", outcome = "Y")
+dagitty::adjustmentSets(g, exposure = "M", outcome = "Y")
+```
+
+The wage-gap example of Chernozhukov et al. (2026, ch. 6) is the same
+question in different clothes. The gender coefficient in a wage regression
+falls when occupation and experience are added. Occupation and experience
+are post-treatment for gender. The drop is not a direct effect. It is the
+part of the gap that the added variables absorb, and it is a mechanism
+claim only under the assumptions of Section \@ref(sec-identification).
+
+## Structural equations and potential outcomes
+
+A nonparametric structural equation model writes each variable as a
+function of its parents and an error:
+$$
+M = f_M(D, X, e_M), \qquad Y = f_Y(D, M, X, e_Y).
+$$
+Potential outcomes are obtained by substitution: $M(d) = f_M(d, X, e_M)$,
+$Y(d, m) = f_Y(d, m, X, e_Y)$, and the composition $Y(d, M(d')) =
+f_Y(d, f_M(d', X, e_M), X, e_Y)$. Consistency links them to data: $M =
+M(D)$ and $Y = Y(D, M)$. The composition with $d \ne d'$ is the cross-world
+quantity. It is well defined in the model, but the data only show
+$Y(d, M(d))$.
+
+# Estimands {#sec-estimands}
+
+## Total effect and controlled direct effect
+
+The total effect is $TE = E[Y(1, M(1)) - Y(0, M(0))] = E[Y(1) - Y(0)]$.
+The controlled direct effect at mediator level $m$ is
+$$
+CDE(m) = E[Y(1, m) - Y(0, m)].
+$$
+It answers a policy question: if we could fix the mediator at $m$ for
+everyone, what would the treatment do? It depends on $m$ whenever the
+treatment and the mediator interact, and it does not decompose the total
+effect. Its identification only needs the two intervention-world
+assumptions of Section \@ref(sec-identification), which is why it survives
+treatment-induced confounders.
+
+## Natural direct and indirect effects
+
+The natural direct effect holds each unit's mediator at its own untreated
+value; the natural indirect effect moves the mediator while holding the
+treatment (Robins and Greenland 1992; Pearl 2001):
+$$
+NDE = E[Y(1, M(0)) - Y(0, M(0))], \qquad NIE = E[Y(1, M(1)) - Y(1, M(0))].
+$$
+Adding and subtracting $E[Y(1, M(0))]$ gives $TE = NDE + NIE$. Two other
+quantities come from the opposite reference levels:
+$$
+NDE^{tot} = E[Y(1, M(1)) - Y(0, M(1))], \qquad NIE^{pure} = E[Y(0, M(1)) - Y(0, M(0))],
+$$
+and $TE = NDE^{tot} + NIE^{pure}$ as well. VanderWeele (2015) calls
+$NDE$ the pure direct effect and $NIE$ the total indirect effect. When the
+treatment and the mediator do not interact the two decompositions
+coincide. When they do, the difference $NDE^{tot} - NDE$ is the mediated
+interaction, the part of the effect that needs both the treatment and the
+mediator change. Reporting both decompositions is cheap and avoids an
+arbitrary choice.
+
+The proportion mediated $NIE / TE$ is popular and fragile. It is a ratio,
+so its standard error is large when the total effect is small, and it is
+outside $[0, 1]$ whenever the direct and indirect effects have opposite
+signs, as in Cattan et al. (2025).
+
+## Path coefficients in linear systems
+
+In the linear system
+$$
+M = \alpha_0 + \alpha_1 D + X'\alpha_X + e_M, \qquad
+Y = \beta_0 + \beta_1 D + \beta_2 M + X'\beta_X + e_Y,
+$$
+substitution gives $Y(d, M(d')) = \beta_0 + \beta_1 d + \beta_2(\alpha_0 +
+\alpha_1 d' + X'\alpha_X + e_M) + X'\beta_X + e_Y$, so
+$$
+NDE = \beta_1, \qquad NIE = \alpha_1 \beta_2, \qquad TE = \beta_1 + \alpha_1 \beta_2, \qquad CDE(m) = \beta_1 \text{ for every } m.
+$$
+Wright's rules for path analysis say the same: effects along a path
+multiply, effects across paths add. Figure \@ref(fig:dag-paths) labels the
+edges.
+
+```{r dag-paths, echo = FALSE, fig.height = 2.6, out.width = "45%", fig.cap = "Path coefficients in the linear mediation model. The indirect effect is the product along the path through M, the direct effect is the coefficient on the direct edge, and the total effect is their sum."}
+draw_dag(ggdag::dagify(Y ~ D + M, M ~ D, coords = list(x = c(D = 0, M = 1, Y = 2), y = c(D = 0, M = 1, Y = 0))),
+         edge_labels = c("D->M" = "alpha1", "M->Y" = "beta2", "D->Y" = "beta1"))
+```
+
+## Wheeler's shares in this language {#sec-shares-def}
+
+Wheeler et al. (2022, Appendix C) report two shares of the employment
+effect explained by LinkedIn use. Their system is the linear one above
+with $\beta$ the coefficient on treatment in $Y \sim D$, $\gamma$ the
+treatment effect on the mediator, $\alpha$ the mediator coefficient in
+$Y \sim D + M$, and $\delta$ the mediator coefficient in the control
+group only:
+$$
+S_1 = \frac{\alpha \gamma}{\beta}, \qquad S_2 = \frac{\delta \gamma}{\beta}.
+$$
+$S_1$ is the proportion mediated of the linear model: $\alpha\gamma$ is
+the NIE and $\beta$ the total effect. $S_2$ replaces the mediator effect
+by its control-group value. Under the linear model without interaction
+$\alpha = \delta$ in population, and the two shares differ only by
+sampling error. When the mediator effect differs by treatment status,
+$\delta$ is the effect at the untreated level, so $S_2$ corresponds to the
+pure indirect effect over the total. Both shares carry the same
+identification burden: the mediator coefficient is causal only if the
+mediator is unconfounded given $D$ and the controls.
+
+# Identification {#sec-identification}
+
+## Sequential ignorability
+
+Imai, Keele, and Yamamoto (2010) state the assumption in two parts. For
+all $d, d', m$ and $x$ in the support,
+$$
+\text{(SI-1)} \quad \{Y(d', m), M(d)\} \perp D \mid X = x,
+\qquad
+\text{(SI-2)} \quad Y(d', m) \perp M(d) \mid D = d, X = x,
+$$
+with $0 < P(D = d \mid X = x)$ and $0 < p(M(d) = m \mid D = d, X = x)$.
+SI-1 says the treatment is ignorable given pre-treatment covariates. An
+experiment delivers it. SI-2 says that among units with the same
+treatment and covariates, the mediator is ignorable with respect to the
+potential outcomes. No experiment on $D$ delivers it. It rules out the
+$U$ of Figure \@ref(fig:dags-basic) and the $L$ of Figure
+\@ref(fig:dags-post): $X$ must be pre-treatment, so a treatment-induced
+confounder cannot be in it.
+
+Pearl (2001) and VanderWeele (2015) state four conditions: no unmeasured
+$D$-$Y$, $D$-$M$, and $M$-$Y$ confounding given $X$, and no $M$-$Y$
+confounder affected by $D$. SI-1 and SI-2 together imply them, and for the
+estimators of this section the two sets are interchangeable.
+
+## The mediation formula
+
+**Proposition 1.** Under sequential ignorability, for every $d, d'$,
+$$
+E[Y(d, M(d'))] = \int \int E[Y \mid D = d, M = m, X = x]\, dF_{M \mid D = d', X = x}(m)\, dF_X(x).
+$$
+
+*Skeleton.* Fix $x$. SI-1 lets us replace the distribution of $M(d')$ by
+the observed distribution of $M$ among units with $D = d'$. SI-2 lets us
+replace $E[Y(d, m) \mid M(d') = m, D = d, X = x]$ by $E[Y(d, m) \mid D = d,
+X = x]$: the potential outcome does not depend on which mediator value
+the unit would have had. SI-1 and consistency then give
+$E[Y \mid D = d, M = m, X = x]$. Integrate over $m$ and $x$. The formal
+proof is in Appendix \@ref(app-mediation-formula).
+
+Every estimator in Sections \@ref(sec-linear) to \@ref(sec-dml) is an
+estimator of this integral: plug-in regressions (Section
+\@ref(sec-linear)), simulation of the integral (Section
+\@ref(sec-interaction)), and an influence-function estimator whose bias is
+second order in the nuisance errors (Section \@ref(sec-dml)).
+
+## When it fails
+
+*Unmeasured $M$-$Y$ confounding.* SI-2 fails, and Figure
+\@ref(fig:bad-control) shows the consequence. Nothing in the data reveals
+the failure, so the response is sensitivity analysis: how strong must $U$
+be to explain the estimated indirect effect (Section
+\@ref(sec-sensitivity)).
+
+*Treatment-induced confounding.* When $L$ in Figure \@ref(fig:dags-post)
+exists, the natural effects are not identified without further
+restrictions, even with $L$ observed. Avin, Shpitser, and Pearl (2005)
+call $L$ a recanting witness: identification of the path $D \to M \to Y$
+needs $L$ held fixed on the $D \to L \to M$ part and free on the
+$D \to L \to Y$ part, and no adjustment does both. The controlled direct
+effect survives, because it only needs the intervention-world
+assumptions $Y(d, m) \perp D \mid X$ and $Y(d, m) \perp M \mid D, L, X$.
+Section \@ref(sec-cde) estimates it.
+
+*Interaction is not a failure.* The mediation formula holds with any
+interaction between $D$ and $M$. What changes is that the product of
+coefficients is no longer the right plug-in.
+
+## Designs that identify mediation
+
+Imai, Tingley, and Yamamoto (2013) list designs that replace SI-2 with
+experimental variation in the mediator.
+
+- **Parallel design.** One arm randomizes $D$ only; another randomizes
+  $D$ and sets $M$. The second arm identifies $E[Y(d, m)]$; together with
+  the first it bounds the natural effects, and identifies them if the
+  treatment does not interact with the mediator at the unit level.
+- **Crossover design.** Each unit is observed under $(d, M(d))$ and then
+  under $(d, M(1 - d))$ with the mediator set to its earlier value in the
+  other arm. It needs no carryover.
+- **Encouragement design.** The mediator is not set but encouraged, with
+  an instrument $Z$. This identifies effects among mediator compliers, and
+  the full decomposition under a homogeneity assumption. Cattan et al.
+  (2025) use the exam lottery as the encouragement (Section
+  \@ref(sec-iv)).
+- **Front-door structure.** When the treatment affects the outcome only
+  through the mediator and the mediator is unconfounded given $D$, the
+  effect is identified even with unmeasured $D$-$Y$ confounding (Section
+  \@ref(sec-front-door)).
+
+The first two are rare outside the laboratory. The last two are the
+applied economist's tools.
+
+# Estimation I: the linear system {#sec-linear}
+
+## Product of coefficients and the delta method
+
+The running example is the `linear` design of `sim_mediation()`. The
+mediator is $M = 0.5 + 1.2 D + 0.6 x_1 - 0.4 x_2 + e_M$ and the outcome is
+$Y = 1 + D + 0.9 M + 0.5 x_1 + 0.3 x_2 + e_Y$; the treatment probability
+depends on $x_1$ and $x_2$. The truth is $NDE = 1$, $NIE = 1.08$, $TE =
+2.08$.
+
+```{r linear-fit}
+dat <- sim_mediation(3000, dgp = "linear", seed = 1)
+fit_lin <- mediate_reg(dat, "y", "d", "m", x = c("x1", "x2"), method = "delta")
+fit_lin$effects[fit_lin$effects$term %in% c("total", "nde", "nie"), ]
+```
+
+```{r linear-check, echo = FALSE}
+a1 <- coef(lm(m ~ d + x1 + x2, data = dat))[["d"]]
+b2 <- coef(lm(y ~ d + m + x1 + x2, data = dat))[["m"]]
+nie_hat <- fit_lin$effects$estimate[fit_lin$effects$term == "nie"]
+```
+
+The indirect effect `r fmt(nie_hat, 3)` is exactly the product of the
+treatment coefficient in the mediator regression (`r fmt(a1, 3)`) and the
+mediator coefficient in the outcome regression (`r fmt(b2, 3)`). Its
+standard error is Sobel's (1982) delta-method formula
+$$
+\widehat{se}(\hat\alpha_1 \hat\beta_2) = \sqrt{\hat\alpha_1^2\, \widehat{var}(\hat\beta_2) + \hat\beta_2^2\, \widehat{var}(\hat\alpha_1)},
+$$
+which treats the two regressions as independent (Appendix
+\@ref(app-delta)). The simulation method of Section
+\@ref(sec-interaction) and the bootstrap give the same answer here to two
+decimals, and they also work when the models are nonlinear.
+
+```{r linear-methods}
+fit_sim <- mediate_reg(dat, "y", "d", "m", x = c("x1", "x2"), method = "simulation", seed = 1)
+fit_boot <- mediate_reg(dat, "y", "d", "m", x = c("x1", "x2"), method = "bootstrap", n_boot = 199, seed = 1)
+tibble::tibble(method = c("delta", "simulation", "bootstrap"),
+               nie = c(fit_lin$effects$std.error[3], fit_sim$effects$std.error[3], fit_boot$effects$std.error[3]))
+```
+
+## Wheeler's shares on the LinkedIn data {#sec-wheeler-shares}
+
+Appendix Table C1 of Wheeler et al. (2022) reports, for the LinkedIn
+account mediator, $\beta = 0.070$, $\gamma = 0.321$, $\alpha = 0.158$,
+$\delta = 0.146$, $S_1 = 0.729$ (0.306) and $S_2 = 0.672$ (0.266), with
+stratification-block fixed effects and standard errors clustered by
+cohort. `mediate_reg()` reproduces the table from the public data: the
+shares are in `shares`, and their standard errors come from the delta
+method on the stacked influence functions of the four regressions, which
+carries the cross-equation covariance as Stata's `suest` does.
+
+```{r wheeler-load, eval = have_wheeler}
+wh <- as.data.frame(haven::read_dta(wheeler_path))
+wh$strata <- factor(wh$strata)
+wh_acc <- wh[complete.cases(wh[, c("employed1_all", "treatment", "li_account")]), ]
+fit_wh <- mediate_reg(wh_acc, "employed1_all", "treatment", "li_account", x = "strata",
+                      method = "delta", cluster = "studref")
+fit_wh
+```
+
+```{r wheeler-table, eval = have_wheeler, echo = FALSE}
+wh_idx <- wh[complete.cases(wh[, c("employed1_all", "treatment", "summary_li_pca")]), ]
+fit_wh2 <- mediate_reg(wh_idx, "employed1_all", "treatment", "summary_li_pca", x = "strata",
+                       method = "delta", cluster = "studref")
+wh_row <- function(f) {
+  c(beta = coef(f$models$total)[["treatment"]], gamma = coef(f$models$mediator[[1]])[["treatment"]],
+    beta_tilde = coef(f$models$outcome)[["treatment"]], alpha = coef(f$models$outcome)[[f$spec$m]],
+    delta = coef(f$models$control)[[f$spec$m]], S1 = f$shares$estimate[2], S1_se = f$shares$std.error[2],
+    S2 = f$shares$estimate[3], S2_se = f$shares$std.error[3], n = f$n)
+}
+wh_tab <- tibble::tibble(
+  quantity = c("Treatment effect on employment (beta)", "Treatment effect on LinkedIn use (gamma)",
+               "Treatment effect on employment given LinkedIn use (beta tilde)",
+               "Employment-LinkedIn association given treatment (alpha)",
+               "Employment-LinkedIn association in the control group (delta)",
+               "S1 = alpha gamma / beta", "(se)", "S2 = delta gamma / beta", "(se)", "Sample size"),
+  paper_account = c("0.070", "0.321", "0.019", "0.158", "0.146", "0.729", "(0.306)", "0.672", "(0.266)", "1626"),
+  ours_account = { r <- wh_row(fit_wh); c(fmt(r[1:5], 3), fmt(r["S1"], 3), paste0("(", fmt(r["S1_se"], 3), ")"), fmt(r["S2"], 3), paste0("(", fmt(r["S2_se"], 3), ")"), r["n"]) },
+  paper_index = c("0.083", "0.954", "0.028", "0.058", "0.059", "0.668", "(0.253)", "0.678", "(0.259)", "1288"),
+  ours_index = { r <- wh_row(fit_wh2); c(fmt(r[1:5], 3), fmt(r["S1"], 3), paste0("(", fmt(r["S1_se"], 3), ")"), fmt(r["S2"], 3), paste0("(", fmt(r["S2_se"], 3), ")"), r["n"]) })
+kbl(wh_tab, booktabs = TRUE, linesep = "", col.names = c("", "Paper", "causalmetrics", "Paper", "causalmetrics"),
+    caption = "Appendix Table C1 of Wheeler et al. (2022) and its reproduction with mediate\\_reg(). Columns 2-3: LinkedIn account as the mediator; columns 4-5: the LinkedIn usage index. Standard errors clustered by cohort; block fixed effects in every regression.") %>%
+  add_header_above(c(" " = 1, "LinkedIn account" = 2, "Usage index" = 2)) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+```
+
+```{r wheeler-missing, eval = !have_wheeler, echo = FALSE, results = "asis"}
+cat("*The public data of Wheeler et al. (2022) are not available on this machine; the table is omitted.*\n")
+```
+
+The point estimates and the standard errors match the paper to three
+decimals. The reading is where the two papers diverge from the two
+functions: the shares say that, if LinkedIn use were as good as randomly
+assigned among trainees with the same block, about two thirds of the
+employment gain would run through it. The paper labels this a
+non-prespecified accounting under strong assumptions, and Section
+\@ref(sec-sensitivity) quantifies how strong.
+
+## Where linearity breaks
+
+The `interaction` design adds $0.8\, D M$ to the outcome equation. The
+product of coefficients has no place for this term. Table
+\@ref(tab:interaction-table) compares the linear plug-in with the
+regression that includes the interaction.
+
+```{r interaction-table, echo = FALSE}
+dat_int <- sim_mediation(3000, dgp = "interaction", seed = 2)
+tr_int <- attr(dat_int, "truth")
+fit_int_lin <- mediate_reg(dat_int, "y", "d", "m", x = c("x1", "x2"), method = "delta")
+fit_int <- mediate_reg(dat_int, "y", "d", "m", x = c("x1", "x2"), interaction = TRUE, seed = 1)
+terms <- c("total", "nde", "nie", "nde_total", "nie_pure", "cde")
+tibble::tibble(
+  estimand = c("Total", "NDE (pure)", "NIE (total)", "NDE (total)", "NIE (pure)", "CDE(0)"),
+  truth = unlist(tr_int[terms]),
+  `no interaction` = fit_int_lin$effects$estimate[match(terms, fit_int_lin$effects$term)],
+  `with interaction` = fit_int$effects$estimate[match(terms, fit_int$effects$term)],
+  `se` = fit_int$effects$std.error[match(terms, fit_int$effects$term)]) %>%
+  kbl(booktabs = TRUE, linesep = "", digits = 3,
+      caption = "The interaction design: truth, the product-of-coefficients plug-in, and the regression with a treatment-mediator interaction (simulation standard errors).") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+```{r interaction-numbers, echo = FALSE}
+nie_lin_err <- fit_int_lin$effects$estimate[fit_int_lin$effects$term == "nie"] - tr_int$nie
+nde_gap <- fit_int$effects$estimate[fit_int$effects$term == "nde_total"] - fit_int$effects$estimate[fit_int$effects$term == "nde"]
+```
+
+Without the interaction the total effect is still right, because $Y \sim
+D + X$ needs no mediator model, but the split is wrong: the plug-in NIE
+misses the truth by `r fmt(nie_lin_err, 2)`. With the interaction the two
+decompositions differ by `r fmt(nde_gap, 2)`, the mediated interaction,
+and the controlled direct effect at $m = 0$ is a different number from
+either natural direct effect.
+
+# Estimation II: regression with interaction and simulation {#sec-interaction}
+
+## Closed forms and the scale problem
+
+With the outcome model $Y = \beta_0 + \beta_1 D + \beta_2 M + \beta_3 D M
++ X'\beta_X + e_Y$ and the linear mediator model, substitution into the
+mediation formula gives (VanderWeele 2015, ch. 2)
+$$
+\begin{aligned}
+NDE &= \beta_1 + \beta_3\, E[\alpha_0 + X'\alpha_X], &
+NIE &= (\beta_2 + \beta_3)\, \alpha_1, \\
+NDE^{tot} &= \beta_1 + \beta_3\, E[\alpha_0 + \alpha_1 + X'\alpha_X], &
+NIE^{pure} &= \beta_2\, \alpha_1, \qquad CDE(m) = \beta_1 + \beta_3 m.
+\end{aligned}
+$$
+`mediate_reg(interaction = TRUE)` computes them by g-computation rather
+than by these formulas, so that the same code handles logistic models.
+
+Binary outcomes raise a scale question. A logistic outcome model has
+coefficients on the log-odds scale, and log-odds do not average: the
+population NDE on the risk-difference scale is not a function of the
+coefficients alone. VanderWeele and Vansteelandt (2010) give closed forms
+on the odds-ratio scale under a rare-outcome approximation. The package
+avoids the approximation by averaging predicted probabilities over the
+sample, which is the mediation formula on the probability scale. The
+`binary` design has a logistic mediator and a logistic outcome.
+
+```{r binary-fit}
+dat_bin <- sim_mediation(3000, dgp = "binary", seed = 3)
+fit_bin <- mediate_reg(dat_bin, "y", "d", "m", x = c("x1", "x2"),
+                       outcome = "logit", mediator = "logit", n_sim = 500, seed = 1)
+cbind(fit_bin$effects[1:3, 1:3], truth = unlist(attr(dat_bin, "truth")[c("total", "nde", "nie")]))
+```
+
+## The simulation algorithm as g-computation
+
+Imai, Keele, and Tingley (2010) estimate the mediation formula in three
+steps.
+
+1. Fit the mediator model and the outcome model; draw their coefficients
+   from the normal approximation to their sampling distribution (a
+   quasi-Bayesian step).
+2. For each draw and each unit, compute the mediator's distribution under
+   $d' = 0$ and $d' = 1$, then the expected outcome under each $(d, d')$
+   pair, integrating over the mediator when the outcome model is
+   nonlinear.
+3. Average over units to get $E[Y(d, M(d'))]$ for the draw; the effects
+   are differences; their spread across draws gives the intervals.
+
+This is g-computation (Robins 1986) with parametric models and a
+simulation-based variance. The `mediation` package of Tingley et al.
+(2014) implements it; `mediate_reg()` does the same with the interaction
+and logit variants and reports both decompositions. Figure
+\@ref(fig:sim-draws) shows the draws behind the intervals of the
+interaction design.
+
+```{r sim-draws, echo = FALSE, fig.height = 3.4, fig.cap = "The quasi-Bayesian draws behind the intervals: 1000 draws of the coefficients produce 1000 values of each effect; the bars are the 2.5 and 97.5 percent quantiles. Dashed lines are the truth of the interaction design."}
+draws <- causalmetrics:::.cm_with_seed(1, causalmetrics:::.cm_med_simulate(
+  causalmetrics:::.cm_med_fit(dat_int, fit_int$spec, NULL), dat_int, fit_int$spec, 1000))
+dd <- tibble::as_tibble(draws[, c("nde", "nie", "nde_total", "nie_pure")]) %>%
+  tidyr::pivot_longer(everything(), names_to = "effect", values_to = "value") %>%
+  mutate(effect = factor(effect, levels = c("nde", "nie", "nde_total", "nie_pure")))
+truth_df <- tibble::tibble(effect = factor(c("nde", "nie", "nde_total", "nie_pure"), levels = levels(dd$effect)),
+                           value = unlist(tr_int[c("nde", "nie", "nde_total", "nie_pure")]))
+ggplot(dd, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "#0072B2", alpha = 0.6) +
+  geom_vline(data = truth_df, aes(xintercept = value), linetype = "dashed") +
+  facet_wrap(~ effect, scales = "free_x", nrow = 1) +
+  labs(x = "Effect (draws)", y = NULL) + med_theme()
+```
+
+## Sensitivity to an unmeasured mediator-outcome confounder {#sec-sensitivity}
+
+Imai, Keele, and Yamamoto (2010, Theorem 3) parameterize the violation of
+SI-2 in the linear model by the correlation $\rho$ between $e_M$ and
+$e_Y$. The indirect effect as a function of $\rho$ is
+$$
+NIE(\rho) = \beta_2\, \frac{\sigma_1}{\sigma_2}\Big(\tilde\rho - \rho\sqrt{\frac{1 - \tilde\rho^2}{1 - \rho^2}}\Big),
+$$
+where $\beta_2$ is here the treatment effect on the mediator, $\sigma_1$
+and $\sigma_2$ are the residual standard deviations of $Y \sim D + X$ and
+$M \sim D + X$, and $\tilde\rho$ is the correlation of their residuals.
+At $\rho = 0$ the formula gives the product-of-coefficients estimate. The
+value $\rho_0$ where $NIE(\rho_0) = 0$ is the sensitivity parameter: an
+unmeasured confounder must induce an error correlation of at least
+$\rho_0$ in absolute value to erase the indirect effect.
+
+The `correlated_errors` design generates $\rho = 0.5$. The estimate at
+$\rho = 0$ is biased upward; the curve passes through the truth at the
+true $\rho$.
+
+```{r sensitivity-fit}
+dat_rho <- sim_mediation(4000, dgp = "correlated_errors", rho = 0.5, seed = 5)
+fit_rho <- mediate_reg(dat_rho, "y", "d", "m", x = c("x1", "x2"), method = "delta")
+sens <- mediate_sensitivity(fit_rho, rho = seq(-0.8, 0.8, by = 0.05))
+c(nie_at_0 = sens$curve$nie[sens$curve$rho == 0], nie_at_true = sens$curve$nie[sens$curve$rho == 0.5],
+  truth = attr(dat_rho, "truth")$nie, rho_zero = sens$rho_zero)
+```
+
+```{r sensitivity-plot, echo = FALSE, fig.height = 3.4, fig.cap = "The indirect effect as a function of the error correlation rho in the correlated-errors design. At rho = 0 (sequential ignorability) the estimate is the product of coefficients; the curve crosses the truth (dotted) at the design's rho = 0.5 and crosses zero at the value reported as rho zero."}
+plot_mediate_sensitivity(sens) +
+  geom_hline(yintercept = attr(dat_rho, "truth")$nie, linetype = "dotted") +
+  geom_vline(xintercept = 0.5, linetype = "dotted", colour = "#D55E00") +
+  annotate("text", x = 0.52, y = max(sens$curve$nie), label = "true rho", hjust = 0, size = 3, colour = "#D55E00")
+```
+
+```{r wheeler-sens, eval = have_wheeler}
+sens_wh <- mediate_sensitivity(fit_wh, rho = seq(-0.5, 0.5, by = 0.05))
+c(rho_zero = sens_wh$rho_zero, rho_tilde = sens_wh$rho_tilde)
+```
+
+```{r wheeler-sens-text, eval = have_wheeler, echo = FALSE, results = "asis"}
+cat(sprintf("On the LinkedIn data the indirect effect through account ownership vanishes at an error correlation of %s. An unmeasured trait that raises both account opening and employment, with that much residual correlation, would explain the whole share. That is a modest amount for a labour-market outcome, which is the quantitative version of the paper's caution.\n", fmt(sens_wh$rho_zero, 2)))
+```
+
+# Estimation III: doubly robust mediation with machine learning {#sec-dml}
+
+## Why two nuisances are not enough
+
+Section 04 estimated the average treatment effect with two nuisances, the
+propensity score and the outcome regression, and an influence function
+whose bias is the product of their errors. The mediation formula has a
+third layer. For $E[Y(1, M(0))]$ we need the outcome regression under
+treatment, $\mu_1(M, X) = E[Y \mid D = 1, M, X]$, averaged over the
+mediator distribution of the controls:
+$$
+\nu_{1,0}(X) = E[\mu_1(M, X) \mid D = 0, X].
+$$
+This nested regression is a regression of a fitted value. Tchetgen
+Tchetgen and Shpitser (2012) derive the efficient influence function for
+$E[Y(d, M(d'))]$, and Farbmacher, Huber, Laffers, Langen, and Spindler
+(2022) write it with propensity scores in place of mediator densities, so
+that the mediator can be continuous or multivariate:
+$$
+\psi_{d,d'} = \frac{1\{D = d\}\, p_{d'}(M, X)}{p_d(M, X)\, p_{d'}(X)}\,\big(Y - \mu_d(M, X)\big)
+ + \frac{1\{D = d'\}}{p_{d'}(X)}\,\big(\mu_d(M, X) - \nu_{d,d'}(X)\big) + \nu_{d,d'}(X),
+$$
+with $p_d(X) = P(D = d \mid X)$ and $p_d(M, X) = P(D = d \mid M, X)$. The
+ratio $p_{d'}(M, X) / (p_d(M, X)\, p_{d'}(X))$ equals $f(M \mid d', X) /
+(f(M \mid d, X)\, p_{d'}(X))$ by Bayes' rule (Appendix \@ref(app-eif)).
+Three corrections appear: the outcome residual reweighted to the
+mediator distribution of arm $d'$, the nested residual reweighted by the
+arm $d'$ propensity, and the plug-in.
+
+## Orthogonality and rates
+
+**Proposition 2.** $E[\psi_{d,d'}] = E[Y(d, M(d'))]$ under sequential
+ignorability, and the Gateaux derivative of $E[\psi_{d,d'}]$ with respect
+to each of the nuisances $(\mu_d, p_d(X), p_d(M, X), \nu_{d,d'})$ at their
+true values is zero. The estimator $\bar\psi_{d,d'}$ with cross-fitted
+nuisances is root-$n$ consistent and asymptotically normal when the
+products of the nuisance errors, $\|\hat\mu_d - \mu_d\| \cdot \|\hat p -
+p\|$ and $\|\hat\nu - \nu\| \cdot \|\hat p - p\|$, are $o(n^{-1/2})$.
+
+*Skeleton.* Take expectations term by term. The first term has mean zero
+because $E[Y - \mu_d(M, X) \mid D = d, M, X] = 0$; the second because
+$E[\mu_d(M, X) - \nu_{d,d'}(X) \mid D = d', X] = 0$; the third is the
+mediation formula. Perturb one nuisance at a time: each first-order term
+is killed by one of the two conditional-mean-zero facts, and what remains
+is a product of two errors. Cross-fitting removes the dependence between
+the nuisance fits and the scores. Appendix \@ref(app-eif) gives the
+algebra.
+
+The estimator is triply robust in the sense of Tchetgen Tchetgen and
+Shpitser: it is consistent if any two of the three nuisance groups
+(outcome model, mediator-related propensities, treatment propensity) are
+correct.
+
+## Cross-fitting and a Monte Carlo
+
+`mediate_dml()` cross-fits all nuisances with `mlr3` learners. The nested
+regression is the delicate step. In each fold the outcome model is
+trained on the $D = d$ units of the training folds; its predictions on
+the $D = d'$ units of the same training folds become the labels of the
+nested regression; and that regression is evaluated on the held-out fold.
+No observation's label enters its own nuisance. The default learners are
+linear and logistic regressions, which reproduce the linear system.
+
+```{r dml-linear}
+fit_dml <- mediate_dml(dat, "y", "d", "m", x = c("x1", "x2"), seed = 1)
+fit_dml$effects[1:3, ]
+```
+
+The `nonlinear` design has $\exp(0.5 x_1)$, $x_2^2$, $\cos(x_1)$, and
+$x_1 x_2$ in the mediator and outcome models, and a treatment-mediator
+interaction. Table \@ref(tab:dml-mc-table) reports `r n_sims_dml` simulations
+of `mediate_reg()` with an interaction, `mediate_dml()` with linear
+learners, and `mediate_dml()` with random forests.
+
+```{r dml-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_dml)}
+mc_dml <- mc_reg_vs_dml(n_sims = n_sims_dml, n = 1500)
+mc_dml_tab <- summarise_mc(mc_dml)
+```
+
+```{r dml-mc-table, echo = FALSE}
+mc_dml_tab %>%
+  mutate(estimator = factor(estimator, levels = c("Regression", "DML linear", "DML forest")),
+         term = toupper(term)) %>%
+  arrange(term, estimator) %>%
+  select(term, estimator, truth, bias, sd, rmse, coverage) %>%
+  kbl(booktabs = TRUE, linesep = "", digits = 3,
+      col.names = c("Effect", "Estimator", "Truth", "Bias", "SD", "RMSE", "Coverage"),
+      caption = paste0("Nonlinear design, n = 1500, ", n_sims_dml, " simulations: regression with interaction (simulation intervals), double machine learning with linear learners, and with random forests. Coverage of 95 percent intervals.")) %>%
+  collapse_rows(columns = 1, latex_hline = "major", valign = "top") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+```{r dml-mc-numbers, echo = FALSE}
+g <- function(est, term, col) mc_dml_tab[[col]][mc_dml_tab$estimator == est & mc_dml_tab$term == term]
+```
+
+The regression has an NIE bias of `r fmt(g("Regression", "nie", "bias"))`
+and coverage `r fmt_pct(g("Regression", "nie", "coverage"))`: a wrong
+mediator model puts the wrong distribution into the formula. Linear
+learners inside the influence function reduce the NIE bias to
+`r fmt(g("DML linear", "nie", "bias"))`, because the propensity
+corrections repair part of the outcome model's error, but the
+corrections are themselves misspecified, so the bias does not vanish and
+the NDE bias (`r fmt(g("DML linear", "nde", "bias"))`) is about the
+regression's (`r fmt(g("Regression", "nde", "bias"))`). Orthogonality
+protects against small nuisance errors, not against wrong models. Forests
+bring the biases to `r fmt(g("DML forest", "nde", "bias"))` and
+`r fmt(g("DML forest", "nie", "bias"))` with coverage
+`r fmt_pct(g("DML forest", "nde", "coverage"))` and
+`r fmt_pct(g("DML forest", "nie", "coverage"))`. Figure
+\@ref(fig:dml-mc-plot) shows the sampling distributions.
+
+```{r dml-mc-plot, echo = FALSE, fig.height = 3.4, fig.cap = "Sampling distributions of the natural direct and indirect effects in the nonlinear design. Dashed lines are the truth."}
+mc_dml %>%
+  mutate(estimator = factor(estimator, levels = c("Regression", "DML linear", "DML forest")), term = toupper(term)) %>%
+  ggplot(aes(x = estimate, fill = estimator)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  geom_vline(data = distinct(mc_dml, term, truth) %>% mutate(term = toupper(term)), aes(xintercept = truth), linetype = "dashed") +
+  facet_wrap(~ term, scales = "free") +
+  scale_fill_manual(values = med_colors[c("Regression", "DML linear", "DML forest")], name = NULL) +
+  labs(x = "Estimate", y = NULL) + med_theme()
+```
+
+## Controlled direct effects and treatment-induced confounders {#sec-cde}
+
+With a binary mediator, $E[Y(d, m)]$ has an AIPW score with the joint
+propensity $P(D = d, M = m \mid X)$, and `mediate_dml(m_ref = )` adds the
+controlled direct effect at $m$.
+
+```{r dml-cde}
+fit_dml_bin <- mediate_dml(dat_bin, "y", "d", "m", x = c("x1", "x2"), m_ref = 0, seed = 1)
+fit_dml_bin$effects[fit_dml_bin$effects$term %in% c("nde", "cde"), ]
+attr(dat_bin, "truth")$cde
+```
+
+When a treatment-induced confounder $L$ is present, Acharya, Blackwell,
+and Sen (2016) estimate the controlled direct effect in two steps.
+Regress $Y$ on $D$, $M$, $X$, and $L$; the mediator coefficient
+$\hat\delta$ is identified because $L$ is in the regression. Then form
+the demediated outcome $\tilde Y = Y - \hat\delta (M - m)$ and regress
+it on $D$ and $X$ only; $L$ is out, so the coefficient on $D$ is not a
+post-treatment partial coefficient. The bootstrap of both steps gives the
+standard errors. The `post_treatment_confounder` design has such an $L$
+(called `z` in the data).
+
+```{r cde-fit}
+dat_z <- sim_mediation(3000, dgp = "post_treatment_confounder", seed = 7)
+fit_cde <- mediate_cde(dat_z, "y", "d", "m", x_pre = c("x1", "x2"), x_post = "z", n_boot = 199, seed = 1)
+fit_cde$effects[fit_cde$effects$term %in% c("cde", "naive_direct"), ]
+attr(dat_z, "truth")$cde
+```
+
+The single regression that conditions on $L$ and $M$ together gives
+`r fmt(fit_cde$effects$estimate[fit_cde$effects$term == "naive_direct"])`
+for a truth of `r fmt(attr(dat_z, "truth")$cde)`: it removes the part of
+the direct effect that runs through $L$. The natural effects are not
+identified in this design at all, which is what the `truth` attribute
+records.
+
+# Mechanism accounting in regressions {#sec-accounting}
+
+## Add the mediators and watch the coefficient
+
+The most common mechanism exercise in applied economics adds candidate
+mediators to the outcome regression and reports how far the treatment
+coefficient falls. Figure \@ref(fig:sequential) does this in a design
+with two mediators that carry indirect effects of 0.8 and 0.6, a direct
+effect of 0.5, and mediator errors that share a common component, as
+they do whenever two channels respond to the same unobserved trait. The
+problem is visible: the drop attributed to each mediator depends on the
+order of addition, because the second mediator to enter only gets the
+part of the change that the first did not already absorb.
+
+```{r sequential, echo = FALSE, fig.height = 3.2, fig.cap = "The treatment coefficient as mediators are added one at a time, in two orders, in the correlated-mediators design (n = 3000). The drop attributed to m1 is different when it enters first and when it enters second."}
+dat_seq <- sim_correlated_mediators(3000, share = 0.8, seed = 4)
+seq_a <- sequential_coefficients(dat_seq, "y", "d", c("x1", "x2"), c("m1", "m2")) %>% mutate(order = "m1 then m2")
+seq_b <- sequential_coefficients(dat_seq, "y", "d", c("x1", "x2"), c("m2", "m1")) %>% mutate(order = "m2 then m1")
+seq_df <- bind_rows(seq_a, seq_b)
+ggplot(seq_df, aes(x = step, y = coefficient, colour = order)) +
+  geom_line() + geom_point(size = 2) +
+  geom_text(aes(label = added), vjust = -0.9, size = 3, show.legend = FALSE) +
+  scale_colour_manual(values = c("#0072B2", "#D55E00"), name = NULL) +
+  scale_x_continuous(breaks = 0:2) +
+  labs(x = "Covariates added", y = "Coefficient on D") + med_theme()
+```
+
+```{r sequential-numbers, echo = FALSE}
+drop_m1_first <- seq_a$coefficient[1] - seq_a$coefficient[2]
+drop_m1_second <- seq_b$coefficient[2] - seq_b$coefficient[3]
+```
+
+Adding `m1` first drops the coefficient by `r fmt(drop_m1_first)`; adding
+it second drops it by `r fmt(drop_m1_second)`. The indirect effect
+through `m1` is 0.8, and neither number has a claim to it.
+
+## Gelbach's decomposition
+
+Gelbach (2016) shows that the omitted-variable-bias formula assigns the
+change to each added covariate in a unique, order-independent way. With
+the base regression $Y \sim D + X_{base}$ and the full regression that adds
+$X_{add} = (Z_1, \dots, Z_K)$,
+$$
+\hat\beta^{base} - \hat\beta^{full} = \sum_{k=1}^K \hat\Gamma_k\, \hat\beta_k^{full},
+$$
+where $\hat\Gamma_k$ is the coefficient on $D$ in the auxiliary regression
+$Z_k \sim D + X_{base}$ and $\hat\beta_k^{full}$ is the coefficient of
+$Z_k$ in the full regression. The identity is exact in the sample
+(Appendix \@ref(app-gelbach)). Each term is the part of the change that
+covariate $k$ accounts for. In the design of Figure \@ref(fig:sequential)
+each term is also the indirect effect through that mediator, because the
+outcome model is linear and both mediators are in the full regression, so
+their coefficients are identified despite the shared error.
+
+```{r gelbach-fit}
+g_seq <- gelbach_decomp(dat_seq, "y", "d", x_base = c("x1", "x2"), x_add = c("m1", "m2"), n_boot = 199, seed = 1)
+g_seq
+```
+
+The decomposition is bookkeeping. It says how a coefficient moves when
+covariates enter; it says nothing about why unless the full regression
+identifies the mediator effects. That is the same condition as before.
+
+## Wheeler's mechanisms revisited {#sec-wheeler-gelbach}
+
+Table 6 of Wheeler et al. (2022) reports treatment effects on candidate
+mechanisms. Of the public ones, four are individual outcomes (placed in
+a targeted sector, placed through a partner firm, self-placed, completed
+the program) and two are indices (engagement, aspirations). A Gelbach
+decomposition of the end-of-program employment effect on these six
+variables tells us which of them absorb the coefficient. The indices are
+post-treatment; the decomposition is an accounting, in the sense of
+Section \@ref(sec-controls).
+
+```{r wheeler-gelbach, eval = have_wheeler, fig.height = 3.2, fig.cap = "Gelbach decomposition of the treatment coefficient on end-of-program employment in Wheeler et al. (2022), with the LinkedIn account indicator and five public mechanism variables added to the block-fixed-effects regression. Bars are contributions with cluster-bootstrap intervals."}
+mechs <- c("li_account", "targetsector", "harambee_partner_original", "selfplaced", "s2_completed", "summary_engage")
+wh_g <- wh[complete.cases(wh[, c("employed1_all", "treatment", mechs)]), ]
+g_wh <- gelbach_decomp(wh_g, "employed1_all", "treatment", x_add = mechs, fe = "strata",
+                       cluster = "studref", n_boot = 199, seed = 1)
+g_wh$coefficients
+g_wh$contributions[, c("covariate", "Gamma", "beta_full", "contribution", "share")]
+plot_gelbach(g_wh)
+```
+
+```{r wheeler-gelbach-text, eval = have_wheeler, echo = FALSE, results = "asis"}
+top <- g_wh$contributions[which.max(abs(g_wh$contributions$contribution)), ]
+acc <- g_wh$contributions[g_wh$contributions$covariate == "li_account", ]
+cat(sprintf("The base coefficient of %s falls to %s once the six variables enter. The largest single contribution is from `%s` (%s, or %s of the change). Placement channels are outcomes of the same job search that produces employment, so their contributions describe where the jobs came from rather than a mechanism that could be manipulated. The LinkedIn account now contributes %s, or %s of the change, against the %s share of Section \\@ref(sec-wheeler-shares): with the placement variables in the regression, the account's own coefficient is small because the placement variables sit downstream of it and absorb its effect. The order-invariant decomposition does not remove that dependence on which covariates are included.\n",
+            fmt(g_wh$coefficients$estimate[1], 3), fmt(g_wh$coefficients$estimate[2], 3), top$covariate, fmt(top$contribution, 3), fmt_pct(top$share),
+            fmt(acc$contribution, 3), fmt_pct(acc$share), fmt(fit_wh$shares$estimate[2], 2)))
+```
+
+# Endogenous mediators {#sec-endogenous}
+
+## The instrumental-variables system {#sec-iv}
+
+When the mediator is endogenous but an instrument $Z$ shifts it, Cattan
+et al. (2025) estimate three regressions with the same controls:
+$$
+\begin{aligned}
+M &= \delta_0 + \delta_1 D + \delta_2 Z + X'\delta_X + e_M && \text{(first stage)}, \\
+Y &= \gamma_0 + \gamma_1 D + \gamma_2 M + X'\gamma_X + e_Y, \quad M \text{ instrumented by } Z && \text{(second stage)}, \\
+Y &= \pi_0 + \pi_1 D + X'\pi_X + e && \text{(reduced form)}.
+\end{aligned}
+$$
+The direct effect is $\gamma_1$, the indirect effect is $\delta_1
+\gamma_2$, and the total effect is $\pi_1$. Adding $Z$ to the reduced
+form, the coefficient on $D$ equals $\gamma_1 + \delta_1 \gamma_2$ exactly
+(Appendix \@ref(app-delta)). Beyond instrument validity given $D$ and
+$X$, the decomposition needs the mediator effect $\gamma_2$ to be the same
+for the instrument's compliers and for the units whose mediator $D$
+moves. Huber (2019) and Dippel, Ferrara, and Heblich (2020) call this
+homogeneity; Cattan et al. check it by re-estimating $\gamma_2$ in
+subgroups (their Figure A13).
+
+The `iv_mediator` design has an unobserved $U$ that raises both $M$ and
+$Y$, a binary instrument, direct effect 0.8, and indirect effect
+$-0.6 \times 0.7 = -0.42$: a positive total made of opposite-signed parts,
+as in the elite-peers paper.
+
+```{r iv-fit}
+dat_iv <- sim_mediation(3000, dgp = "iv_mediator", seed = 6)
+fit_iv <- mediate_iv(dat_iv, "y", "d", "m", z = "z", x = c("x1", "x2"), n_boot = 199, seed = 1)
+fit_iv
+```
+
+```{r iv-numbers, echo = FALSE}
+iv_get <- function(t) fit_iv$effects$estimate[fit_iv$effects$term == t]
+iv_se <- function(t) fit_iv$effects$std.error[fit_iv$effects$term == t]
+iv_mc <- t(sapply(1:30, function(s) {
+  dd <- sim_mediation(3000, dgp = "iv_mediator", seed = 100 + s)
+  e <- mediate_iv(dd, "y", "d", "m", z = "z", x = c("x1", "x2"), n_boot = 0)$effects
+  c(direct = e$estimate[e$term == "direct"], mediator_effect = e$estimate[e$term == "mediator_effect"])
+}))
+```
+
+The naive mediator coefficient is `r fmt(iv_get("naive_mediator_effect"))`
+for a truth of 0.7, and the naive direct effect
+`r fmt(iv_get("naive_direct"))` for a truth of 0.8: $U$ inflates the
+mediator's coefficient and the collider at $M$ moves the treatment's.
+The instrumented system gives `r fmt(iv_get("mediator_effect"))` (standard
+error `r fmt(iv_se("mediator_effect"))`) and `r fmt(iv_get("direct"))`
+(standard error `r fmt(iv_se("direct"))`), which are
+`r fmt(abs(iv_get("mediator_effect") - 0.7) / iv_se("mediator_effect"), 1)` and
+`r fmt(abs(iv_get("direct") - 0.8) / iv_se("direct"), 1)` standard errors
+from the truth. Across 30 further samples of the design the direct
+effect averages `r fmt(mean(iv_mc[, "direct"]))` with standard deviation
+`r fmt(sd(iv_mc[, "direct"]))`, so the estimator is centred and the
+bootstrap standard error is about right.
+Figure \@ref(fig:iv-plot) shows the
+decomposition, and the homogeneity check below re-estimates the mediator
+effect by subgroup.
+
+```{r iv-plot, echo = FALSE, fig.height = 3, fig.cap = "Total, direct, and indirect effects in the instrumented-mediator design, with bootstrap intervals. The total effect is small because the two channels have opposite signs."}
+plot_mediation(fit_iv, terms = c("total", "direct", "indirect"))
+```
+
+```{r iv-homogeneity}
+dat_iv$group <- ifelse(dat_iv$x2 > 0, "x2 > 0", "x2 <= 0")
+mediate_iv(dat_iv, "y", "d", "m", z = "z", x = c("x1", "x2"), homogeneity_by = "group", n_boot = 49)$homogeneity
+```
+
+## Front-door adjustment {#sec-front-door}
+
+The right panel of Figure \@ref(fig:dags-post) has no valid back-door
+adjustment set: $U$ is unobserved. Pearl (1995) shows that the effect of
+$D$ on $Y$ is still identified when a mediator satisfies three
+conditions: $M$ intercepts every directed path from $D$ to $Y$; no
+unblocked back-door path from $D$ to $M$; and every back-door path from
+$M$ to $Y$ is blocked by $D$. Then
+$$
+E[Y(d)] = \sum_m P(m \mid d) \sum_{d'} E[Y \mid d', m]\, P(d'),
+$$
+with covariates $X$ added to every conditioning set (Appendix
+\@ref(app-front-door)). The formula chains two identified effects: $D$ on
+$M$ (no confounding), and $M$ on $Y$ with $D$ as the adjustment variable
+(because $D$ blocks $M \leftarrow D \leftarrow U \to Y$).
+
+Bellemare, Bloem, and Wexler (2020) give the applied reading with a
+ride-sharing example: the effect of a driver's tipping prompt on tips,
+with the mediator being whether the rider saw the prompt. The mediator
+must carry the whole effect, and that is the assumption to argue.
+`front_door()` estimates the formula by two regressions with a bootstrap,
+or by the influence-function estimator of Fulcher et al. (2020) for a
+binary mediator.
+
+```{r fd-fit}
+dat_fd <- sim_mediation(4000, dgp = "front_door", seed = 9)
+fd_reg <- front_door(dat_fd, "y", "d", "m", x = c("x1", "x2"), n_boot = 199, seed = 1)
+fd_reg$effects[1:2, ]
+fd_aipw <- front_door(dat_fd, "y", "d", "m", x = c("x1", "x2"), method = "aipw", seed = 1)
+fd_aipw$effects[1, ]
+attr(dat_fd, "truth")$total
+```
+
+```{r fd-mc, echo = FALSE, cache = TRUE, cache.extra = list(helper_md5, n_sims_fd)}
+mc_fd <- mc_front_door(n_sims = n_sims_fd, n = 2000)
+```
+
+```{r fd-plot, echo = FALSE, fig.height = 3.2, fig.cap = "Back-door regression and front-door estimate across repeated samples of the front-door design (n = 2000). The back-door regression adjusts for X only and is biased by the unobserved U; the front-door estimate centres on the truth (dashed)."}
+mc_fd %>% tidyr::pivot_longer(c(front_door, backdoor), names_to = "estimator", values_to = "estimate") %>%
+  mutate(estimator = factor(estimator, levels = c("backdoor", "front_door"), labels = c("Back door (Y ~ D + X)", "Front door"))) %>%
+  ggplot(aes(x = estimate, fill = estimator)) +
+  geom_density(alpha = 0.6, colour = NA) +
+  geom_vline(xintercept = mean(mc_fd$truth), linetype = "dashed") +
+  scale_fill_manual(values = c("grey60", "#009E73"), name = NULL) +
+  labs(x = "Estimate of the total effect", y = NULL) + med_theme()
+```
+
+## What the two have in common
+
+The instrument and the front door both give the mediator a source of
+variation that the outcome equation cannot see except through the
+mediator. With an instrument, that source is $Z$. With the front door,
+it is the treatment itself, once we grant that $D$ has no other route to
+$Y$. In both cases the estimator multiplies an effect of something on $M$
+by an effect of $M$ on $Y$ estimated with a different conditioning set.
+The credibility of the result is the credibility of the exclusion.
+
+# Multiple and latent mediators {#sec-multiple}
+
+## Parallel mediators
+
+With mediators $M_1, \dots, M_J$ that do not cause each other, the joint
+natural indirect effect is $E[Y(1, M_1(1), \dots, M_J(1)) - Y(1, M_1(0),
+\dots, M_J(0))]$, and the mediator-specific effect moves one mediator at
+a time. `mediate_reg()` accepts a vector of mediators and reports both.
+The sum of the specific effects equals the joint effect when the outcome
+model is additive in the mediators.
+
+```{r parallel-fit}
+dat_par <- sim_mediation(3000, dgp = "parallel", seed = 4)
+fit_par <- mediate_reg(dat_par, "y", "d", c("m1", "m2"), x = c("x1", "x2"), n_sim = 500, seed = 1)
+fit_par$effects[fit_par$effects$term %in% c("total", "nde", "nie", "nie_m1", "nie_m2"), ]
+unlist(attr(dat_par, "truth")[c("nde", "nie", "nie_m1", "nie_m2")])
+```
+
+Sequential ignorability must now hold for the mediator vector, and it
+must be that no mediator affects another. If $M_1$ causes $M_2$, the
+effect through $M_1$ includes the part relayed by $M_2$, and the
+mediator-specific effects need the path-specific machinery of Avin,
+Shpitser, and Pearl (2005), which is beyond this section. Figure
+\@ref(fig:dag-parallel) draws the assumption.
+
+```{r dag-parallel, echo = FALSE, fig.height = 2.4, out.width = "40%", fig.cap = "Parallel mediators: each is caused by D and causes Y, and neither causes the other."}
+draw_dag(dag_parallel())
+```
+
+## Mediators from text
+
+Zhang, Li, and Allenby (2024) ask why consumers reject cultivated meat.
+The treatments are information conditions, the outcome is a purchase
+choice, and the mediators are what respondents wrote in an open-ended
+answer. A seeded topic model turns each answer into shares of three
+topics fixed in advance (animal welfare, disgust, sustainability) and one
+free topic. The treatment shifts the prior over topic shares, and the
+shares enter a logistic outcome model, with an optional direct path.
+Everything is estimated in one Markov chain Monte Carlo run.
+
+The structure is the parallel-mediator model of the previous subsection
+with mediators that are latent. Two ways to estimate it:
+
+- **Integrated.** The authors' approach. The topic shares and the
+  mediation parameters are drawn jointly, so the uncertainty in the
+  mediator construction propagates into the effects.
+- **Two-step.** Fit the seeded topic model, take posterior mean shares as
+  mediator values, and run `mediate_reg()` with a logit outcome and the
+  shares as parallel mediators. Simpler and transparent, but the shares
+  are measured with error, and measurement error in a mediator attenuates
+  its coefficient and pushes the missing part into the direct effect.
+
+The replication note in the notes repository runs the two-step version
+on their data and compares it with the paper's Tables 4 to 7. For the
+lecture the point is the identification burden, which is the same as for
+any mediator: the topics must be unconfounded with the choice given the
+treatment. Text is measured after treatment and describes reasons the
+respondent chose to give, so the assumption is that what they wrote and
+what they chose share no unmeasured cause beyond the treatment.
+
+# Sensitivity, design, and credibility {#sec-credibility}
+
+## Reporting sensitivity
+
+A mediation estimate under sequential ignorability should come with the
+value of $\rho_0$ from Section \@ref(sec-sensitivity), or with an
+equivalent bound. VanderWeele (2015, ch. 3) gives bias formulas in terms
+of the strength of an unmeasured $U$ on $Y$ and its prevalence difference
+across mediator levels. Ding and VanderWeele's E-value has a mediation
+version: the minimum strength of association that $U$ needs with both $M$
+and $Y$ to explain away the indirect effect. All three say the same
+thing in different units. The lecture's advice is to report one and to
+compare it with the strength of the observed covariates, which puts the
+number on a scale the reader knows.
+
+## Designing for mechanisms
+
+- Measure candidate mediators before the outcome, and pre-register the
+  list. Wheeler et al. note that none of their mechanism analysis was
+  prespecified; a registered list turns a mechanism story into a test.
+- Randomize an encouragement for the mediator whenever the budget allows
+  a second arm. An instrument for $M$ is worth more than any covariate.
+- When the mediator is a choice, look for institutional randomness that
+  moves it, as the exam lottery does for grades.
+- Collect the intermediate confounders. If a treatment-induced $L$ is
+  plausible, the controlled direct effect is the estimand to report.
+
+## Graphs as statements, not as evidence
+
+Imbens (2020) argues that graphs have had little influence in economics
+because the identifying restrictions economists trust are about
+behaviour and design, not about arrows between variables. The reply from
+the graphical side is that a graph makes those restrictions explicit and
+checkable. Both are right. In this section the graph did two jobs: it
+showed why a post-treatment control fails, and it listed the assumptions
+that an estimator needs. It cannot tell us whether $U$ exists. The
+credibility of a mediation claim rests on the argument for SI-2, the
+instrument, or the exclusion, and the graph is the place to write that
+argument down.
+
+# Practice {#sec-practice}
+
+## Replications and anchors
+
+Three papers anchor this section; their replication notes live next to
+the lecture in the notes repository.
+
+- **Wheeler, Garlick, Johnson, Shaw, and Gargano (2022), LinkedIn
+  training.** The public data reproduce Table C1 with `mediate_reg()`
+  (Section \@ref(sec-wheeler-shares)) and support the Gelbach
+  decomposition of Section \@ref(sec-wheeler-gelbach). The LinkedIn usage
+  measures that build the intensive-margin indices are not in the public
+  release.
+- **Cattan, Salvanes, and Tominey (2025), elite peers.** The registry data
+  are not public. The replication note audits the code path and runs
+  `mediate_iv()` on the authors' simulated data to reproduce the
+  structure of their Table 4: first stage, instrumented second stage, and
+  the decomposition panel.
+- **Zhang, Li, and Allenby (2024), text mediators.** The data and seed
+  lists are public. The replication note fits the seeded topic model and
+  runs the two-step version with `mediate_reg()`, next to the authors'
+  integrated estimates.
+
+## A mechanisms checklist
+
+1. State which estimand answers the question: total, controlled direct,
+   natural direct and indirect, or an accounting of a coefficient change.
+2. Draw the graph, mark what is observed, and say where sequential
+   ignorability could fail. Name the candidate $U$ and $L$.
+3. If $D$ is randomized, report the total effect and the effect on each
+   candidate mediator first. These need no mediation assumption.
+4. For natural effects, fit `mediate_reg()` with and without the
+   interaction and `mediate_dml()` with flexible learners; report both
+   decompositions and the proportion mediated with its standard error.
+5. Report the sensitivity parameter $\rho_0$ and compare it with the
+   observed covariates' strength.
+6. If an instrument for the mediator exists, run `mediate_iv()` and the
+   homogeneity check. If the front-door structure is credible, run
+   `front_door()` and argue the exclusion.
+7. If a treatment-induced confounder exists, report the controlled direct
+   effect from `mediate_cde()` and say that natural effects are not
+   identified.
+8. For regression decompositions, use `gelbach_decomp()` rather than
+   sequential addition, and label the result as accounting unless the
+   full regression is argued to identify the mediator effects.
+
+# Appendix {#sec-appendix}
+
+## The mediation formula under sequential ignorability {#app-mediation-formula}
+
+Fix $x$. By SI-1, $M(d') \perp D \mid X$, so the distribution of $M(d')$
+given $X = x$ equals the distribution of $M(d')$ given $D = d', X = x$,
+which by consistency is the distribution of $M$ given $D = d', X = x$.
+Next,
+$$
+E[Y(d, M(d')) \mid X = x] = \int E[Y(d, m) \mid M(d') = m, X = x]\, dF_{M(d') \mid X = x}(m).
+$$
+By SI-1 again, $\{Y(d, m), M(d')\} \perp D \mid X$, so conditioning on
+$D = d$ changes nothing: $E[Y(d, m) \mid M(d') = m, X = x] = E[Y(d, m)
+\mid M(d') = m, D = d, X = x]$. By SI-2, $Y(d, m) \perp M(d') \mid D = d,
+X = x$, so this equals $E[Y(d, m) \mid D = d, X = x]$. A third
+application of SI-2 with $d' = d$ gives $Y(d, m) \perp M(d) \mid D = d,
+X = x$, hence $E[Y(d, m) \mid D = d, X = x] = E[Y(d, m) \mid M(d) = m,
+D = d, X = x] = E[Y \mid D = d, M = m, X = x]$ by consistency. Substitute
+and integrate over $x$.
+
+The positivity conditions ensure that every conditional expectation is
+defined on the support of $(D, M, X)$.
+
+## The efficient influence function and its orthogonality {#app-eif}
+
+*Bayes' rule for the density ratio.* $f(M \mid d', X) / f(M \mid d, X) =
+\{P(D = d' \mid M, X) / P(D = d')\} \cdot \{P(D = d \mid X) / P(D = d \mid
+M, X)\}$ after cancelling $f(M \mid X)$, so
+$$
+\frac{f(M \mid d', X)}{f(M \mid d, X)\, p_{d'}(X)} = \frac{p_{d'}(M, X)}{p_d(M, X)\, p_{d'}(X)}
+\cdot \frac{p_d(X)}{p_{d'}(X)} \cdot \frac{p_{d'}(X)}{p_d(X)},
+$$
+and the last two factors cancel. This is the weight in $\psi_{d,d'}$.
+
+*Unbiasedness.* Write $\psi_{d,d'} = A + B + \nu_{d,d'}(X)$ with $A$ the
+outcome-residual term and $B$ the nested-residual term. $E[A \mid D = d,
+M, X] = w(M, X)\, E[Y - \mu_d(M, X) \mid D = d, M, X] = 0$ and $A = 0$
+when $D \ne d$, so $E[A] = 0$. $E[B \mid D = d', X] = p_{d'}(X)^{-1}\,
+E[\mu_d(M, X) - \nu_{d,d'}(X) \mid D = d', X] = 0$ by the definition of
+$\nu$, so $E[B] = 0$. $E[\nu_{d,d'}(X)] = E[Y(d, M(d'))]$ by the
+mediation formula.
+
+*Orthogonality.* Perturb the nuisances by $\epsilon$ in the direction of
+a fixed alternative and differentiate $E[\psi_{d,d'}]$ at $\epsilon = 0$.
+
+- Perturbing $\mu_d$ by $\epsilon h$: the change in $A$ is $-\epsilon\,
+  E[w(M, X) 1\{D = d\} h(M, X)] = -\epsilon\, E[p_d(X)\, w\, h]$ after
+  conditioning on $(M, X)$; the change in $B$ is $+\epsilon\,
+  E[1\{D = d'\} p_{d'}(X)^{-1} h(M, X)] = \epsilon\, E[E[h(M, X) \mid
+  D = d', X]]$. Using the density-ratio identity, $E[p_d(X)\, w(M, X)\,
+  h(M, X) \mid X] = E[h(M, X) \mid D = d', X]$, so the two changes cancel.
+- Perturbing $\nu_{d,d'}$ by $\epsilon k$: $B$ changes by $-\epsilon\,
+  E[1\{D = d'\} p_{d'}(X)^{-1} k(X)] = -\epsilon E[k(X)]$ and the plug-in
+  by $+\epsilon E[k(X)]$.
+- Perturbing the propensities: the weights multiply residuals whose
+  conditional means are zero at the true $\mu$ and $\nu$, so the
+  derivative is zero.
+
+The remainder after the first-order terms is a sum of products of two
+nuisance errors, which gives the rate condition of Proposition 2. The
+cross-fitted estimator inherits the asymptotic variance $\mathrm{var}(\psi_{d,d'})$,
+and the effects are differences of the four $\bar\psi_{d,d'}$ with
+variances computed from the differences of the influence functions.
+
+*Controlled direct effect.* For a binary mediator, $E[Y(d, m)]$ is
+identified by $E[E[Y \mid D = d, M = m, X]]$ under the intervention-world
+assumptions, and its influence function is the AIPW score with the joint
+propensity $P(D = d, M = m \mid X) = p_d(X)\, P(M = m \mid D = d, X)$.
+
+## Delta-method variances for products and ratios {#app-delta}
+
+For an estimator $\hat\theta$ of $\theta = (\theta_1, \dots, \theta_K)$ with
+covariance $V$ and a differentiable $g$, $\widehat{var}(g(\hat\theta)) =
+\nabla g(\hat\theta)' V \nabla g(\hat\theta)$.
+
+- *Sobel.* $g = \alpha_1 \beta_2$ with $\alpha_1$ and $\beta_2$ from
+  separate regressions treated as independent: $\nabla g = (\beta_2,
+  \alpha_1)$, so $\widehat{var} = \beta_2^2 v_{\alpha_1} + \alpha_1^2
+  v_{\beta_2}$. The two regressions share the sample, but their
+  coefficient estimates are asymptotically uncorrelated when the
+  mediator model is correctly specified, which is why the formula works
+  in the linear case.
+- *Shares.* $S_1 = \alpha\gamma/\beta$ with $(\beta, \gamma, \alpha)$ from
+  three regressions on the same sample: $\nabla S_1 = S_1\,(-1/\beta,
+  1/\gamma, 1/\alpha)$. The covariance $V$ across regressions is the
+  covariance of the stacked influence functions $n^{-1} \sum_i
+  (X_i'X_i/n)^{-1} X_i e_i$ of the three coefficient vectors, clustered
+  when needed. `mediate_reg()` computes it this way; it is what Stata's
+  `suest` does.
+- *IV decomposition.* With the reduced form including $Z$, $Y = \pi_0 +
+  \pi_1 D + \pi_2 Z + X'\pi_X + e$, two-stage least squares satisfies
+  $\hat\pi_1 = \hat\gamma_1 + \hat\gamma_2 \hat\delta_1$ and $\hat\pi_2 =
+  \hat\gamma_2 \hat\delta_2$ exactly, because the second-stage fitted
+  values are linear in the first-stage coefficients. The bootstrap of
+  the whole system in `mediate_iv()` gives the variance of $\hat\delta_1
+  \hat\gamma_2$ without the cross-equation covariance formula.
+
+## Gelbach's identity {#app-gelbach}
+
+Let $W = (1, D, X_{base})$ and $Z$ the $n \times K$ matrix of added
+covariates. The full regression $Y = W b + Z c + e$ with OLS residual $e$
+orthogonal to $W$ and $Z$. Regress both sides on $W$ alone: the OLS
+coefficient of $Y$ on $W$ is $b + (W'W)^{-1} W' Z\, c + (W'W)^{-1} W' e$,
+and the last term is zero. The middle term is $\sum_k \hat\Gamma_{k} c_k$
+where $\hat\Gamma_{k} = (W'W)^{-1} W' Z_k$ is the coefficient vector of
+$Z_k$ on $W$. Taking the $D$ component gives $\hat\beta^{base} -
+\hat\beta^{full} = \sum_k \hat\Gamma_{k, D}\, \hat c_k$. The identity is
+algebraic, so it holds in every sample and for every ordering of the
+added covariates. With fixed effects, replace all variables by their
+within-transformed versions; `gelbach_decomp()` does this through
+`fixest`.
+
+## Front-door identification {#app-front-door}
+
+In the graph $D \to M \to Y$, $D \leftarrow U \to Y$, with $U$ unobserved.
+The effect of $D$ on $M$ is identified by $P(m \mid d)$, because the only
+back-door path $D \leftarrow U \to Y \leftarrow M$ is blocked at the
+collider $Y$. The effect of $M$ on $Y$ is identified by adjusting for
+$D$, because $D$ blocks the back-door path $M \leftarrow D \leftarrow U
+\to Y$ and $D$ is not a descendant of $M$: $P(y \mid do(m)) = \sum_{d'}
+P(y \mid m, d') P(d')$. Chaining, since $D$ affects $Y$ only through $M$,
+$P(y \mid do(d)) = \sum_m P(m \mid d)\, P(y \mid do(m)) = \sum_m P(m
+\mid d) \sum_{d'} P(y \mid m, d') P(d')$. Taking expectations gives the
+formula of Section \@ref(sec-front-door); adding observed covariates $X$
+to every term is immediate. The influence function of Fulcher et al.
+(2020) for $E[Y(d)]$ with a binary mediator is
+$$
+\varphi_d = \frac{f(M \mid d, X)}{f(M \mid D, X)}\,\big(Y - \mu(D, M, X)\big)
+ + \frac{1\{D = d\}}{p_d(X)}\,\big(\xi(M, X) - \eta_d(X)\big) + \eta_d(X),
+$$
+with $\mu(d', m, x) = E[Y \mid d', m, x]$, $\xi(m, x) = \sum_{d'} \mu(d', m,
+x)\, P(d' \mid x)$, and $\eta_d(x) = \sum_m f(m \mid d, x)\, \xi(m, x)$;
+its orthogonality follows the same pattern as Appendix \@ref(app-eif).
+
+## References
+
+- Acharya, Avidit, Matthew Blackwell, and Maya Sen. 2016. "Explaining Causal Findings Without Bias: Detecting and Assessing Direct Effects." *American Political Science Review*.
+- Avin, Chen, Ilya Shpitser, and Judea Pearl. 2005. "Identifiability of Path-Specific Effects." *IJCAI*.
+- Baron, Reuben M., and David A. Kenny. 1986. "The Moderator-Mediator Variable Distinction in Social Psychological Research." *Journal of Personality and Social Psychology*.
+- Bellemare, Marc F., Jeffrey R. Bloem, and Noah Wexler. 2020. "The Paper of How: Estimating Treatment Effects Using the Front-Door Criterion." Working paper.
+- Cattan, Sarah, Kjell G. Salvanes, and Emma Tominey. 2025. "First-Generation Elite: The Role of School Social Networks." *American Economic Review*.
+- Chernozhukov, Victor, Christian Hansen, Nathan Kallus, Martin Spindler, and Vasilis Syrgkanis. 2026. *Applied Causal Inference Powered by ML and AI*, chapters 6 to 8.
+- Childers, David. 2024. "Causal Graphs." Lecture notes.
+- Dippel, Christian, Andreas Ferrara, and Stephan Heblich. 2020. "Causal Mediation Analysis in Instrumental-Variables Regressions." *Stata Journal*.
+- Farbmacher, Helmut, Martin Huber, Lukas Laffers, Henrika Langen, and Martin Spindler. 2022. "Causal Mediation Analysis with Double Machine Learning." *The Econometrics Journal*.
+- Fulcher, Isabel R., Ilya Shpitser, Stella Marealle, and Eric J. Tchetgen Tchetgen. 2020. "Robust Inference on Population Indirect Causal Effects: The Generalized Front Door Criterion." *Journal of the Royal Statistical Society, Series B*.
+- Gelbach, Jonah B. 2016. "When Do Covariates Matter? And Which Ones, and How Much?" *Journal of Labor Economics*.
+- Huber, Martin. 2019. "A Review of Causal Mediation Analysis for Assessing Direct and Indirect Treatment Effects." IZA Discussion Paper 12660.
+- Imai, Kosuke, Luke Keele, and Dustin Tingley. 2010. "A General Approach to Causal Mediation Analysis." *Psychological Methods*.
+- Imai, Kosuke, Luke Keele, and Teppei Yamamoto. 2010. "Identification, Inference and Sensitivity Analysis for Causal Mediation Effects." *Statistical Science*.
+- Imai, Kosuke, Dustin Tingley, and Teppei Yamamoto. 2013. "Experimental Designs for Identifying Causal Mechanisms." *Journal of the Royal Statistical Society, Series A*.
+- Imbens, Guido W. 2020. "Potential Outcome and Directed Acyclic Graph Approaches to Causality." *Journal of Economic Literature*.
+- Lattimore, Finnian. MS&E 228 lectures 8 to 10: structural equation models, DAGs, valid adjustment sets.
+- Pearl, Judea. 1995. "Causal Diagrams for Empirical Research." *Biometrika*.
+- Pearl, Judea. 2001. "Direct and Indirect Effects." *UAI*.
+- Robins, James M. 1986. "A New Approach to Causal Inference in Mortality Studies." *Mathematical Modelling*.
+- Robins, James M., and Sander Greenland. 1992. "Identifiability and Exchangeability for Direct and Indirect Effects." *Epidemiology*.
+- Sobel, Michael E. 1982. "Asymptotic Confidence Intervals for Indirect Effects in Structural Equation Models." *Sociological Methodology*.
+- Tchetgen Tchetgen, Eric J., and Ilya Shpitser. 2012. "Semiparametric Theory for Causal Mediation Analysis." *Annals of Statistics*.
+- Tingley, Dustin, Teppei Yamamoto, Kentaro Hirose, Luke Keele, and Kosuke Imai. 2014. "mediation: R Package for Causal Mediation Analysis." *Journal of Statistical Software*.
+- VanderWeele, Tyler J. 2015. *Explanation in Causal Inference: Methods for Mediation and Interaction*. Oxford University Press.
+- VanderWeele, Tyler J., and Stijn Vansteelandt. 2010. "Odds Ratios for Mediation Analysis for a Dichotomous Outcome." *American Journal of Epidemiology*.
+- Wheeler, Laurel, Robert Garlick, Eric Johnson, Patrick Shaw, and Marissa Gargano. 2022. "LinkedIn(to) Job Opportunities: Experimental Evidence from Job Readiness Training." *AEJ: Applied Economics*.
+- Zhang, Judy (Zijing), H. Alice Li, and Greg M. Allenby. 2024. "Using Text Analysis in Parallel Mediation Analysis." *Marketing Science*.

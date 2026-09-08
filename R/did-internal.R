@@ -390,7 +390,13 @@ utils::globalVariables(c(
   mat <- as.matrix(cs$mat)
   V <- crossprod(mat) / n^2
   est <- estimates[keep]
+  df <- length(keep)
   stat <- tryCatch(as.numeric(t(est) %*% solve(V, est)), error = function(e) NA_real_)
-  list(statistic = stat, df = length(keep),
-       p.value = if (is.finite(stat)) stats::pchisq(stat, df = length(keep), lower.tail = FALSE) else NA_real_)
+  if (!is.finite(stat) || .cm_rcond(V) < 1e-12) {
+    # singular covariance (collinear estimates): generalized inverse and rank as df
+    stat <- as.numeric(t(est) %*% .cm_ginv(V) %*% est)
+    df <- qr(V)$rank
+  }
+  list(statistic = stat, df = df,
+       p.value = if (is.finite(stat)) stats::pchisq(stat, df = df, lower.tail = FALSE) else NA_real_)
 }

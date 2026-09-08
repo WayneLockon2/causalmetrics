@@ -1,0 +1,526 @@
+---
+title: "Replication: Targeting for Long-Term Outcomes"
+subtitle: "Yang, Eckles, Dhillon, and Aral (2024), Management Science 70(6), on the authors' synthetic data"
+author: "Weiheng Zhang"
+date: "`r Sys.Date()`"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    keep_tex: false
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+link-citations: true
+params:
+  data_path: "/Users/waynezhang/Documents/note/R/R_package/causalmetrics/data_raw/08_Heterogeneous_Treatment_Effects_and_Policy_Learning/yang2024targeting/"
+  n_boot: 1000
+  n_bts: 200
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE, comment = "#>", fig.align = "center", fig.pos = "H",
+  fig.width = 7, fig.height = 4.2, out.width = "90%", dpi = 150,
+  message = FALSE, warning = FALSE, echo = TRUE
+)
+default_chunk_hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- default_chunk_hook(x, options)
+  paste0("\\footnotesize\n\n", x, "\n\n\\normalsize\n")
+})
+pkg_root <- normalizePath(file.path("..", "..", ".."), mustWork = FALSE)
+if (file.exists(file.path(pkg_root, "DESCRIPTION"))) {
+  devtools::load_all(pkg_root, quiet = TRUE)
+} else {
+  library(causalmetrics)
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+library(mlr3)
+library(mlr3learners)
+data_path <- params$data_path
+fmt <- function(x, digits = 2) formatC(x, digits = digits, format = "f")
+tab_style <- function(k) kable_styling(k, latex_options = "hold_position", font_size = 9)
+# The authors' figure style (their notebooks 3 and 6): points and a line by
+# month, solid 75 percent and dashed 95 percent bars, dashed zero line.
+authors_theme <- function() theme_bw(base_size = 11) + theme(panel.grid.minor = element_blank())
+```
+
+# The paper and the question
+
+Yang, Eckles, Dhillon, and Aral (2024) want a rule that assigns a
+discount to digital subscribers of *The Boston Globe* so as to maximize
+long-term (18-month or 3-year) revenue. The difficulty is that the
+long-term outcome is not observed when the rule has to be chosen. Their
+answer has three steps.
+
+1. **Surrogate index.** On historical data where the long-term outcome is
+   observed, fit $\tilde Y = E_H[Y \mid S, X]$ with gradient boosting, where
+   $S$ are surrogates observed in the first one to six months after treatment
+   (revenue and articles read by section) and $X$ are pre-treatment
+   covariates. Impute $\tilde Y$ for every subscriber in the experiment.
+   Under ignorability, surrogacy, and comparability, the value of any policy
+   on $\tilde Y$ equals its value on $Y$ (their Propositions 1 and 2); for
+   the *optimal* policy, only sign preservation of the conditional average
+   treatment effect is needed (Proposition 3).
+2. **Doubly robust scores and policy optimization.** Cross-fit outcome
+   models $\hat\mu(x, a)$ for $\tilde Y$, use the known design propensities
+   $\pi_D(a \mid x)$, form the scores of their equation (19),
+   $$
+   \hat\gamma_a(X_i) = \hat\mu(X_i, a) + \frac{\mathbb{1}\{A_i = a\}}{\pi_D(a \mid X_i)}\,\big(\tilde Y_i - \hat\mu(X_i, a)\big),
+   $$
+   and solve the cost-sensitive classification of equation (21) with a
+   gradient-boosting classifier.
+3. **Off-policy evaluation.** Value of the learned rule on a held-out test
+   sample by the doubly robust estimator of equation (17), against the status
+   quo of treating no one, with percentile intervals from 1,000 bootstrap
+   draws.
+
+The doubly robust score is the same object as the pseudo-outcome of Section
+08 of the lecture notes, and every step below is one function of the package
+applied to it. Their published results: the policy treats 21 percent of
+subscribers and is worth about $40 per subscriber over three years (95
+percent interval [$10, $75]); policies learned on surrogates from months 2
+to 6 beat the status quo, policies learned on short-term revenue alone do
+not, and the six-month surrogate policy is statistically indistinguishable
+from the policy learned on realized 18-month revenue (their Figure 3).
+
+# The synthetic data and what they allow
+
+The real data are under a non-disclosure agreement. The authors provide a
+synthetic file with 1,000 rows sampled from Experiment 1 and regenerated
+with `synthpop` (their notebook 5), revenues rescaled by an undisclosed
+constant. The treatment and design propensity columns are kept from the
+original rows; every other column is synthesized. The file contains the
+outputs of the authors' steps 1 and 2 that need data we do not have: the
+surrogate index of 18-month revenue built from the first $m = 1, \dots, 6$
+months of surrogates (`rev_m`), and their cross-fitted outcome models
+(`y0_m`, `y1_m`). What it does not contain: the realized 18-month revenue,
+short-term revenue, Experiment 2, and the historical data. So the
+replication runs steps 2 and 3, exactly what the authors' notebook 6 does on
+the same file, and their notebook's figure is the number to match. Table 1,
+Figure 3(a)'s true-revenue reference, and Figures 3(c) and 3(d) cannot be
+produced from these data.
+
+```{r data}
+dat <- read.csv(file.path(data_path, "synthetic.csv"))
+x_all <- setdiff(names(dat), c("subscriber_id", "treated", "p_treated",
+                               grep("^rev_|^y0_|^y1_", names(dat), value = TRUE)))
+x_cov <- x_all[sapply(dat[x_all], function(v) length(unique(v)) > 1)]
+c(n = nrow(dat), treated = sum(dat$treated), covariates = length(x_cov),
+  dropped_constant = length(x_all) - length(x_cov))
+```
+
+```{r tab-desc, echo = FALSE}
+desc <- bind_rows(
+  tibble(Variable = "Design propensity p_treated", Mean = mean(dat$p_treated), SD = sd(dat$p_treated),
+         Min = min(dat$p_treated), Max = max(dat$p_treated)),
+  tibble(Variable = "Risk score (predicted churn)", Mean = mean(dat$risk_score), SD = sd(dat$risk_score),
+         Min = min(dat$risk_score), Max = max(dat$risk_score)),
+  tibble(Variable = "Articles read, last 6 months", Mean = mean(dat$last_6month), SD = sd(dat$last_6month),
+         Min = min(dat$last_6month), Max = max(dat$last_6month)),
+  bind_rows(lapply(1:6, function(m) {
+    v <- dat[[paste0("rev_", m)]]
+    tibble(Variable = paste0("Surrogate index of 18-month revenue, ", m, "-month surrogates"),
+           Mean = mean(v), SD = sd(v), Min = min(v), Max = max(v))
+  }))
+)
+desc %>% mutate(across(where(is.numeric), ~ formatC(.x, digits = 3, format = "fg", flag = "#"))) %>%
+  kbl(booktabs = TRUE, linesep = "", caption = "Synthetic Experiment 1 data: 1,000 subscribers, 16 treated. Revenues are rescaled by an undisclosed constant.") %>%
+  tab_style()
+```
+
+Only 16 subscribers are treated, with design propensities between
+`r fmt(min(dat$p_treated), 3)` and `r fmt(max(dat$p_treated), 2)`. Every
+treated observation therefore carries an inverse-propensity weight of the
+order of `r round(1 / median(dat$p_treated[dat$treated == 1]))`, and every
+value estimate below is noisy. That is the synthetic file's nature, not a
+choice.
+
+## The design
+
+In the real experiment the design policy assigned subscribers with higher
+predicted churn to treatment with higher probability, keeping
+$0 < \pi_D < 1$ for everyone. In the synthetic file the propensity is the
+original one but the risk score is synthesized, so the link between them is
+broken (correlation `r fmt(cor(dat$p_treated, dat$risk_score))`). Figure
+\@ref(fig:design) shows both facts: propensities spread over two orders of
+magnitude, and no relation to the synthesized risk score.
+
+```{r design, echo = FALSE, fig.height = 3.4, fig.cap = "Design propensity of treatment by treatment status (left) and against the synthesized risk score (right), log scales."}
+p1 <- ggplot(dat, aes(p_treated, fill = factor(treated, labels = c("control", "treated")))) +
+  geom_histogram(bins = 30, position = "identity", alpha = 0.6) +
+  scale_x_log10() + labs(x = "design propensity (log scale)", y = "subscribers", fill = NULL) +
+  authors_theme() + theme(legend.position = "bottom")
+p2 <- ggplot(dat, aes(risk_score, p_treated, colour = factor(treated, labels = c("control", "treated")))) +
+  geom_point(alpha = 0.5, size = 0.9) + scale_x_log10() + scale_y_log10() +
+  scale_colour_manual(values = c(control = "grey60", treated = "black")) +
+  labs(x = "risk score (log scale)", y = "design propensity (log scale)", colour = NULL) +
+  authors_theme() + theme(legend.position = "bottom")
+patchwork::wrap_plots(p1, p2)
+```
+
+# Step 1, which we cannot run: the surrogate index
+
+The authors regress 3-year (or 18-month) revenue on covariates and on the
+first $m$ months of surrogates in historical data from 2015 to 2018 with
+`xgboost` (depth 2, 150 rounds), then predict for the experiment's
+subscribers. The synthetic file supplies the prediction, `rev_m`, for each
+horizon. Two things about this step matter for reading the results.
+
+- Comparability (their Assumption 3) requires the conditional distribution
+  of long-term revenue given surrogates to be the same in the historical and
+  the experimental data. It is untestable here and the paper's own
+  validation (Figure 3(a), 3(d)) is the evidence.
+- Because the same surrogate index is the outcome at every step, a policy
+  learned on `rev_m` is evaluated on `rev_m`. The paper's real validation
+  evaluates on realized revenue instead; on the synthetic file that
+  validation is out of reach.
+
+# Step 2: doubly robust scores with `dr_scores()` {#sec-scores}
+
+Their equation (19) with two arms and the known design propensity is the
+AIPW pseudo-outcome of `dr_scores()` with the nuisances supplied and no
+clipping. We build one scores object per horizon and check the formula
+against the authors' notebook line by line.
+
+```{r scores}
+make_scores <- function(m, rows = seq_len(nrow(dat))) {
+  d <- dat[rows, ]
+  d$y <- d[[paste0("rev_", m)]]
+  d$mu0 <- d[[paste0("y0_", m)]]
+  d$mu1 <- d[[paste0("y1_", m)]]
+  dr_scores(d, y = "y", d = "treated", x = x_cov,
+            p_hat = "p_treated", mu0_hat = "mu0", mu1_hat = "mu1", p_clip = c(0, 1))
+}
+sc <- lapply(1:6, make_scores)
+# the authors' construction (notebook 6): y0_dr, y1_dr, tau_dr
+authors_tau <- function(m) {
+  with(dat, {
+    y <- dat[[paste0("rev_", m)]]; y0 <- dat[[paste0("y0_", m)]]; y1 <- dat[[paste0("y1_", m)]]
+    y0_dr <- ifelse(treated == 1, y0, y0 + (y - y0) / (1 - p_treated))
+    y1_dr <- ifelse(treated == 0, y1, y1 + (y - y1) / p_treated)
+    y1_dr - y0_dr
+  })
+}
+max(sapply(1:6, function(m) max(abs(sc[[m]]$score - authors_tau(m)))))
+```
+
+The scores agree to machine precision. Their mean is the doubly robust ATE;
+the ATT uses the same nuisances with the score of Section 04. The paper's
+Figure 3(a) plots the ATT on the surrogate index by horizon against the ATT
+on realized revenue; Figure \@ref(fig:fig-att) reproduces the layout without the
+reference line.
+
+```{r att}
+effects <- bind_rows(lapply(1:6, function(m) {
+  d <- sc[[m]]$data
+  att <- est_aipw(d, "y", "treated", p_hat = "p_treated", mu0_hat = "mu0", mu1_hat = "mu1",
+                  estimand = "ATT", p_clip = c(1e-6, 1 - 1e-6))
+  tibble(month = m,
+         ATE = sc[[m]]$ate$estimate, ATE_se = sc[[m]]$ate$std.error,
+         ATT = att$estimate, ATT_se = att$std.error)
+}))
+effects %>% mutate(across(-month, ~ round(.x, 2)))
+```
+
+```{r fig-att, echo = FALSE, fig.height = 3.6, fig.cap = "Treatment effects on the surrogate index of 18-month revenue by the number of months of surrogates used, in the layout of the paper's Figure 3(a): ATT (points), 75 percent (solid) and 95 percent (dashed) normal intervals from the influence function. The paper's horizontal reference lines need realized revenue, which the synthetic file does not contain."}
+ggplot(effects, aes(month, ATT)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_errorbar(aes(ymin = ATT - qnorm(0.975) * ATT_se, ymax = ATT + qnorm(0.975) * ATT_se), width = 0, linetype = "dashed") +
+  geom_errorbar(aes(ymin = ATT - qnorm(0.925) * ATT_se, ymax = ATT + qnorm(0.925) * ATT_se), width = 0, linewidth = 0.9) +
+  geom_line() + geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:6) +
+  labs(x = "month", y = "treatment effect on 18-month revenue (dollars)") + authors_theme()
+```
+
+Two features of these estimates carry over to everything below. The point
+estimates grow with the horizon, as in the paper, where the effect of an
+eight-week discount is only visible once the surrogates cover the months
+after it ends. And the standard errors grow with the horizon too, because
+the outcome models fit the later surrogate indices less well
+(`r paste0("R2 of mu0: ", paste(sapply(1:6, function(m) fmt(sc[[m]]$diagnostics$nuisance["mu0", "r2"])), collapse = ", "))`).
+
+# Step 3: policy optimization with `policy_learn()`
+
+The authors split the file 80/20 with seed 101 (`train_id <- sort(sample(n,
+0.8 n))`), and fit `mlr`'s cost-sensitive weighted-pairs wrapper around an
+`xgboost` classifier with pre-tuned hyperparameters, using the misclassification
+costs `(max(tau, 0), max(-tau, 0))` for the two actions. With two actions
+that wrapper is weighted classification with label $\mathbb{1}\{\hat\tau_i > 0\}$
+and weight $|\hat\tau_i|$, which is what `policy_learn(method = "classifier")`
+fits. We use the same split and hyperparameters, and add two policy classes
+the paper does not consider: the depth-two policy tree of Athey and Wager
+(2021), and the budgeted rule that treats the top share of a DR-learner
+CATE at the share the boosting policy chooses.
+
+```{r split}
+set.seed(101)
+train_id <- sort(sample(nrow(dat), nrow(dat) * 0.8))
+test_id <- setdiff(seq_len(nrow(dat)), train_id)
+sc_train <- lapply(1:6, make_scores, rows = train_id)
+sc_test <- lapply(1:6, make_scores, rows = test_id)
+xgb_learner <- lrn("classif.xgboost", predict_type = "prob", eval_metric = "logloss",
+                   eta = 0.3, max_depth = 6, gamma = 0, colsample_bytree = 0.6,
+                   min_child_weight = 1, subsample = 1, nrounds = 150, nthread = 1)
+rf_final <- lrn("regr.ranger", num.trees = 500, min.node.size = 20)
+```
+
+```{r policies}
+# Not cached: knitr's chunk cache drops the task backend of mlr3 learners,
+# after which they can no longer predict. Fitting takes about a minute.
+fit_policies <- function(m) {
+  set.seed(101)
+  xgb <- policy_learn(sc_train[[m]], x = x_cov, method = "classifier", learner = xgb_learner, holdout = 0)
+  tree <- policy_learn(sc_train[[m]], x = x_cov, method = "tree", depth = 2, engine = "policytree", holdout = 0)
+  cate <- cate_learner(scores = sc_train[[m]], x_het = x_cov, method = "dr", learner_final = rf_final)
+  share <- max(mean(predict(xgb, sc_test[[m]]$data)), 0.05)
+  budget <- policy_learn(sc_train[[m]], method = "budget", budget = share, tau_hat = cate, holdout = 0)
+  list(xgboost = xgb, tree = tree, budget = budget, cate = cate)
+}
+pols <- lapply(1:6, fit_policies)
+```
+
+```{r tab-policies, echo = FALSE}
+pol_tab <- bind_rows(lapply(1:6, function(m) {
+  bind_rows(lapply(c("xgboost", "tree", "budget"), function(k) {
+    p <- pols[[m]][[k]]
+    v <- policy_value(sc_test[[m]], p)
+    tibble(month = m, class = k,
+           share_train = mean(p$assign), share_test = v$share_treated,
+           value_train = p$value$value_vs_none[1], value_test = v$estimate, se_test = v$std.error)
+  }))
+}))
+pol_tab %>%
+  mutate(class = recode(class, xgboost = "Gradient boosting (paper)", tree = "Policy tree, depth 2", budget = "Top share by DR-learner CATE"),
+         across(c(share_train, share_test), ~ fmt(.x, 2)),
+         across(c(value_train, value_test, se_test), ~ fmt(.x, 2))) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Month", "Policy class", "Share treated (train)", "Share treated (test)", "Value, train", "Value, test", "SE, test"),
+      caption = "Policies optimized on the surrogate index built from the first m months, by policy class. Values are dollars per subscriber over treating no one, doubly robust, on the 800 training and 200 test rows.") %>%
+  tab_style() %>%
+  collapse_rows(columns = 1, valign = "top", latex_hline = "major")
+```
+
+The boosting policy treats between
+`r fmt(100 * min(pol_tab$share_test[pol_tab$class == "xgboost"]), 0)` and
+`r fmt(100 * max(pol_tab$share_test[pol_tab$class == "xgboost"]), 0)` percent
+of the test subscribers depending on the horizon (the paper: 21 percent on
+the real data with 3-year revenue). The training value of every class is
+optimistic, the boosting classifier's most of all: with 150 rounds of depth
+six it fits the training scores almost perfectly. The test values are the
+ones to read.
+
+# Step 4: off-policy evaluation with `policy_value()`
+
+Their equation (17) evaluated for a deterministic rule against the rule that
+treats no one is the difference of two means of scores, so it is the mean
+of $\pi(X_i)\,\hat\gamma_i$ with $\hat\gamma_i$ the doubly robust CATE
+score; that is what `policy_value()` returns, with a standard error from
+the influence function. The authors use 1,000 bootstrap draws of the test
+rows and report 75 and 95 percent percentile intervals; `n_boot` adds them.
+
+```{r evaluate, cache = TRUE}
+eval_tab <- bind_rows(lapply(1:6, function(m) {
+  v <- policy_value(sc_test[[m]], pols[[m]]$xgboost, n_boot = params$n_boot, seed = 101)
+  B <- attr(v, "boot")[, 1]
+  tibble(month = m, estimate = v$estimate, se_if = v$std.error,
+         if_low = v$conf.low, if_high = v$conf.high,
+         boot_se = v$boot.se, boot_95_low = v$boot.low, boot_95_high = v$boot.high,
+         boot_75_low = quantile(B, 0.125), boot_75_high = quantile(B, 0.875))
+}))
+```
+
+```{r tab-evaluate, echo = FALSE}
+eval_tab %>% mutate(across(-month, ~ fmt(.x, 2))) %>%
+  select(month, estimate, se_if, if_low, if_high, boot_se, boot_95_low, boot_95_high) %>%
+  kbl(booktabs = TRUE, linesep = "", col.names = c("Month", "Value", "SE (IF)", "95\\% low (IF)", "95\\% high (IF)", "SE (boot)", "95\\% low (boot)", "95\\% high (boot)"), escape = FALSE,
+      caption = "Value of the boosting policy over treating no one on the 200 test rows: influence-function (IF) intervals from policy\\_value() and percentile intervals from 1,000 bootstrap draws of the test rows, the authors' construction.") %>%
+  tab_style()
+```
+
+```{r fig3b, echo = FALSE, fig.height = 4, fig.width = 5, out.width = "60%", fig.cap = "Value of the policy optimized on the surrogate index built from the first m months, relative to treating no one, in the layout of the paper's Figure 3(b) and of the authors' notebook 6: solid bars are 75 percent and dashed bars 95 percent bootstrap percentile intervals (1,000 draws of the test rows)."}
+ggplot(eval_tab, aes(month, estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_errorbar(aes(ymin = boot_95_low, ymax = boot_95_high), width = 0, linetype = "dashed") +
+  geom_errorbar(aes(ymin = boot_75_low, ymax = boot_75_high), width = 0, linewidth = 0.9) +
+  geom_line() + geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:6) +
+  labs(x = "month", y = "difference in policy value (dollars per user)") +
+  authors_theme()
+```
+
+```{r fig3b-authors, echo = FALSE, out.width = "45%", fig.cap = "The same figure as produced by the authors' notebook 6 on the same file with the same split (image embedded in their notebook)."}
+knitr::include_graphics(file.path(data_path, "authors_notebook6_figure.png"))
+```
+
+The two figures agree in shape and scale. The authors' values are about
+1.3, 3.5, 2.7, 3.2, 4.8, and 4.1 dollars per user for months 1 to 6; ours
+are `r paste(fmt(eval_tab$estimate, 1), collapse = ", ")`. Both start near
+$1 at one month and rise to $4 to $5 by month 5; ours dip at months 3 and 4
+where theirs do not. Their 95 percent intervals exclude zero from month 2
+on; ours do at months
+`r paste(eval_tab$month[eval_tab$boot_95_low > 0], collapse = ", ")`. The
+differences come from the gradient-boosting fit, which is not identical
+across `xgboost` versions and draws its column subsamples at random, not
+from the scores, which are identical. One slip in the authors'
+notebook 6 is corrected here: their month-3 policy is optimized on `rev_6`
+with the month-3 outcome models, a copy-paste error absent from their
+notebook 3; we use `rev_3`.
+
+Influence-function and bootstrap standard errors agree to within
+`r fmt(100 * max(abs(eval_tab$se_if - eval_tab$boot_se) / eval_tab$se_if), 0)`
+percent, as they should for a sample mean. The bootstrap costs 1,000
+predictions per policy and buys nothing here; it is the right tool when the
+statistic is not a mean, for instance when the policy itself is refitted in
+each draw (Section \@ref(sec-bts)).
+
+The paper reports values against treating no one because that was the
+status quo. The other natural benchmark is treating everyone:
+
+```{r all}
+bind_rows(lapply(c(2, 6), function(m) {
+  cbind(month = m, policy_value(sc_test[[m]], pols[[m]]$xgboost, baseline = "all")[, c("share_treated", "estimate", "std.error")])
+}))
+```
+
+Against treating everyone the learned rule loses in point estimate, by an
+amount within one standard error of zero. The reason is Section
+\@ref(sec-scores): the average effect of the discount on the surrogate
+index is positive at every horizon, so treating everyone earns the ATE per
+subscriber, and a rule that treats a fifth to a half of them captures less
+than that in these data. The paper's status quo was treating no one, so its
+values do not answer this question; the real data, with an ATE that is a
+few dollars against a discount cost the surrogate index nets out, may well
+differ. A firm should report both benchmarks.
+
+# Beyond the paper: validating the CATE signal
+
+The policy's value says that the rule's sign is informative. The
+diagnostics of Section 08 ask more of the CATE model behind it. On the test
+scores at six months we validate the DR-learner from the budgeted rule
+(a random forest on the scores). With about three treated subscribers among
+the 200 test rows, the honest expectation is wide intervals.
+
+```{r validate}
+val <- cate_validate(sc_test[[6]], pols[[6]]$cate, n_groups = 4, n_boot = 499, seed = 1)
+val$blp
+val$areas
+```
+
+```{r validate-plot, echo = FALSE, fig.height = 3.6, fig.cap = "Validation of the DR-learner CATE on the test rows (six-month surrogate index). Left: doubly robust group average effect by quartile of predicted CATE against the mean prediction. Right: TOC curve with pointwise (dotted) and one-sided simultaneous (shaded) 95 percent lower bounds."}
+patchwork::wrap_plots(plot_cate_validation(val, "calibration"), plot_cate_validation(val, "toc"))
+```
+
+The curves are wide and the heterogeneity slope is imprecise, as expected
+with 16 treated subscribers in the file. The exercise still shows what a
+targeting paper can report next to a policy value: whether the ranking that
+the policy uses is calibrated, and at what share of the population the
+targeting gain is concentrated.
+
+# Beyond the paper: what the policy looks at
+
+The paper's Online Appendix D.4 reports variable importance and partial
+dependence of the boosting policy on the real data (top variables: risk
+score, tenure, sports articles in the last six months; non-monotone
+relations). The fitted classifier is available as `$model`, so the same
+tools apply.
+
+```{r importance}
+imp <- xgboost::xgb.importance(model = pols[[6]]$xgboost$model$model)
+head(imp, 10)
+```
+
+```{r pdp, echo = FALSE, fig.height = 3.2, fig.cap = "Share of subscribers the six-month boosting policy treats as one covariate is moved over its range with the others held at their observed values (partial dependence on the test rows), for the three variables closest to the paper's Appendix D.4: risk score, total articles in the last six months (the file has no tenure), and sports articles in the last six months."}
+pd <- function(pol, data, variable, grid) {
+  share <- sapply(grid, function(g) { d <- data; d[[variable]] <- g; mean(predict(pol, d)) })
+  tibble(var = variable, x = as.numeric(grid), share = share)
+}
+test_data <- sc_test[[6]]$data
+pd_tab <- bind_rows(
+  pd(pols[[6]]$xgboost, test_data, "risk_score", quantile(dat$risk_score, seq(0.02, 0.98, by = 0.04))),
+  pd(pols[[6]]$xgboost, test_data, "last_6month", quantile(dat$last_6month, seq(0.02, 0.98, by = 0.04))),
+  pd(pols[[6]]$xgboost, test_data, "sports_last_6month", quantile(dat$sports_last_6month, seq(0.02, 0.98, by = 0.04)))
+) %>% mutate(var = factor(var, levels = c("risk_score", "last_6month", "sports_last_6month"),
+                          labels = c("risk score", "articles, last 6 months", "sports articles, last 6 months")))
+ggplot(pd_tab, aes(x, share)) + geom_line() + geom_point(size = 1) +
+  facet_wrap(~ var, scales = "free_x") +
+  labs(x = NULL, y = "share treated by the policy") + authors_theme()
+```
+
+A depth-two policy tree is the transparent alternative. It is fitted to the
+same scores (Table \@ref(tab:tab-policies) gives its value) and can be
+read directly:
+
+```{r tree-print}
+pols[[6]]$tree$model
+```
+
+# Beyond the paper: bootstrap Thompson sampling {#sec-bts}
+
+Section 4.2.3 of the paper implements the learned policy in Experiment 2
+with exploration: a subscriber is treated with probability equal to the
+share of bootstrap replicates in which the refitted policy treats them
+(their equation 23). We refit the boosting classifier on `r params$n_bts`
+resamples of the training rows and read off the exploration probabilities on
+the test rows.
+
+```{r bts, cache = TRUE}
+bts <- replicate(params$n_bts, {
+  idx <- sample(train_id, length(train_id), replace = TRUE)
+  sc_b <- make_scores(6, rows = idx)
+  pol_b <- policy_learn(sc_b, x = x_cov, method = "classifier", learner = xgb_learner, holdout = 0)
+  predict(pol_b, test_data)
+})
+pi_bts <- rowMeans(bts)
+c(mean_treat_prob = mean(pi_bts), share_interior = mean(pi_bts > 0.1 & pi_bts < 0.9),
+  agreement_with_point_policy = mean((pi_bts > 0.5) == (predict(pols[[6]]$xgboost, test_data) == 1)))
+```
+
+```{r bts-plot, echo = FALSE, fig.height = 3, fig.cap = "Bootstrap Thompson sampling probabilities of treatment on the test rows: the share of refitted policies that treat each subscriber."}
+ggplot(tibble(p = pi_bts), aes(p)) + geom_histogram(bins = 20, fill = "grey70", colour = "grey30") +
+  labs(x = "probability of treatment under bootstrap Thompson sampling", y = "test subscribers") + authors_theme()
+```
+
+`r round(100 * mean(pi_bts > 0.1 & pi_bts < 0.9))` percent of the test
+subscribers have a treatment probability strictly between 0.1 and 0.9: with
+16 treated units the policy is uncertain for more than half of the
+population, and the exploration this induces is what allows a second
+experiment to improve on it.
+
+# What the workflow teaches
+
+- **One object.** The doubly robust score built once in Step 2 is the ATE
+  and ATT (its mean), the label of the policy classifier (its sign and
+  magnitude), the value of any rule (its mean over the treated set), the
+  outcome of every validation statistic, and the reward of the bootstrap
+  Thompson sampling loop. `dr_scores()` reproduces the authors' scores to
+  machine precision; every later number is a different average of the same
+  vector.
+- **Where surrogacy enters.** Only in the outcome column. The policy
+  machinery never sees the long-term outcome; the surrogate index stands in
+  for it, and the assumptions of Section 4.1 of the paper are what make the
+  substitution innocent. The paper's real contribution is the validation on
+  realized revenue, which the synthetic file cannot reproduce.
+- **Where the uncertainty comes from.** Sixteen treated subscribers with
+  propensities as low as `r fmt(min(dat$p_treated), 3)`. The doubly robust
+  score divides by those propensities, and every interval in this document
+  is wide for that reason. The paper's real data have about 45,000
+  subscribers and 806 treated; the width of its intervals is the same
+  phenomenon scaled by $\sqrt{n}$.
+- **Bootstrap or influence function.** For a policy value the two agree,
+  and the influence function is free. The bootstrap earns its cost when the
+  policy is refitted inside it.
+
+# References
+
+- Athey, Susan, Raj Chetty, Guido W. Imbens, and Hyunseung Kang. 2019. "The Surrogate Index: Combining Short-Term Proxies to Estimate Long-Term Treatment Effects More Rapidly and Precisely." NBER Working Paper 26463.
+- Athey, Susan, and Stefan Wager. 2021. "Policy Learning with Observational Data." *Econometrica*.
+- Dudík, Miroslav, Dumitru Erhan, John Langford, and Lihong Li. 2014. "Doubly Robust Policy Evaluation and Optimization." *Statistical Science*.
+- Eckles, Dean, and Maurits Kaptein. 2014. "Thompson Sampling with the Online Bootstrap." arXiv:1410.4009.
+- Yang, Jeremy, Dean Eckles, Paramveer Dhillon, and Sinan Aral. 2024. "Targeting for Long-Term Outcomes." *Management Science* 70(6), 3841-3855.
+- Zhou, Zhengyuan, Susan Athey, and Stefan Wager. 2023. "Offline Multi-Action Policy Learning: Generalization and Optimization." *Operations Research*.

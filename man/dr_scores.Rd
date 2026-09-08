@@ -12,6 +12,8 @@ dr_scores(
   p_hat = NULL,
   mu0_hat = NULL,
   mu1_hat = NULL,
+  mu_hat = NULL,
+  arms = NULL,
   learner_p = NULL,
   learner_mu = NULL,
   learner_mu0 = NULL,
@@ -21,6 +23,7 @@ dr_scores(
   fold_id = NULL,
   seed = NULL,
   p_clip = c(0.01, 0.99),
+  trim = NULL,
   outcome_type = c("auto", "continuous", "binary"),
   na_action = c("fail", "omit")
 )
@@ -28,7 +31,11 @@ dr_scores(
 \arguments{
 \item{data}{A data frame.}
 
-\item{y, d}{Outcome and binary treatment column names.}
+\item{y, d}{Outcome and treatment column names. A binary \code{d} (0/1,
+logical) gives the pseudo-outcome below. A \code{d} with more than two
+levels (or an explicit \code{arms}) gives the multi-arm score matrix
+\verb{Gamma[i, k] = mu_k(Z_i) + 1\{W_i = k\}(Y_i - mu_k(Z_i)) / e_k(Z_i)},
+one column per arm, of class \code{cm_scores_multi}; see Details.}
 
 \item{x}{Character vector of covariate names (the controls \code{Z}). Needed
 when the nuisances are estimated internally, and used as the default
@@ -37,7 +44,16 @@ heterogeneity variables downstream.}
 \item{p_hat, mu0_hat, mu1_hat}{Optional out-of-fold predictions of
 \code{P(D = 1 | Z)}, \verb{E[Y | D = 0, Z]}, \verb{E[Y | D = 1, Z]}: numeric vectors of
 length \code{nrow(data)} or column names. When all three are supplied no
-learner is fitted.}
+learner is fitted. In the multi-arm case \code{p_hat} is an \verb{n x K} matrix
+of arm probabilities (or \code{K} column names) and \code{mu_hat} the matching
+matrix of outcome predictions.}
+
+\item{mu_hat}{Multi-arm case only: out-of-fold predictions
+\verb{E[Y | W = k, Z]}, an \verb{n x K} matrix or \code{K} column names.}
+
+\item{arms}{Multi-arm case only: the arm labels in the order the columns
+of the score matrix should take (default the sorted unique values, or
+the factor levels, of \code{d}).}
 
 \item{learner_p}{\code{mlr3} classification learner for the propensity score
 (default logistic regression).}
@@ -60,6 +76,14 @@ the folds of supplied nuisances or imposing a partition.}
 \item{seed}{Optional seed for the fold partition.}
 
 \item{p_clip}{Propensity clipping bounds.}
+
+\item{trim}{Optional propensity trimming bounds, e.g. \code{c(0.01, 0.99)}
+(multi-arm case: applied to the propensity of the arm the unit
+received):
+rows whose estimated propensity falls outside the bounds are dropped
+after the nuisances are fitted, as in Crump et al. (2009). Trimming
+changes the target population to the region of overlap; \code{diagnostics}
+records the share dropped.}
 
 \item{outcome_type}{\code{"auto"}, \code{"continuous"}, or \code{"binary"}; matters only
 when a classification learner predicts the outcome.}
@@ -93,6 +117,17 @@ Nuisances are cross-fitted with \code{mlr3} learners (as in \code{\link[=est_dml
 supplied as out-of-fold predictions. The object also stores the residuals
 \code{Y - l(Z)} and \code{D - p(Z)}, with \verb{l(Z) = p mu1 + (1 - p) mu0}, for the
 R-learner.
+
+\strong{Multi-arm scores.} With \code{K} arms the propensities are estimated by one
+cross-fitted classifier per arm (one against the rest), normalized to sum
+to one, and the outcome model of each arm is fitted on that arm's rows.
+The returned object holds \code{gamma} (the \verb{n x K} score matrix), \code{nuisance}
+(\code{e} and \code{mu} matrices), \code{w} (arm labels), \code{arms}, and \code{ate} (expected
+outcome under each arm and contrasts against the first arm). It feeds
+\code{\link[=policy_value]{policy_value()}} (the expected outcome of any arm-valued policy, the
+inverse-propensity-score reward when \code{type = "ipw"}), \code{\link[=policy_learn]{policy_learn()}}
+(trees over the arms, or \code{policytree}), and \code{\link[=contrast_scores]{contrast_scores()}}, which
+extracts the binary object of any pair for the binary tools.
 }
 \examples{
 dat <- sim_hte(n = 600, dgp = "smooth", seed = 1)

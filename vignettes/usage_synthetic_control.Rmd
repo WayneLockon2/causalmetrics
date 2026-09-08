@@ -1,0 +1,152 @@
+---
+title: "Using causalmetrics for synthetic control: weights, placebos, conformal inference, and staggered adoption"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{Using causalmetrics for synthetic control: weights, placebos, conformal inference, and staggered adoption}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4,
+                      message = FALSE, warning = FALSE)
+library(causalmetrics)
+set.seed(1)
+```
+
+## What the package adds
+
+Synthetic control is not a regression, so nothing in `fixest` or `estimatr`
+produces it. `causalmetrics` implements the estimator and the inference
+tools that the applied literature uses with it.
+
+| Task | Function |
+|---|---|
+| Donor weights from outcome lags and covariates, with equal, regression-based, or MSPE-optimized predictor weights; demeaned synthetic control; relaxed constraints; ridge penalty; ridge augmentation; one fit per treated unit under staggered adoption | `synth_control()` |
+| In-space placebos (MSPE-ratio p-values) and in-time placebos (backdating) | `synth_placebo()` |
+| Conformal p-values and confidence sets (Chernozhukov, Wuthrich, and Zhu 2021) | `synth_conformal()` |
+| Specification test contrasting the demeaned synthetic control with DiD (Ferman and Pinto 2021) | `synth_spec_test()` |
+| Leave-one-donor-out refits | `synth_loo()` |
+| Paths, gaps, detrended fit, weights, balance, placebo bands | `plot_synth()` |
+| A linear factor model to simulate from | `sim_synth_panel()` |
+
+The synthetic difference-in-differences weights of `sdid_weights()` (lecture
+07) are the same family: `synth_control()` with all outcome lags equals
+`sdid_weights(estimator = "sc")`, and with `demean = TRUE` it equals the
+`"difp"` estimator averaged over the post-treatment periods.
+
+## A panel from a linear factor model
+
+`sim_synth_panel()` draws untreated outcomes `c_j + delta_t + lambda_t' mu_j + e_jt`.
+The treated unit here loads more than the donors on the first factor, and
+its fixed effect sits above theirs, so neither the donor average nor a
+level match is a good counterfactual.
+
+```{r data}
+dat <- sim_synth_panel(n_donors = 20, t_pre = 20, t_post = 5, sd_e = 0.7,
+                       select_loading = 1.2, select_level = 1.5, effect = 2, seed = 3)
+head(dat)
+```
+
+## Fitting the synthetic control
+
+The default uses every pre-treatment outcome as a predictor, equal
+predictor weights, and weights on the simplex.
+
+```{r fit}
+fit <- synth_control(dat, id = "id", time = "time", y = "y", d = "d")
+fit
+plot_synth(fit, type = "path")
+```
+
+The object reports the pre-treatment fit (`pre_rmspe`), the weight
+concentration `||w||^2` of Ferman and Pinto (2021), and a balance table.
+Two variants matter in practice. The demeaned synthetic control matches
+trends rather than levels. The ridge-augmented estimator adds a regression
+correction for the remaining imbalance.
+
+```{r variants}
+fit_dm <- synth_control(dat, id = "id", time = "time", y = "y", d = "d", demean = TRUE)
+fit_aug <- synth_control(dat, id = "id", time = "time", y = "y", d = "d", demean = TRUE, augment = "ridge")
+did <- sdid_weights(dat, id = "id", time = "time", y = "y", d = "d", estimator = "did")
+c(did = did$estimate, sc = fit$estimate, demeaned = fit_dm$estimate, augmented = fit_aug$estimate)
+plot_synth(fit_dm, type = "demeaned_path")
+```
+
+Covariates enter as pre-treatment averages, outcome lags can be chosen, and
+`v = "mspe"` runs the nested optimization of the predictor weights.
+
+```{r covariates}
+dat$x1 <- 0.5 * dat$y0 + rnorm(nrow(dat))
+fit_x <- synth_control(dat, id = "id", time = "time", y = "y", d = "d", x = "x1",
+                       lags = c(10, 15, 20), pre_window = 11:20, v = "mspe")
+fit_x$balance
+```
+
+## Inference
+
+In-space placebos reassign the treatment to each donor; the p-value is the
+rank of the treated unit's post/pre MSPE ratio.
+
+```{r placebo}
+pl <- synth_placebo(fit_dm)
+pl
+plot_synth(pl)
+plot_synth(pl, type = "ratio")
+```
+
+An in-time placebo moves the treatment date into the pre-treatment period
+and should find nothing.
+
+```{r placebo-time}
+synth_placebo(fit_dm, type = "time", placebo_time = 12)$estimate
+```
+
+Conformal inference tests a sharp null on the post-treatment effects and
+inverts the test into a confidence set.
+
+```{r conformal}
+ci <- synth_conformal(fit_dm)
+ci
+```
+
+The specification test of Ferman and Pinto (2021) contrasts the demeaned
+synthetic control with DiD; a low p-value says both are biased.
+
+```{r spec}
+st <- synth_spec_test(fit_dm)
+st
+plot_synth(st)
+```
+
+Leave-one-donor-out shows how much the estimate depends on any single donor.
+
+```{r loo}
+synth_loo(fit_dm)
+```
+
+## Several treated units and staggered adoption
+
+With `treated_units = "separate"`, each treated unit gets its own synthetic
+control from the units still untreated over its window, and the gaps are
+averaged in event time.
+
+```{r staggered}
+stag <- sim_synth_panel(n_donors = 20, n_treated = 4, t_pre = 15, t_post = 8, effect = 2,
+                        adoption = c(14, 16, 18, 20), seed = 4)
+fit_sep <- synth_control(stag, id = "id", time = "time", y = "y", d = "d",
+                         treated_units = "separate", horizon = 4, demean = TRUE)
+fit_sep
+fit_sep$unit_table
+plot_synth(fit_sep)
+```
+
+`tidy()` and `glance()` work on every fit for `modelsummary` tables.
+
+```{r tidy}
+tidy(fit_dm)
+glance(fit_dm)
+```
