@@ -81,20 +81,20 @@ Every function has a usage vignette; see `browseVignettes("causalmetrics")` or
 
 ## Lecture notes
 
-Section-by-section notes (PDFs knitted in place next to each `.Rmd`), with
+Section-by-section notes (each PDF is knitted from the `.Rmd` beside it), with
 proofs in appendices and Monte Carlo evidence computed in the document.
 
 | Section | Topic | File |
 |---|---|---|
-| 02 | Experiments and Randomized Trials | [`inst/lectures/02_rct/`](inst/lectures/02_rct/) |
-| 03 | Selection on Observables | [`inst/lectures/03_soo/`](inst/lectures/03_soo/) |
-| 04 | Doubly Robust Estimation and Double Machine Learning | [`inst/lectures/04_dml/`](inst/lectures/04_dml/) |
-| 05 | Instrumental Variables and Unobserved Confounding | [`inst/lectures/05_iv/`](inst/lectures/05_iv/) |
-| 06 | Regression Discontinuity and Kink Designs | [`inst/lectures/06_rd/`](inst/lectures/06_rd/) |
-| 07 | Difference-in-Differences and Its Variants | [`inst/lectures/07_did/`](inst/lectures/07_did/) |
-| 08 | Heterogeneous Treatment Effects and Policy Learning | [`inst/lectures/08_hte/`](inst/lectures/08_hte/) |
-| 09 | Synthetic Control | [`inst/lectures/09_sc/`](inst/lectures/09_sc/) |
-| 10 | Mediation and Mechanisms | [`inst/lectures/10_mediation/`](inst/lectures/10_mediation/) |
+| 02 | Experiments and Randomized Trials | [lecture\_02\_experiments\_and\_randomized\_trials.pdf](inst/lectures/02_rct/lecture_02_experiments_and_randomized_trials.pdf) |
+| 03 | Selection on Observables | [lecture\_03\_selection\_on\_observables.pdf](inst/lectures/03_soo/lecture_03_selection_on_observables.pdf) |
+| 04 | Doubly Robust Estimation and Double Machine Learning | [lecture\_04\_doubly\_robust\_and\_double\_ml.pdf](inst/lectures/04_dml/lecture_04_doubly_robust_and_double_ml.pdf) |
+| 05 | Instrumental Variables and Unobserved Confounding | [lecture\_05\_instrumental\_variables.pdf](inst/lectures/05_iv/lecture_05_instrumental_variables.pdf) |
+| 06 | Regression Discontinuity and Kink Designs | [lecture\_06\_regression\_discontinuity.pdf](inst/lectures/06_rd/lecture_06_regression_discontinuity.pdf) |
+| 07 | Difference-in-Differences and Its Variants | [lecture\_07\_difference\_in\_differences.pdf](inst/lectures/07_did/lecture_07_difference_in_differences.pdf) |
+| 08 | Heterogeneous Treatment Effects and Policy Learning | [lecture\_08\_heterogeneous\_effects\_and\_policy.pdf](inst/lectures/08_hte/lecture_08_heterogeneous_effects_and_policy.pdf) |
+| 09 | Synthetic Control | [lecture\_09\_synthetic\_control.pdf](inst/lectures/09_sc/lecture_09_synthetic_control.pdf) |
+| 10 | Mediation and Mechanisms | [lecture\_10\_mediation\_and\_mechanisms.pdf](inst/lectures/10_mediation/lecture_10_mediation_and_mechanisms.pdf) |
 
 ## Paper replications
 
@@ -106,20 +106,20 @@ knitted PDFs are committed so the results are readable without the data.
 
 | Section | Paper | Note |
 |---|---|---|
-| 02 | Thornton (2008, AER): The Demand for, and Impact of, Learning HIV Status | [`thornton2008demand.Rmd`](inst/replications/02_Experiments_and_Randomized_Trials/thornton2008demand.Rmd) |
-| 02 | Karaman (2026): Review Solicitation and Future Spending | [`karaman2026asymmetric.Rmd`](inst/replications/02_Experiments_and_Randomized_Trials/karaman2026asymmetric.Rmd) |
-| 03 | Imbens and Xu (2025): Comparing Experimental and Nonexperimental Methods Four Decades After LaLonde | [`imbens2025comparing.Rmd`](inst/replications/03_Selection_on_Observables/imbens2025comparing.Rmd) |
-| 04 | Ellickson, Kar, and Reeder (2023, Marketing Science): Estimating Marketing Component Effects | [`ellickson2023estimating.Rmd`](inst/replications/04_Doubly_Robust_and_Double_ML/ellickson2023estimating.Rmd) |
-| 04 | Ye et al. (2025, Management Science): Deep Learning-Based Causal Inference for Combinatorial Experiments | [`ye2025deep.Rmd`](inst/replications/04_Doubly_Robust_and_Double_ML/ye2025deep.Rmd) |
-| 05 | Hsieh, Du, and Lu (2026, Marketing Science): Single-Source Data for TV Advertising, a Control-Function Strategy | [`hsieh2026leveraging.Rmd`](inst/replications/05_IV_control_fun/hsieh2026leveraging.Rmd) |
-| 07 | Jiang, Uetake, and Yang (2026, Marketing Science): Premium Adoption in mHealth (Callaway–Sant'Anna workflow) | [`jiang2026does.Rmd`](inst/replications/07_did/jiang2026does.Rmd) |
-| 08 | Yang, Eckles, Dhillon, and Aral (2024, Management Science): Targeting for Long-Term Outcomes | [`yang2024targeting.Rmd`](inst/replications/08_Heterogeneous_Effects_and_Policy_Learning/yang2024targeting.Rmd) |
-| 08 | Yoganarasimhan, Barzegary, and Pani (2023, Management Science): Design and Evaluation of Optimal Free Trials | [`yoganarasimhan2023design.Rmd`](inst/replications/08_Heterogeneous_Effects_and_Policy_Learning/yoganarasimhan2023design.Rmd) |
-| 08 | Zhan, Ren, Athey, and Zhou (2024, Management Science): Policy Learning with Adaptively Collected Data | [`zhan2024policy.Rmd`](inst/replications/08_Heterogeneous_Effects_and_Policy_Learning/zhan2024policy.Rmd) |
-| 09 | Andersson (2019, AEJ: Economic Policy): Carbon Taxes and CO2 Emissions | [`andersson2019carbon.Rmd`](inst/replications/09_Synthetic_Control/andersson2019carbon.Rmd) |
-| 10 | Wheeler, Garlick, Johnson, Shaw, and Gargano (2022, AEJ: Applied): LinkedIn(to) Job Opportunities | [`wheeler2022linkedin.Rmd`](inst/replications/10_mediation/wheeler2022linkedin.Rmd) |
-| 10 | Zhang, Li, and Allenby (2024, Marketing Science): Text Analysis in Parallel Mediation | [`zhang2024text.Rmd`](inst/replications/10_mediation/zhang2024text.Rmd) |
-| 10 | Cattan, Salvanes, and Tominey (2025, AER): First-Generation Elite (IV mediation audit + calibrated design) | [`cattan2025elite.Rmd`](inst/replications/10_mediation/cattan2025elite.Rmd) |
+| 02 | Thornton (2008, AER): The Demand for, and Impact of, Learning HIV Status | [thornton2008demand.pdf](inst/replications/02_Experiments_and_Randomized_Trials/thornton2008demand.pdf) |
+| 02 | Karaman (2026): Review Solicitation and Future Spending | [karaman2026asymmetric.pdf](inst/replications/02_Experiments_and_Randomized_Trials/karaman2026asymmetric.pdf) |
+| 03 | Imbens and Xu (2025): Comparing Experimental and Nonexperimental Methods Four Decades After LaLonde | [imbens2025comparing.pdf](inst/replications/03_Selection_on_Observables/imbens2025comparing.pdf) |
+| 04 | Ellickson, Kar, and Reeder (2023, Marketing Science): Estimating Marketing Component Effects | [ellickson2023estimating.pdf](inst/replications/04_Doubly_Robust_and_Double_ML/ellickson2023estimating.pdf) |
+| 04 | Ye et al. (2025, Management Science): Deep Learning-Based Causal Inference for Combinatorial Experiments | [ye2025deep.pdf](inst/replications/04_Doubly_Robust_and_Double_ML/ye2025deep.pdf) |
+| 05 | Hsieh, Du, and Lu (2026, Marketing Science): Single-Source Data for TV Advertising, a Control-Function Strategy | [hsieh2026leveraging.pdf](inst/replications/05_IV_control_fun/hsieh2026leveraging.pdf) |
+| 07 | Jiang, Uetake, and Yang (2026, Marketing Science): Premium Adoption in mHealth (Callaway–Sant'Anna workflow) | [jiang2026does.pdf](inst/replications/07_did/jiang2026does.pdf) |
+| 08 | Yang, Eckles, Dhillon, and Aral (2024, Management Science): Targeting for Long-Term Outcomes | [yang2024targeting.pdf](inst/replications/08_Heterogeneous_Effects_and_Policy_Learning/yang2024targeting.pdf) |
+| 08 | Yoganarasimhan, Barzegary, and Pani (2023, Management Science): Design and Evaluation of Optimal Free Trials | [yoganarasimhan2023design.pdf](inst/replications/08_Heterogeneous_Effects_and_Policy_Learning/yoganarasimhan2023design.pdf) |
+| 08 | Zhan, Ren, Athey, and Zhou (2024, Management Science): Policy Learning with Adaptively Collected Data | [zhan2024policy.pdf](inst/replications/08_Heterogeneous_Effects_and_Policy_Learning/zhan2024policy.pdf) |
+| 09 | Andersson (2019, AEJ: Economic Policy): Carbon Taxes and CO2 Emissions | [andersson2019carbon.pdf](inst/replications/09_Synthetic_Control/andersson2019carbon.pdf) |
+| 10 | Wheeler, Garlick, Johnson, Shaw, and Gargano (2022, AEJ: Applied): LinkedIn(to) Job Opportunities | [wheeler2022linkedin.pdf](inst/replications/10_mediation/wheeler2022linkedin.pdf) |
+| 10 | Zhang, Li, and Allenby (2024, Marketing Science): Text Analysis in Parallel Mediation | [zhang2024text.pdf](inst/replications/10_mediation/zhang2024text.pdf) |
+| 10 | Cattan, Salvanes, and Tominey (2025, AER): First-Generation Elite (IV mediation audit + calibrated design) | [cattan2025elite.pdf](inst/replications/10_mediation/cattan2025elite.pdf) |
 
 ## Skills: the lectures as LLM-loadable workflows
 
